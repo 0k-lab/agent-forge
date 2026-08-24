@@ -10,9 +10,95 @@ import (
 	"testing"
 	"time"
 
+	"agent-forge/internal/protocol"
 	"agent-forge/internal/store"
 	"github.com/coder/websocket"
 )
+
+func TestValidateTaskRejectsInvalidCommitAuthorsWithoutEchoingValues(t *testing.T) {
+	valid := protocol.CodingTask{
+		Repository:  "/repo",
+		BaseSHA:     strings.Repeat("a", 40),
+		Instruction: "edit",
+		Tests:       [][]string{{"true"}},
+	}
+	tests := []struct {
+		name  string
+		value string
+		set   func(*protocol.CodingTask, string)
+	}{
+		{"name only", "kricha", func(task *protocol.CodingTask, value string) { task.CommitAuthorName = value }},
+		{"email only", "kricha@example.com", func(task *protocol.CodingTask, value string) { task.CommitAuthorEmail = value }},
+		{"oversized name", strings.Repeat("n", 257), func(task *protocol.CodingTask, value string) {
+			task.CommitAuthorName, task.CommitAuthorEmail = value, "kricha@example.com"
+		}},
+		{"oversized email", strings.Repeat("e", 255), func(task *protocol.CodingTask, value string) {
+			task.CommitAuthorName, task.CommitAuthorEmail = "kricha", value
+		}},
+		{"name newline", "kricha\nInjected", func(task *protocol.CodingTask, value string) {
+			task.CommitAuthorName, task.CommitAuthorEmail = value, "kricha@example.com"
+		}},
+		{"email carriage return", "kricha@example.com\rInjected", func(task *protocol.CodingTask, value string) {
+			task.CommitAuthorName, task.CommitAuthorEmail = "kricha", value
+		}},
+		{"name control", "k\x00richa", func(task *protocol.CodingTask, value string) {
+			task.CommitAuthorName, task.CommitAuthorEmail = value, "kricha@example.com"
+		}},
+		{"name angle bracket", "kricha <admin>", func(task *protocol.CodingTask, value string) {
+			task.CommitAuthorName, task.CommitAuthorEmail = value, "kricha@example.com"
+		}},
+		{"email header form", "kricha <kricha@example.com>", func(task *protocol.CodingTask, value string) {
+			task.CommitAuthorName, task.CommitAuthorEmail = "kricha", value
+		}},
+		{"name header style", "Author: kricha", func(task *protocol.CodingTask, value string) {
+			task.CommitAuthorName, task.CommitAuthorEmail = value, "kricha@example.com"
+		}},
+		{"malformed email", "not-an-email", func(task *protocol.CodingTask, value string) {
+			task.CommitAuthorName, task.CommitAuthorEmail = "kricha", value
+		}},
+		{"name leading whitespace", " kricha", func(task *protocol.CodingTask, value string) {
+			task.CommitAuthorName, task.CommitAuthorEmail = value, "kricha@example.com"
+		}},
+		{"name trailing unicode whitespace", "kricha\u2003", func(task *protocol.CodingTask, value string) {
+			task.CommitAuthorName, task.CommitAuthorEmail = value, "kricha@example.com"
+		}},
+		{"email leading unicode whitespace", "\u2003kricha@example.com", func(task *protocol.CodingTask, value string) {
+			task.CommitAuthorName, task.CommitAuthorEmail = "kricha", value
+		}},
+		{"email trailing whitespace", "kricha@example.com ", func(task *protocol.CodingTask, value string) {
+			task.CommitAuthorName, task.CommitAuthorEmail = "kricha", value
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			task := valid
+			tt.set(&task, tt.value)
+			err := validateTask(task)
+			if err == nil {
+				t.Fatal("invalid commit author accepted")
+			}
+			if len(err.Error()) > 64 || strings.Contains(err.Error(), tt.value) {
+				t.Fatalf("unsafe validation error %q", err)
+			}
+		})
+	}
+}
+
+func TestValidateTaskAcceptsAbsentOrPairedCommitAuthor(t *testing.T) {
+	for _, author := range [][2]string{{}, {"kricha", "4619899+kricha@users.noreply.github.com"}} {
+		task := protocol.CodingTask{
+			Repository:        "/repo",
+			BaseSHA:           strings.Repeat("a", 40),
+			Instruction:       "edit",
+			Tests:             [][]string{{"true"}},
+			CommitAuthorName:  author[0],
+			CommitAuthorEmail: author[1],
+		}
+		if err := validateTask(task); err != nil {
+			t.Fatalf("author %q <%s> rejected: %v", author[0], author[1], err)
+		}
+	}
+}
 
 func TestWorkerWebSocketRequiresMatchingBearerToken(t *testing.T) {
 	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))

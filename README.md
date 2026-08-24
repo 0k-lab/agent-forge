@@ -57,11 +57,13 @@ curl -sS -H 'Authorization: Bearer fake-owner-token' "http://127.0.0.1:18080/v1/
 
 Job results are accepted only for the currently bound attempt. Repeating the identical result is idempotent; a different result or wrong attempt is rejected. Worker `connected` state is set on authenticated WebSocket establishment and cleared when that connection ends.
 
-Submit a coding task with an absolute local repository path, full base SHA, instruction, and explicit argv arrays:
+Submit a coding task with an absolute local repository path, full base SHA, instruction, explicit argv arrays, and an optional paired commit author:
 
 ```json
-{"repository":"/srv/forge/repos/synthetic-project","base_sha":"0123456789abcdef0123456789abcdef01234567","instruction":"Fix the failing focused test.","tests":[["go","test","./internal/example","-run","TestFocused"]]}
+{"repository":"/srv/forge/repos/synthetic-project","base_sha":"0123456789abcdef0123456789abcdef01234567","instruction":"Fix the failing focused test.","tests":[["go","test","./internal/example","-run","TestFocused"]],"commit_author_name":"kricha","commit_author_email":"4619899+kricha@users.noreply.github.com"}
 ```
+
+`commit_author_name` and `commit_author_email` must be supplied together or both omitted. Names are limited to 256 bytes and emails to 254 bytes; leading or trailing Unicode whitespace, unsafe Git-header characters, and malformed addresses are rejected. A supplied identity becomes the exact Git Author, while Git Committer remains `Agent Forge <forge@example.invalid>`. If both fields are omitted, both identities use that Agent Forge fallback for compatibility.
 
 The terminal job contains `candidate_sha`; its deterministic candidate ref keeps that commit reachable after worktree removal, reflog expiration, and garbage collection. With no configured repository roots, legacy jobs still run and coding jobs fail with a bounded reason.
 

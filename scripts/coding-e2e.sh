@@ -60,7 +60,7 @@ done
 
 SUBMIT=$(python3 - "$REPO" "$BASE" <<'PY' | curl -fsS -X POST http://127.0.0.1:18081/v1/jobs -H "Authorization: Bearer $OWNER_TOKEN" -H 'Content-Type: application/json' --data-binary @-
 import json,sys
-json.dump({"repository":sys.argv[1],"base_sha":sys.argv[2],"instruction":"Change Answer in answer.go to return 42. Edit files only; do not commit or run tests.","tests":[["go","test","./..."]]},sys.stdout)
+json.dump({"repository":sys.argv[1],"base_sha":sys.argv[2],"instruction":"Change Answer in answer.go to return 42. Edit files only; do not commit or run tests.","tests":[["go","test","./..."]],"commit_author_name":"kricha","commit_author_email":"4619899+kricha@users.noreply.github.com"},sys.stdout)
 PY
 )
 JOB_ID=$(printf '%s' "$SUBMIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
@@ -81,6 +81,10 @@ git -C "$REPO" cat-file -e "$CANDIDATE^{commit}"
 [ "$(git -C "$REPO" rev-parse "$CANDIDATE_REF")" = "$CANDIDATE" ]
 PARENT=$(git -C "$REPO" rev-parse "$CANDIDATE^")
 [ "$PARENT" = "$BASE" ]
+AUTHOR=$(git -C "$REPO" show -s --format='%an <%ae>' "$CANDIDATE")
+COMMITTER=$(git -C "$REPO" show -s --format='%cn <%ce>' "$CANDIDATE")
+[ "$AUTHOR" = "kricha <4619899+kricha@users.noreply.github.com>" ]
+[ "$COMMITTER" = "Agent Forge <forge@example.invalid>" ]
 VERIFY="$RUN/verify"
 git -C "$REPO" worktree add -q --detach "$VERIFY" "$CANDIDATE"
 (cd "$VERIFY" && go test ./...)
@@ -98,6 +102,8 @@ TERMINAL=$(printf '%s' "$JOB" | python3 -c 'import json,sys; j=json.load(sys.std
   echo "base_sha=$BASE"
   echo "candidate_sha=$CANDIDATE"
   echo "candidate_parent=$PARENT"
+  echo "candidate_author=$AUTHOR"
+  echo "candidate_committer=$COMMITTER"
   echo "candidate_ref=$CANDIDATE_REF"
   echo "candidate_object=verified"
   echo "event_candidate_sha=verified"

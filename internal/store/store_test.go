@@ -128,6 +128,32 @@ func TestCandidateResultIsExactAndImmutable(t *testing.T) {
 	}
 }
 
+func TestCodingTaskCommitAuthorRoundTripsThroughJobAndLease(t *testing.T) {
+	s := testStore(t)
+	task := protocol.CodingTask{
+		Instruction:       "coding task",
+		CommitAuthorName:  "kricha",
+		CommitAuthorEmail: "4619899+kricha@users.noreply.github.com",
+	}
+	job, err := s.CreateCodingJob(task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := s.Job(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, ok, err := s.LeaseNext("worker-1")
+	if err != nil || !ok {
+		t.Fatalf("lease: ok=%v err=%v", ok, err)
+	}
+	for label, got := range map[string]*protocol.CodingTask{"job": stored.Task, "lease": lease.Task} {
+		if got == nil || got.CommitAuthorName != task.CommitAuthorName || got.CommitAuthorEmail != task.CommitAuthorEmail {
+			t.Fatalf("%s task = %#v, want author %q <%s>", label, got, task.CommitAuthorName, task.CommitAuthorEmail)
+		}
+	}
+}
+
 func TestCodingJobRejectsLegacyTextCompletion(t *testing.T) {
 	s := testStore(t)
 	job, err := s.CreateCodingJob(protocol.CodingTask{Instruction: "coding task"})

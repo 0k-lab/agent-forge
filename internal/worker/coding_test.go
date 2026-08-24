@@ -24,16 +24,18 @@ func TestCodingTaskUsesExactBaseAndCreatesCandidate(t *testing.T) {
 	git(t, repo, "commit", "-qam", "later")
 
 	plugin := filepath.Join(t.TempDir(), "plugin")
-	write(t, plugin, "#!/bin/sh\npython3 -c 'import json,sys,pathlib; r=json.load(sys.stdin); pathlib.Path(r[\"workspace\"], \"answer.txt\").write_text(\"candidate\\n\"); print(json.dumps({\"version\":\"v1\",\"result\":\"edited\"}))'\n")
+	write(t, plugin, "#!/bin/sh\npython3 -c 'import json,sys,pathlib; r=json.load(sys.stdin); pathlib.Path(r[\"workspace\"], \"answer.txt\").write_text(\"candidate\\n\"); print(json.dumps({\"version\":\"v1\",\"result\":\"Mallory <mallory@example.com>\"}))'\n")
 	if err := os.Chmod(plugin, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
 	sha, err := executeCodingTask(context.Background(), plugin, []string{repo}, "11111111111111111111111111111111", "22222222222222222222222222222222", protocol.CodingTask{
-		Repository:  repo,
-		BaseSHA:     base,
-		Instruction: "write candidate to answer.txt",
-		Tests:       [][]string{{"grep", "-qx", "candidate", "answer.txt"}},
+		Repository:        repo,
+		BaseSHA:           base,
+		Instruction:       "write candidate to answer.txt",
+		Tests:             [][]string{{"grep", "-qx", "candidate", "answer.txt"}},
+		CommitAuthorName:  "kricha",
+		CommitAuthorEmail: "4619899+kricha@users.noreply.github.com",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -43,6 +45,9 @@ func TestCodingTaskUsesExactBaseAndCreatesCandidate(t *testing.T) {
 	}
 	if got := git(t, repo, "show", sha+":answer.txt"); got != "candidate" {
 		t.Fatalf("candidate content = %q", got)
+	}
+	if got := git(t, repo, "show", "-s", "--format=%an <%ae>%n%cn <%ce>", sha); got != "kricha <4619899+kricha@users.noreply.github.com>\nAgent Forge <forge@example.invalid>" {
+		t.Fatalf("candidate identity = %q", got)
 	}
 	if got := git(t, repo, "status", "--short"); got != "" {
 		t.Fatalf("source repository changed: %s", got)
@@ -55,6 +60,47 @@ func TestCodingTaskUsesExactBaseAndCreatesCandidate(t *testing.T) {
 	git(t, repo, "gc", "--prune=now")
 	if got := git(t, repo, "rev-parse", ref); got != sha {
 		t.Fatalf("candidate after GC = %s, want %s", got, sha)
+	}
+}
+
+func TestCodingTaskWithoutCommitAuthorUsesAgentForgeFallback(t *testing.T) {
+	repo, base, plugin := codingFixture(t, "#!/bin/sh\nexit 0\n")
+	sha, err := executeCodingTask(context.Background(), plugin, []string{repo}, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccccccccccccccc", protocol.CodingTask{
+		Repository: repo, BaseSHA: base, Instruction: "edit", Tests: [][]string{{"true"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := git(t, repo, "show", "-s", "--format=%an <%ae>%n%cn <%ce>", sha); got != "Agent Forge <forge@example.invalid>\nAgent Forge <forge@example.invalid>" {
+		t.Fatalf("fallback identity = %q", got)
+	}
+}
+
+func TestCodingTaskRejectsInvalidCommitAuthorBeforePluginOrCandidate(t *testing.T) {
+	repo, base, _ := codingFixture(t, "#!/bin/sh\nexit 0\n")
+	marker := filepath.Join(t.TempDir(), "plugin-invoked")
+	plugin := filepath.Join(t.TempDir(), "plugin")
+	write(t, plugin, "#!/bin/sh\n: > \""+marker+"\"\nprintf '%s\\n' '{\"version\":\"v1\",\"result\":\"edited\"}'\n")
+	if err := os.Chmod(plugin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jobID := "dddddddddddddddddddddddddddddddd"
+	attemptID := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	sha, err := executeCodingTask(context.Background(), plugin, []string{repo}, jobID, attemptID, protocol.CodingTask{
+		Repository: repo, BaseSHA: base, Instruction: "edit", Tests: [][]string{{"true"}}, CommitAuthorName: "kricha",
+	})
+	if err == nil || sha != "" || err.Error() != "invalid commit author" {
+		t.Fatalf("invalid author result: sha=%q err=%v", sha, err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("invalid author invoked plugin: %v", err)
+	}
+	if got := git(t, repo, "rev-list", "--all", "--count"); got != "1" {
+		t.Fatalf("invalid author created a commit: count=%s", got)
+	}
+	ref := "refs/agent-forge/candidates/" + jobID + "/" + attemptID
+	if err := exec.Command("git", "-C", repo, "show-ref", "--verify", "--quiet", ref).Run(); err == nil {
+		t.Fatal("invalid author created a candidate ref")
 	}
 }
 
