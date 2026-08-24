@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Agent Forge debug viewer</title>
+  <link rel="stylesheet" href="/debug/app.css">
+  <script src="/debug/app.js" defer></script>
+</head>
+<body>
+  <header>
+    <h1>Agent Forge debug viewer</h1>
+    <p>Read-only diagnostics</p>
+  </header>
+  <main>
+    <section id="auth">
+      <label for="token">Owner token</label>
+      <input id="token" type="password" autocomplete="off" spellcheck="false">
+      <button id="connect" type="button">Load diagnostics</button>
+      <span id="notice" role="status" aria-live="polite"></span>
+    </section>
+    <section>
+      <h2>Recent jobs</h2>
+      <ul id="jobs"></ul>
+    </section>
+    <section>
+      <h2>Selected job</h2>
+      <dl id="job"></dl>
+      <ol id="timeline"></ol>
+    </section>
+    <section>
+      <h2>Workers</h2>
+      <ul id="workers"></ul>
+    </section>
+  </main>
+</body>
+</html>

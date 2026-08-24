@@ -1,0 +1,13 @@
+:root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+body { margin: auto; max-width: 72rem; padding: 1rem; }
+header, #auth { display: flex; align-items: baseline; flex-wrap: wrap; gap: .75rem; }
+header p { opacity: .7; }
+main { display: grid; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); gap: 1rem; }
+section { border: 1px solid color-mix(in srgb, currentColor 25%, transparent); border-radius: .4rem; padding: 1rem; }
+#auth { grid-column: 1 / -1; }
+input, button { font: inherit; padding: .4rem .6rem; }
+button { cursor: pointer; }
+ul, ol { padding-left: 1.4rem; }
+li { margin: .4rem 0; overflow-wrap: anywhere; }
+dt { font-weight: 700; }
+dd { margin: 0 0 .5rem; overflow-wrap: anywhere; }

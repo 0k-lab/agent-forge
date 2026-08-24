@@ -1,13 +1,21 @@
 package gate
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
+	"embed"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,7 +29,76 @@ type server struct {
 	store  *store.Store
 	tokens map[string]string
 	owner  string
+	cursor debugCursorCodec
 }
+
+const (
+	debugCursorVersion   = 1
+	maxDebugCursorLength = 512
+	debugJobsPurpose     = "jobs"
+	debugWorkersPurpose  = "workers"
+)
+
+type debugCursorCodec struct{ key [sha256.Size]byte }
+
+type debugCursorPayload struct {
+	Version int    `json:"v"`
+	Purpose string `json:"purpose"`
+	Stamp   string `json:"stamp"`
+	ID      string `json:"id"`
+}
+
+func newDebugCursorCodec(key [sha256.Size]byte) debugCursorCodec {
+	return debugCursorCodec{key: key}
+}
+
+func (c debugCursorCodec) encode(purpose string, position *store.DebugPosition) string {
+	if position == nil {
+		return ""
+	}
+	body, _ := json.Marshal(debugCursorPayload{
+		Version: debugCursorVersion,
+		Purpose: purpose,
+		Stamp:   position.At.Format(time.RFC3339Nano),
+		ID:      position.ID,
+	})
+	mac := hmac.New(sha256.New, c.key[:])
+	_, _ = mac.Write(body)
+	return base64.RawURLEncoding.EncodeToString(append(body, mac.Sum(nil)...))
+}
+
+func (c debugCursorCodec) decode(cursor, purpose string) (*store.DebugPosition, error) {
+	if cursor == "" {
+		return nil, nil
+	}
+	if len(cursor) > maxDebugCursorLength {
+		return nil, store.ErrInvalidDebugCursor
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil || len(raw) <= sha256.Size {
+		return nil, store.ErrInvalidDebugCursor
+	}
+	body, suppliedMAC := raw[:len(raw)-sha256.Size], raw[len(raw)-sha256.Size:]
+	mac := hmac.New(sha256.New, c.key[:])
+	_, _ = mac.Write(body)
+	if subtle.ConstantTimeCompare(suppliedMAC, mac.Sum(nil)) != 1 {
+		return nil, store.ErrInvalidDebugCursor
+	}
+	var payload debugCursorPayload
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil || decoder.Decode(&struct{}{}) != io.EOF || payload.Version != debugCursorVersion || payload.Purpose != purpose || payload.ID == "" {
+		return nil, store.ErrInvalidDebugCursor
+	}
+	at, err := time.Parse(time.RFC3339Nano, payload.Stamp)
+	if err != nil {
+		return nil, store.ErrInvalidDebugCursor
+	}
+	return &store.DebugPosition{At: at, ID: payload.ID}, nil
+}
+
+//go:embed debug/index.html debug/app.css debug/app.js
+var debugFiles embed.FS
 
 func NewHandler(s *store.Store, tokens map[string]string, ownerToken string) http.Handler {
 	for workerToken := range tokens {
@@ -29,14 +106,32 @@ func NewHandler(s *store.Store, tokens map[string]string, ownerToken string) htt
 			ownerToken = ""
 		}
 	}
-	x := &server{store: s, tokens: tokens, owner: ownerToken}
+	x := &server{store: s, tokens: tokens, owner: ownerToken, cursor: newDebugCursorCodec(s.DebugCursorKey(ownerToken))}
 	m := http.NewServeMux()
 	m.HandleFunc("POST /v1/jobs", x.ownerAuth(x.submit))
 	m.HandleFunc("GET /v1/jobs/{id}", x.ownerAuth(x.getJob))
 	m.HandleFunc("GET /v1/jobs/{id}/events", x.ownerAuth(x.getEvents))
 	m.HandleFunc("GET /v1/workers/{id}", x.ownerAuth(x.getWorker))
 	m.HandleFunc("GET /v1/workers/connect", x.connect)
+	m.HandleFunc("/v1/debug/jobs", getOnly(x.ownerAuth(x.debugJobs)))
+	m.HandleFunc("/v1/debug/jobs/{id}", getOnly(x.ownerAuth(x.debugTimeline)))
+	m.HandleFunc("/v1/debug/workers", getOnly(x.ownerAuth(x.debugWorkers)))
+	m.HandleFunc("GET /debug", x.debugAsset)
+	m.HandleFunc("GET /debug/", x.debugAsset)
 	return m
+}
+
+func getOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		next(w, r)
+	}
 }
 
 func (x *server) ownerAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -62,6 +157,127 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func debugLimit(r *http.Request) (int, error) {
+	if r.URL.Query().Get("limit") == "" {
+		return 25, nil
+	}
+	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+	if err != nil || limit <= 0 {
+		return 0, errors.New("invalid limit")
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	return limit, nil
+}
+
+func (x *server) debugJobs(w http.ResponseWriter, r *http.Request) {
+	limit, err := debugLimit(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"message": "invalid request"})
+		return
+	}
+	position, err := x.cursor.decode(r.URL.Query().Get("cursor"), debugJobsPurpose)
+	if err != nil {
+		writeDebugError(w, err)
+		return
+	}
+	page, err := x.store.RecentDebugJobs(r.Context(), limit, position)
+	if err != nil {
+		writeDebugError(w, err)
+		return
+	}
+	page.NextCursor = x.cursor.encode(debugJobsPurpose, page.NextPosition)
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, page)
+}
+
+func (x *server) debugWorkers(w http.ResponseWriter, r *http.Request) {
+	limit, err := debugLimit(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"message": "invalid request"})
+		return
+	}
+	position, err := x.cursor.decode(r.URL.Query().Get("cursor"), debugWorkersPurpose)
+	if err != nil {
+		writeDebugError(w, err)
+		return
+	}
+	page, err := x.store.RecentDebugWorkers(r.Context(), limit, position)
+	if err != nil {
+		writeDebugError(w, err)
+		return
+	}
+	page.NextCursor = x.cursor.encode(debugWorkersPurpose, page.NextPosition)
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, page)
+}
+
+func (x *server) debugTimeline(w http.ResponseWriter, r *http.Request) {
+	limit, err := debugLimit(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"message": "invalid request"})
+		return
+	}
+	jobID := r.PathValue("id")
+	purpose := "timeline:" + jobID
+	position, err := x.cursor.decode(r.URL.Query().Get("cursor"), purpose)
+	if err != nil {
+		writeDebugError(w, err)
+		return
+	}
+	timeline, err := x.store.DebugJobTimeline(r.Context(), jobID, limit, position)
+	if err != nil {
+		status, message := http.StatusInternalServerError, "request failed"
+		if errors.Is(err, sql.ErrNoRows) {
+			status, message = http.StatusNotFound, "not found"
+		}
+		if errors.Is(err, store.ErrInvalidDebugCursor) {
+			writeDebugError(w, err)
+		} else {
+			writeJSON(w, status, map[string]string{"message": message})
+		}
+		return
+	}
+	timeline.NextCursor = x.cursor.encode(purpose, timeline.NextPosition)
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, timeline)
+}
+
+func writeDebugError(w http.ResponseWriter, err error) {
+	status, message := http.StatusInternalServerError, "request failed"
+	if errors.Is(err, store.ErrInvalidDebugCursor) {
+		status, message = http.StatusBadRequest, "invalid request"
+	}
+	writeJSON(w, status, map[string]string{"message": message})
+}
+
+func (x *server) debugAsset(w http.ResponseWriter, r *http.Request) {
+	name, contentType := "debug/index.html", "text/html; charset=utf-8"
+	if r.URL.Path == "/debug/app.css" {
+		name, contentType = "debug/app.css", "text/css; charset=utf-8"
+	} else if r.URL.Path == "/debug/app.js" {
+		name, contentType = "debug/app.js", "text/javascript; charset=utf-8"
+	} else if r.URL.Path != "/debug" && r.URL.Path != "/debug/" {
+		http.NotFound(w, r)
+		return
+	}
+	body, err := debugFiles.ReadFile(name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+	w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 func writeErr(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error()})
