@@ -1,11 +1,127 @@
 package store
 
 import (
+	"context"
+	"fmt"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
+	"time"
 
 	"agent-forge/internal/protocol"
 )
+
+func TestDebugReadModelsAreBoundedStableAndReadOnly(t *testing.T) {
+	s := testStore(t)
+	stamp := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC).Format(time.RFC3339Nano)
+	ids := make([]string, 102)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("job-%03d", i)
+		if _, err := s.db.Exec(`INSERT INTO jobs(id,input,status,created_at,updated_at) VALUES(?,?,?,?,?)`, ids[i], "secret", "pending", stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var before int
+	if err := s.db.QueryRow(`SELECT total_changes()`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.RecentDebugJobs(context.Background(), 1000, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Items) != 100 || first.NextCursor == "" {
+		t.Fatalf("first page = %d items, cursor %q", len(first.Items), first.NextCursor)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(ids)))
+	for i, job := range first.Items {
+		if job.ID != ids[i] {
+			t.Fatalf("item %d = %q, want %q", i, job.ID, ids[i])
+		}
+	}
+	second, err := s.RecentDebugJobs(context.Background(), 100, first.NextCursor)
+	if err != nil || len(second.Items) != 2 || second.Items[0].ID != ids[100] || second.Items[1].ID != ids[101] {
+		t.Fatalf("second page = %#v, %v", second, err)
+	}
+	var after int
+	if err := s.db.QueryRow(`SELECT total_changes()`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("debug reads mutated store: changes %d -> %d", before, after)
+	}
+	for i := 0; i < 102; i++ {
+		if _, err := s.db.Exec(`INSERT INTO workers(id,connected,last_seen) VALUES(?,?,?)`, fmt.Sprintf("worker-%03d", i), i%2, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	workers, err := s.RecentDebugWorkers(context.Background(), 101, "")
+	if err != nil || len(workers.Items) != 100 || workers.NextCursor == "" || workers.Items[0].ID != "worker-101" {
+		t.Fatalf("worker page = %#v, %v", workers, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := s.RecentDebugJobs(ctx, 1, ""); err == nil {
+		t.Fatal("canceled context was ignored")
+	}
+}
+
+func TestDebugTimelinePaginationIsBoundedAndStable(t *testing.T) {
+	s := testStore(t)
+	stamp := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC).Format(time.RFC3339Nano)
+	if _, err := s.db.Exec(`INSERT INTO jobs(id,input,status,created_at,updated_at) VALUES('job','secret','pending',?,?)`, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 102; i++ {
+		if _, err := s.db.Exec(`INSERT INTO events(job_id,kind,detail,at) VALUES('job',?,?,?)`, fmt.Sprintf("event-%03d", i), "secret detail", stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := s.DebugJobTimeline(context.Background(), "job", 1000, "")
+	if err != nil || len(first.Events) != 100 || first.NextCursor == "" || first.Events[0].Type != "event-000" || first.Events[99].Type != "event-099" {
+		t.Fatalf("first timeline page = %#v, %v", first, err)
+	}
+	second, err := s.DebugJobTimeline(context.Background(), "job", 100, first.NextCursor)
+	if err != nil || len(second.Events) != 2 || second.Events[0].Type != "event-100" || second.Events[1].Type != "event-101" {
+		t.Fatalf("second timeline page = %#v, %v", second, err)
+	}
+}
+
+func TestDebugTimelineSanitizesSyntheticCompletedJob(t *testing.T) {
+	s := testStore(t)
+	base := strings.Repeat("a", 40)
+	candidate := strings.Repeat("b", 40)
+	job, err := s.CreateCodingJob(protocol.CodingTask{
+		Repository: "/synthetic/private/repo", BaseSHA: base,
+		Instruction: "do not expose this", Tests: [][]string{{"sh", "-c", "private output"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, ok, err := s.LeaseNext("worker-secret-id")
+	if err != nil || !ok {
+		t.Fatalf("lease: %#v %v %v", lease, ok, err)
+	}
+	if _, err := s.CompleteCandidate(job.ID, lease.AttemptID, candidate); err != nil {
+		t.Fatal(err)
+	}
+	timeline, err := s.DebugJobTimeline(context.Background(), job.ID, 1000, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if timeline.Job.BaseSHA != base || timeline.Job.CandidateSHA != candidate || timeline.Job.Kind != "coding" {
+		t.Fatalf("timeline job = %#v", timeline.Job)
+	}
+	want := []string{"submitted", "leased", "succeeded"}
+	if len(timeline.Events) != len(want) {
+		t.Fatalf("events = %#v", timeline.Events)
+	}
+	for i, event := range timeline.Events {
+		if event.Type != want[i] || event.At.IsZero() {
+			t.Fatalf("event %d = %#v", i, event)
+		}
+	}
+}
 
 func testStore(t *testing.T) *Store {
 	t.Helper()

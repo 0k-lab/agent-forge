@@ -7,7 +7,7 @@ A minimal Go vertical slice: submit a job to **forge-gate**, persist it in SQLit
 - **Gate** owns HTTP/WebSocket APIs, a distinct owner bearer token for every HTTP endpoint, per-worker bearer-token authentication, leases, and authoritative SQLite state.
 - **Worker** initiates the only worker connection (outbound WebSocket), accepts coding jobs only inside configured repository roots, creates a detached worktree at the approved base SHA, executes one configured plugin, runs only the supplied argv test commands in a sanitized environment, and retains the verified candidate under `refs/agent-forge/candidates/<job_id>/<attempt_id>`.
 - **Plugin** is an edit-only subprocess contract. The reference plugin accepts legacy input; `forge-codex-plugin` accepts a workspace and instruction, invokes `CODEX_BIN` (default `codex`) with bounded output and a timeout, and never reports business success or commits.
-- This MVP deliberately has no frontend, Docker, GitHub integration, reviewer, mTLS, PostgreSQL, or plugin marketplace.
+- This MVP deliberately has no control panel, Docker, GitHub integration, reviewer, mTLS, PostgreSQL, or plugin marketplace. Its only browser UI is a read-only debug viewer.
 
 ## Build and test
 
@@ -54,6 +54,14 @@ curl -sS -H 'Authorization: Bearer fake-owner-token' "http://127.0.0.1:18080/v1/
 curl -sS -H 'Authorization: Bearer fake-owner-token' "http://127.0.0.1:18080/v1/jobs/$JOB_ID/events"
 curl -sS -H 'Authorization: Bearer fake-owner-token' "http://127.0.0.1:18080/v1/workers/worker-1"
 ```
+
+## Read-only debug viewer
+
+Open `http://127.0.0.1:18080/debug/`, enter the owner token, and load recent jobs, job timelines, and Worker connection state. The public embedded shell contains no state; the password value is cleared after being copied to JavaScript memory and every JSON request sends it only in the `Authorization: Bearer ...` header.
+
+The owner-authenticated JSON routes are `GET /v1/debug/jobs`, `GET /v1/debug/workers`, and `GET /v1/debug/jobs/{id}`. List and timeline routes accept `limit` (default 25, maximum 100) and an opaque `cursor`. Records contain only diagnostic identifiers, kind/status, timestamps, connection state, exact available SHAs, and event type/time.
+
+These routes cannot submit, retry, cancel, approve, edit policy, manage repositories, recover leases, or mutate state. They intentionally omit task inputs and instructions, repository paths, plugin/test results, authorization values, and event details or errors.
 
 Job results are accepted only for the currently bound attempt. Repeating the identical result is idempotent; a different result or wrong attempt is rejected. Worker `connected` state is set on authenticated WebSocket establishment and cleared when that connection ends.
 
