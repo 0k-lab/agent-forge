@@ -129,7 +129,10 @@ func (s *Store) LeaseNext(workerID string) (Lease, bool, error) {
 	}
 	defer tx.Rollback()
 	var id, input, taskJSON string
-	err = tx.QueryRow(`SELECT id,input,task_json FROM jobs WHERE status='pending' ORDER BY created_at,id LIMIT 1`).Scan(&id, &input, &taskJSON)
+	err = tx.QueryRow(`SELECT id,input,task_json FROM jobs
+		WHERE status='pending'
+		AND NOT EXISTS (SELECT 1 FROM jobs WHERE status='leased' AND worker_id=?)
+		ORDER BY created_at,id LIMIT 1`, workerID).Scan(&id, &input, &taskJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Lease{}, false, nil
 	}
@@ -196,6 +199,9 @@ func (s *Store) terminal(jobID, attemptID, status, result, candidateSHA, failure
 	if j.AttemptID != attemptID {
 		return Job{}, errors.New("attempt does not own job")
 	}
+	if status == "succeeded" && (j.Task != nil) != (candidateSHA != "") {
+		return Job{}, errors.New("result kind does not match job kind")
+	}
 	if j.Status == "succeeded" || j.Status == "failed" {
 		if j.Status != status || j.Result != result || j.CandidateSHA != candidateSHA || j.Error != failure {
 			return Job{}, errors.New("result is immutable")
@@ -210,7 +216,9 @@ func (s *Store) terminal(jobID, attemptID, status, result, candidateSHA, failure
 		return Job{}, err
 	}
 	detail := "result stored"
-	if candidateSHA != "" {
+	if failure != "" {
+		detail = "failure_code=" + failure
+	} else if candidateSHA != "" {
 		detail = "candidate_sha=" + candidateSHA
 	}
 	if _, err = tx.Exec(`INSERT INTO events(job_id,kind,detail,at) VALUES(?,?,?,?)`, jobID, status, detail, stamp); err != nil {

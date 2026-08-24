@@ -20,8 +20,5 @@ jobs:
         run: go test ./...
       - name: Vet
         run: go vet ./...
-      - name: Build binaries
-        run: |
-          go build ./cmd/forge-gate
-          go build ./cmd/forge-worker
-          go build ./cmd/forge-ref-plugin
+      - name: Build
+        run: go build ./...

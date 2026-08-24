@@ -111,7 +111,9 @@ func executeCodingTask(ctx context.Context, pluginPath string, task protocol.Cod
 		return "", err
 	}
 	defer func() {
-		_ = gitCommand(context.Background(), task.Repository, "worktree", "remove", "--force", worktree)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = gitCommand(cleanupCtx, task.Repository, "worktree", "remove", "--force", worktree)
 		_ = os.RemoveAll(worktree)
 	}()
 	if err := gitCommand(ctx, task.Repository, "worktree", "add", "--detach", worktree, task.BaseSHA); err != nil {

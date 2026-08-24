@@ -1,8 +1,8 @@
 CODING E2E PASS
-terminal_job={"status":"succeeded","candidate_sha":"e70b40f7dfd521639bf4cc7741dc557fee896feb","created_at":"2026-08-24T20:04:06.002827348Z","updated_at":"2026-08-24T20:04:33.575707611Z"}
-base_sha=6545e51e1cd81bc22fa2ce91dc4695c762bbeaf9
-candidate_sha=e70b40f7dfd521639bf4cc7741dc557fee896feb
-candidate_parent=6545e51e1cd81bc22fa2ce91dc4695c762bbeaf9
+terminal_job={"status":"succeeded","candidate_sha":"cbb8b3dc7b8d7b00cf36b92331093ba238f1d1cd","created_at":"2026-08-24T20:13:29.444666641Z","updated_at":"2026-08-24T20:13:46.081159805Z"}
+base_sha=299089e31d37729039d0bd9d70f4fac96d58ff36
+candidate_sha=cbb8b3dc7b8d7b00cf36b92331093ba238f1d1cd
+candidate_parent=299089e31d37729039d0bd9d70f4fac96d58ff36
 candidate_object=verified
 event_candidate_sha=verified
 scoped_test=passed
