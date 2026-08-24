@@ -3,6 +3,10 @@ package gate
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +19,213 @@ import (
 	"agent-forge/internal/store"
 	"github.com/coder/websocket"
 )
+
+func TestDebugCursorsAreAuthenticatedScopedAndStableAcrossRestart(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	jobA, err := s.CreateJob("secret-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobB, err := s.CreateJob("secret-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.LeaseNext("worker-a"); err != nil || !ok {
+		t.Fatalf("lease: ok=%v err=%v", ok, err)
+	}
+	if err := s.SetWorkerConnected("worker-a", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetWorkerConnected("worker-b", true); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(s, nil, "owner-secret")
+	jobsCursor := debugResponseCursor(t, h, "/v1/debug/jobs?limit=1", "owner-secret")
+	workersCursor := debugResponseCursor(t, h, "/v1/debug/workers?limit=1", "owner-secret")
+	timelineCursor := debugResponseCursor(t, h, "/v1/debug/jobs/"+jobA.ID+"?limit=1", "owner-secret")
+
+	for name, tc := range map[string]struct {
+		h     http.Handler
+		path  string
+		token string
+	}{
+		"same token after restart": {NewHandler(s, nil, "owner-secret"), "/v1/debug/jobs?cursor=" + jobsCursor, "owner-secret"},
+		"owner token changed":      {NewHandler(s, nil, "new-owner-secret"), "/v1/debug/jobs?cursor=" + jobsCursor, "new-owner-secret"},
+		"jobs on workers":          {h, "/v1/debug/workers?cursor=" + jobsCursor, "owner-secret"},
+		"workers on jobs":          {h, "/v1/debug/jobs?cursor=" + workersCursor, "owner-secret"},
+		"timeline on jobs":         {h, "/v1/debug/jobs?cursor=" + timelineCursor, "owner-secret"},
+		"timeline on another job":  {h, "/v1/debug/jobs/" + jobB.ID + "?cursor=" + timelineCursor, "owner-secret"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			want := http.StatusBadRequest
+			if name == "same token after restart" {
+				want = http.StatusOK
+			}
+			assertDebugStatus(t, tc.h, tc.path, tc.token, want)
+		})
+	}
+
+	codec := newDebugCursorCodec("owner-secret")
+	wrongVersion := signedDebugCursor(t, codec, debugCursorPayload{Version: 2, Purpose: debugJobsPurpose, Stamp: time.Now().UTC().Format(time.RFC3339Nano), ID: "job"})
+	unsigned := base64.RawURLEncoding.EncodeToString([]byte(time.Now().UTC().Format(time.RFC3339Nano) + "\x00job"))
+	replacement := "A"
+	if jobsCursor[0] == 'A' {
+		replacement = "B"
+	}
+	modified := replacement + jobsCursor[1:]
+	for name, cursor := range map[string]string{
+		"modified":         modified,
+		"truncated":        jobsCursor[:len(jobsCursor)-1],
+		"unsigned":         unsigned,
+		"malformed":        "not-valid",
+		"version mismatch": wrongVersion,
+		"too long":         strings.Repeat("A", maxDebugCursorLength+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			assertDebugStatus(t, h, "/v1/debug/jobs?cursor="+cursor, "owner-secret", http.StatusBadRequest)
+		})
+	}
+}
+
+func TestDebugLimitsRejectNonPositiveAndCapLargeValues(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	h := NewHandler(s, nil, "owner-secret")
+	for _, path := range []string{"/v1/debug/jobs", "/v1/debug/workers", "/v1/debug/jobs/missing"} {
+		assertDebugStatus(t, h, path+"?limit=0", "owner-secret", http.StatusBadRequest)
+		assertDebugStatus(t, h, path+"?limit=-1", "owner-secret", http.StatusBadRequest)
+	}
+	for range 101 {
+		if _, err := s.CreateJob("secret"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res := debugRequest(t, h, "/v1/debug/jobs?limit=1000000", "owner-secret")
+	var page struct {
+		Items []json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &page); res.Code != http.StatusOK || err != nil || len(page.Items) != 100 {
+		t.Fatalf("large limit = %d, %d items, err=%v; want 200 and 100 items", res.Code, len(page.Items), err)
+	}
+}
+
+func TestDebugJobsAndWorkersHideStoreFailures(t *testing.T) {
+	for _, path := range []string{"/v1/debug/jobs", "/v1/debug/workers"} {
+		t.Run(path+" database", func(t *testing.T) {
+			s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := NewHandler(s, nil, "owner-secret")
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			res := debugRequest(t, h, path, "owner-secret")
+			if res.Code != http.StatusInternalServerError || res.Body.String() != "{\"message\":\"request failed\"}\n" {
+				t.Fatalf("store failure = %d %q, want generic 500", res.Code, res.Body.String())
+			}
+		})
+		t.Run(path+" context", func(t *testing.T) {
+			s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			h := NewHandler(s, nil, "owner-secret")
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			req := httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx)
+			req.Header.Set("Authorization", "Bearer owner-secret")
+			res := httptest.NewRecorder()
+			h.ServeHTTP(res, req)
+			if res.Code != http.StatusInternalServerError || res.Body.String() != "{\"message\":\"request failed\"}\n" {
+				t.Fatalf("context failure = %d %q, want generic 500", res.Code, res.Body.String())
+			}
+		})
+		t.Run(path+" scan", func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "forge.db")
+			s, err := store.Open(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			if path == "/v1/debug/jobs" {
+				if _, err := s.CreateJob("secret"); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := s.SetWorkerConnected("worker", true); err != nil {
+				t.Fatal(err)
+			}
+			db, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			table, column := "jobs", "updated_at"
+			if path == "/v1/debug/workers" {
+				table, column = "workers", "last_seen"
+			}
+			if _, err := db.Exec("UPDATE " + table + " SET " + column + "='not-a-time'"); err != nil {
+				t.Fatal(err)
+			}
+			h := NewHandler(s, nil, "owner-secret")
+			res := debugRequest(t, h, path, "owner-secret")
+			if res.Code != http.StatusInternalServerError || res.Body.String() != "{\"message\":\"request failed\"}\n" {
+				t.Fatalf("scan failure = %d %q, want generic 500", res.Code, res.Body.String())
+			}
+		})
+	}
+}
+
+func debugResponseCursor(t *testing.T, h http.Handler, path, token string) string {
+	t.Helper()
+	res := debugRequest(t, h, path, token)
+	if res.Code != http.StatusOK {
+		t.Fatalf("GET %s = %d: %s", path, res.Code, res.Body.String())
+	}
+	var body struct {
+		NextCursor string `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil || body.NextCursor == "" {
+		t.Fatalf("GET %s cursor = %q, err=%v", path, body.NextCursor, err)
+	}
+	return body.NextCursor
+}
+
+func assertDebugStatus(t *testing.T, h http.Handler, path, token string, want int) {
+	t.Helper()
+	res := debugRequest(t, h, path, token)
+	if res.Code != want {
+		t.Fatalf("GET %s = %d: %s; want %d", path, res.Code, res.Body.String(), want)
+	}
+}
+
+func debugRequest(t *testing.T, h http.Handler, path, token string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, req)
+	return res
+}
+
+func signedDebugCursor(t *testing.T, codec debugCursorCodec, payload debugCursorPayload) string {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mac := hmac.New(sha256.New, codec.key[:])
+	_, _ = mac.Write(body)
+	return base64.RawURLEncoding.EncodeToString(append(body, mac.Sum(nil)...))
+}
 
 func TestDebugAPIRequiresOwnerAndReturnsOnlySanitizedData(t *testing.T) {
 	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))

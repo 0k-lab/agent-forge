@@ -26,12 +26,12 @@ func TestDebugReadModelsAreBoundedStableAndReadOnly(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT total_changes()`).Scan(&before); err != nil {
 		t.Fatal(err)
 	}
-	first, err := s.RecentDebugJobs(context.Background(), 1000, "")
+	first, err := s.RecentDebugJobs(context.Background(), 1000, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(first.Items) != 100 || first.NextCursor == "" {
-		t.Fatalf("first page = %d items, cursor %q", len(first.Items), first.NextCursor)
+	if len(first.Items) != 100 || first.NextPosition == nil {
+		t.Fatalf("first page = %d items, position %#v", len(first.Items), first.NextPosition)
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(ids)))
 	for i, job := range first.Items {
@@ -39,7 +39,7 @@ func TestDebugReadModelsAreBoundedStableAndReadOnly(t *testing.T) {
 			t.Fatalf("item %d = %q, want %q", i, job.ID, ids[i])
 		}
 	}
-	second, err := s.RecentDebugJobs(context.Background(), 100, first.NextCursor)
+	second, err := s.RecentDebugJobs(context.Background(), 100, first.NextPosition)
 	if err != nil || len(second.Items) != 2 || second.Items[0].ID != ids[100] || second.Items[1].ID != ids[101] {
 		t.Fatalf("second page = %#v, %v", second, err)
 	}
@@ -55,13 +55,13 @@ func TestDebugReadModelsAreBoundedStableAndReadOnly(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	workers, err := s.RecentDebugWorkers(context.Background(), 101, "")
-	if err != nil || len(workers.Items) != 100 || workers.NextCursor == "" || workers.Items[0].ID != "worker-101" {
+	workers, err := s.RecentDebugWorkers(context.Background(), 101, nil)
+	if err != nil || len(workers.Items) != 100 || workers.NextPosition == nil || workers.Items[0].ID != "worker-101" {
 		t.Fatalf("worker page = %#v, %v", workers, err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := s.RecentDebugJobs(ctx, 1, ""); err == nil {
+	if _, err := s.RecentDebugJobs(ctx, 1, nil); err == nil {
 		t.Fatal("canceled context was ignored")
 	}
 }
@@ -77,11 +77,11 @@ func TestDebugTimelinePaginationIsBoundedAndStable(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	first, err := s.DebugJobTimeline(context.Background(), "job", 1000, "")
-	if err != nil || len(first.Events) != 100 || first.NextCursor == "" || first.Events[0].Type != "event-000" || first.Events[99].Type != "event-099" {
+	first, err := s.DebugJobTimeline(context.Background(), "job", 1000, nil)
+	if err != nil || len(first.Events) != 100 || first.NextPosition == nil || first.Events[0].Type != "event-000" || first.Events[99].Type != "event-099" {
 		t.Fatalf("first timeline page = %#v, %v", first, err)
 	}
-	second, err := s.DebugJobTimeline(context.Background(), "job", 100, first.NextCursor)
+	second, err := s.DebugJobTimeline(context.Background(), "job", 100, first.NextPosition)
 	if err != nil || len(second.Events) != 2 || second.Events[0].Type != "event-100" || second.Events[1].Type != "event-101" {
 		t.Fatalf("second timeline page = %#v, %v", second, err)
 	}
@@ -105,7 +105,7 @@ func TestDebugTimelineSanitizesSyntheticCompletedJob(t *testing.T) {
 	if _, err := s.CompleteCandidate(job.ID, lease.AttemptID, candidate); err != nil {
 		t.Fatal(err)
 	}
-	timeline, err := s.DebugJobTimeline(context.Background(), job.ID, 1000, "")
+	timeline, err := s.DebugJobTimeline(context.Background(), job.ID, 1000, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,13 +1,18 @@
 package gate
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
 	"embed"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -24,6 +29,72 @@ type server struct {
 	store  *store.Store
 	tokens map[string]string
 	owner  string
+	cursor debugCursorCodec
+}
+
+const (
+	debugCursorVersion   = 1
+	maxDebugCursorLength = 512
+	debugJobsPurpose     = "jobs"
+	debugWorkersPurpose  = "workers"
+)
+
+type debugCursorCodec struct{ key [sha256.Size]byte }
+
+type debugCursorPayload struct {
+	Version int    `json:"v"`
+	Purpose string `json:"purpose"`
+	Stamp   string `json:"stamp"`
+	ID      string `json:"id"`
+}
+
+func newDebugCursorCodec(ownerToken string) debugCursorCodec {
+	return debugCursorCodec{key: sha256.Sum256([]byte("agent-forge/debug-cursor/v1\x00" + ownerToken))}
+}
+
+func (c debugCursorCodec) encode(purpose string, position *store.DebugPosition) string {
+	if position == nil {
+		return ""
+	}
+	body, _ := json.Marshal(debugCursorPayload{
+		Version: debugCursorVersion,
+		Purpose: purpose,
+		Stamp:   position.At.Format(time.RFC3339Nano),
+		ID:      position.ID,
+	})
+	mac := hmac.New(sha256.New, c.key[:])
+	_, _ = mac.Write(body)
+	return base64.RawURLEncoding.EncodeToString(append(body, mac.Sum(nil)...))
+}
+
+func (c debugCursorCodec) decode(cursor, purpose string) (*store.DebugPosition, error) {
+	if cursor == "" {
+		return nil, nil
+	}
+	if len(cursor) > maxDebugCursorLength {
+		return nil, store.ErrInvalidDebugCursor
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil || len(raw) <= sha256.Size {
+		return nil, store.ErrInvalidDebugCursor
+	}
+	body, suppliedMAC := raw[:len(raw)-sha256.Size], raw[len(raw)-sha256.Size:]
+	mac := hmac.New(sha256.New, c.key[:])
+	_, _ = mac.Write(body)
+	if subtle.ConstantTimeCompare(suppliedMAC, mac.Sum(nil)) != 1 {
+		return nil, store.ErrInvalidDebugCursor
+	}
+	var payload debugCursorPayload
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil || decoder.Decode(&struct{}{}) != io.EOF || payload.Version != debugCursorVersion || payload.Purpose != purpose || payload.ID == "" {
+		return nil, store.ErrInvalidDebugCursor
+	}
+	at, err := time.Parse(time.RFC3339Nano, payload.Stamp)
+	if err != nil {
+		return nil, store.ErrInvalidDebugCursor
+	}
+	return &store.DebugPosition{At: at, ID: payload.ID}, nil
 }
 
 //go:embed debug/index.html debug/app.css debug/app.js
@@ -35,7 +106,7 @@ func NewHandler(s *store.Store, tokens map[string]string, ownerToken string) htt
 			ownerToken = ""
 		}
 	}
-	x := &server{store: s, tokens: tokens, owner: ownerToken}
+	x := &server{store: s, tokens: tokens, owner: ownerToken, cursor: newDebugCursorCodec(ownerToken)}
 	m := http.NewServeMux()
 	m.HandleFunc("POST /v1/jobs", x.ownerAuth(x.submit))
 	m.HandleFunc("GET /v1/jobs/{id}", x.ownerAuth(x.getJob))
@@ -92,7 +163,14 @@ func debugLimit(r *http.Request) (int, error) {
 	if r.URL.Query().Get("limit") == "" {
 		return 25, nil
 	}
-	return strconv.Atoi(r.URL.Query().Get("limit"))
+	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+	if err != nil || limit <= 0 {
+		return 0, errors.New("invalid limit")
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	return limit, nil
 }
 
 func (x *server) debugJobs(w http.ResponseWriter, r *http.Request) {
@@ -101,11 +179,17 @@ func (x *server) debugJobs(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"message": "invalid request"})
 		return
 	}
-	page, err := x.store.RecentDebugJobs(r.Context(), limit, r.URL.Query().Get("cursor"))
+	position, err := x.cursor.decode(r.URL.Query().Get("cursor"), debugJobsPurpose)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"message": "invalid request"})
+		writeDebugError(w, err)
 		return
 	}
+	page, err := x.store.RecentDebugJobs(r.Context(), limit, position)
+	if err != nil {
+		writeDebugError(w, err)
+		return
+	}
+	page.NextCursor = x.cursor.encode(debugJobsPurpose, page.NextPosition)
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, page)
 }
@@ -116,11 +200,17 @@ func (x *server) debugWorkers(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"message": "invalid request"})
 		return
 	}
-	page, err := x.store.RecentDebugWorkers(r.Context(), limit, r.URL.Query().Get("cursor"))
+	position, err := x.cursor.decode(r.URL.Query().Get("cursor"), debugWorkersPurpose)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"message": "invalid request"})
+		writeDebugError(w, err)
 		return
 	}
+	page, err := x.store.RecentDebugWorkers(r.Context(), limit, position)
+	if err != nil {
+		writeDebugError(w, err)
+		return
+	}
+	page.NextCursor = x.cursor.encode(debugWorkersPurpose, page.NextPosition)
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, page)
 }
@@ -131,19 +221,37 @@ func (x *server) debugTimeline(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"message": "invalid request"})
 		return
 	}
-	timeline, err := x.store.DebugJobTimeline(r.Context(), r.PathValue("id"), limit, r.URL.Query().Get("cursor"))
+	jobID := r.PathValue("id")
+	purpose := "timeline:" + jobID
+	position, err := x.cursor.decode(r.URL.Query().Get("cursor"), purpose)
+	if err != nil {
+		writeDebugError(w, err)
+		return
+	}
+	timeline, err := x.store.DebugJobTimeline(r.Context(), jobID, limit, position)
 	if err != nil {
 		status, message := http.StatusInternalServerError, "request failed"
 		if errors.Is(err, sql.ErrNoRows) {
 			status, message = http.StatusNotFound, "not found"
-		} else if errors.Is(err, store.ErrInvalidDebugCursor) {
-			status, message = http.StatusBadRequest, "invalid request"
 		}
-		writeJSON(w, status, map[string]string{"message": message})
+		if errors.Is(err, store.ErrInvalidDebugCursor) {
+			writeDebugError(w, err)
+		} else {
+			writeJSON(w, status, map[string]string{"message": message})
+		}
 		return
 	}
+	timeline.NextCursor = x.cursor.encode(purpose, timeline.NextPosition)
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, timeline)
+}
+
+func writeDebugError(w http.ResponseWriter, err error) {
+	status, message := http.StatusInternalServerError, "request failed"
+	if errors.Is(err, store.ErrInvalidDebugCursor) {
+		status, message = http.StatusBadRequest, "invalid request"
+	}
+	writeJSON(w, status, map[string]string{"message": message})
 }
 
 func (x *server) debugAsset(w http.ResponseWriter, r *http.Request) {
