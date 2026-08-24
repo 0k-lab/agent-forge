@@ -112,6 +112,9 @@ func validateTask(task protocol.CodingTask) error {
 			return errors.New("invalid scoped test argv")
 		}
 	}
+	if err := protocol.ValidateCommitAuthor(task.CommitAuthorName, task.CommitAuthorEmail); err != nil {
+		return err
+	}
 	return nil
 }
 func (x *server) getJob(w http.ResponseWriter, r *http.Request) {

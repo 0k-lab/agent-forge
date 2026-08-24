@@ -107,6 +107,9 @@ func invoke(parent context.Context, path string, request pluginRequest) (string,
 }
 
 func executeCodingTask(ctx context.Context, pluginPath string, roots []string, jobID, attemptID string, task protocol.CodingTask) (sha string, err error) {
+	if err := protocol.ValidateCommitAuthor(task.CommitAuthorName, task.CommitAuthorEmail); err != nil {
+		return "", err
+	}
 	repository, err := allowedRepository(task.Repository, roots)
 	if err != nil {
 		return "", err
@@ -176,7 +179,17 @@ func executeCodingTask(ctx context.Context, pluginPath string, roots []string, j
 	if err := gitCommand(ctx, worktree, "add", "-A"); err != nil {
 		return "", err
 	}
-	if err := gitCommand(ctx, worktree, "-c", "user.name=Agent Forge", "-c", "user.email=forge@example.invalid", "commit", "-m", "chore: apply coding task"); err != nil {
+	authorName, authorEmail := task.CommitAuthorName, task.CommitAuthorEmail
+	if authorName == "" && authorEmail == "" {
+		authorName, authorEmail = "Agent Forge", "forge@example.invalid"
+	}
+	identityEnv := []string{
+		"GIT_AUTHOR_NAME=" + authorName,
+		"GIT_AUTHOR_EMAIL=" + authorEmail,
+		"GIT_COMMITTER_NAME=Agent Forge",
+		"GIT_COMMITTER_EMAIL=forge@example.invalid",
+	}
+	if err := gitCommandEnv(ctx, worktree, identityEnv, "commit", "-m", "chore: apply coding task"); err != nil {
 		return "", err
 	}
 	sha, err = gitOutput(ctx, worktree, "rev-parse", "HEAD")
@@ -279,8 +292,12 @@ func environmentValue(name, fallback string) string {
 }
 
 func gitCommand(ctx context.Context, dir string, args ...string) error {
+	return gitCommandEnv(ctx, dir, nil, args...)
+}
+
+func gitCommandEnv(ctx context.Context, dir string, env []string, args ...string) error {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = []string{"PATH=" + environmentValue("PATH", "/usr/local/bin:/usr/bin:/bin")}
+	cmd.Env = append([]string{"PATH=" + environmentValue("PATH", "/usr/local/bin:/usr/bin:/bin")}, env...)
 	cmd.Stdout = &limitedWriter{w: io.Discard, n: 1 << 20}
 	cmd.Stderr = &limitedWriter{w: io.Discard, n: 1 << 20}
 	return cmd.Run()
