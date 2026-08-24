@@ -5,30 +5,37 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"agent-forge/internal/protocol"
 	_ "modernc.org/sqlite"
 )
 
 type Store struct{ db *sql.DB }
 
 type Job struct {
-	ID        string    `json:"id"`
-	Input     string    `json:"input"`
-	Status    string    `json:"status"`
-	AttemptID string    `json:"attempt_id,omitempty"`
-	WorkerID  string    `json:"worker_id,omitempty"`
-	Result    string    `json:"result,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID           string               `json:"id"`
+	Input        string               `json:"input,omitempty"`
+	Task         *protocol.CodingTask `json:"task,omitempty"`
+	Status       string               `json:"status"`
+	AttemptID    string               `json:"attempt_id,omitempty"`
+	WorkerID     string               `json:"worker_id,omitempty"`
+	Result       string               `json:"result,omitempty"`
+	CandidateSHA string               `json:"candidate_sha,omitempty"`
+	Error        string               `json:"error,omitempty"`
+	CreatedAt    time.Time            `json:"created_at"`
+	UpdatedAt    time.Time            `json:"updated_at"`
 }
 
 type Lease struct {
-	JobID     string `json:"job_id"`
-	AttemptID string `json:"attempt_id"`
-	Input     string `json:"input"`
+	JobID     string               `json:"job_id"`
+	AttemptID string               `json:"attempt_id"`
+	Input     string               `json:"input,omitempty"`
+	Task      *protocol.CodingTask `json:"task,omitempty"`
 }
 type Event struct {
 	ID     int64     `json:"id"`
@@ -58,6 +65,18 @@ CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, connected INTEGER NOT N
 		db.Close()
 		return nil, err
 	}
+	if _, err = db.Exec(`ALTER TABLE jobs ADD COLUMN candidate_sha TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		db.Close()
+		return nil, err
+	}
+	if _, err = db.Exec(`ALTER TABLE jobs ADD COLUMN task_json TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		db.Close()
+		return nil, err
+	}
+	if _, err = db.Exec(`ALTER TABLE jobs ADD COLUMN error_text TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		db.Close()
+		return nil, err
+	}
 	return s, nil
 }
 func (s *Store) Close() error { return s.db.Close() }
@@ -71,14 +90,30 @@ func newID() string {
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
 func (s *Store) CreateJob(input string) (Job, error) {
-	j := Job{ID: newID(), Input: input, Status: "pending", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	return s.createJob(input, nil)
+}
+
+func (s *Store) CreateCodingJob(task protocol.CodingTask) (Job, error) {
+	return s.createJob("", &task)
+}
+
+func (s *Store) createJob(input string, task *protocol.CodingTask) (Job, error) {
+	j := Job{ID: newID(), Input: input, Task: task, Status: "pending", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	taskJSON := ""
+	if task != nil {
+		body, err := json.Marshal(task)
+		if err != nil {
+			return Job{}, err
+		}
+		taskJSON = string(body)
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Job{}, err
 	}
 	defer tx.Rollback()
 	stamp := j.CreatedAt.Format(time.RFC3339Nano)
-	if _, err = tx.Exec(`INSERT INTO jobs(id,input,status,created_at,updated_at) VALUES(?,?,?,?,?)`, j.ID, j.Input, j.Status, stamp, stamp); err != nil {
+	if _, err = tx.Exec(`INSERT INTO jobs(id,input,task_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?)`, j.ID, j.Input, taskJSON, j.Status, stamp, stamp); err != nil {
 		return Job{}, err
 	}
 	if _, err = tx.Exec(`INSERT INTO events(job_id,kind,detail,at) VALUES(?,?,?,?)`, j.ID, "submitted", "job accepted", stamp); err != nil {
@@ -93,8 +128,11 @@ func (s *Store) LeaseNext(workerID string) (Lease, bool, error) {
 		return Lease{}, false, err
 	}
 	defer tx.Rollback()
-	var id, input string
-	err = tx.QueryRow(`SELECT id,input FROM jobs WHERE status='pending' ORDER BY created_at,id LIMIT 1`).Scan(&id, &input)
+	var id, input, taskJSON string
+	err = tx.QueryRow(`SELECT id,input,task_json FROM jobs
+		WHERE status='pending'
+		AND NOT EXISTS (SELECT 1 FROM jobs WHERE status='leased' AND worker_id=?)
+		ORDER BY created_at,id LIMIT 1`, workerID).Scan(&id, &input, &taskJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Lease{}, false, nil
 	}
@@ -117,24 +155,55 @@ func (s *Store) LeaseNext(workerID string) (Lease, bool, error) {
 	if err = tx.Commit(); err != nil {
 		return Lease{}, false, err
 	}
-	return Lease{JobID: id, AttemptID: attempt, Input: input}, true, nil
+	lease := Lease{JobID: id, AttemptID: attempt, Input: input}
+	if taskJSON != "" {
+		lease.Task = new(protocol.CodingTask)
+		if err := json.Unmarshal([]byte(taskJSON), lease.Task); err != nil {
+			return Lease{}, false, err
+		}
+	}
+	return lease, true, nil
 }
 
 func (s *Store) Complete(jobID, attemptID, result string) (Job, error) {
+	return s.terminal(jobID, attemptID, "succeeded", result, "", "")
+}
+
+func (s *Store) CompleteCandidate(jobID, attemptID, candidateSHA string) (Job, error) {
+	if len(candidateSHA) != 40 {
+		return Job{}, errors.New("candidate SHA must be full length")
+	}
+	if _, err := hex.DecodeString(candidateSHA); err != nil {
+		return Job{}, errors.New("candidate SHA is not hexadecimal")
+	}
+	return s.terminal(jobID, attemptID, "succeeded", "", candidateSHA, "")
+}
+
+func (s *Store) Fail(jobID, attemptID, code string) (Job, error) {
+	if code == "" || len(code) > 64 {
+		return Job{}, errors.New("invalid failure code")
+	}
+	return s.terminal(jobID, attemptID, "failed", "", "", code)
+}
+
+func (s *Store) terminal(jobID, attemptID, status, result, candidateSHA, failure string) (Job, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Job{}, err
 	}
 	defer tx.Rollback()
-	j, err := scanJob(tx.QueryRow(`SELECT id,input,status,attempt_id,worker_id,result,created_at,updated_at FROM jobs WHERE id=?`, jobID))
+	j, err := scanJob(tx.QueryRow(`SELECT id,input,task_json,status,attempt_id,worker_id,result,candidate_sha,error_text,created_at,updated_at FROM jobs WHERE id=?`, jobID))
 	if err != nil {
 		return Job{}, err
 	}
 	if j.AttemptID != attemptID {
 		return Job{}, errors.New("attempt does not own job")
 	}
-	if j.Status == "succeeded" {
-		if j.Result != result {
+	if status == "succeeded" && (j.Task != nil) != (candidateSHA != "") {
+		return Job{}, errors.New("result kind does not match job kind")
+	}
+	if j.Status == "succeeded" || j.Status == "failed" {
+		if j.Status != status || j.Result != result || j.CandidateSHA != candidateSHA || j.Error != failure {
 			return Job{}, errors.New("result is immutable")
 		}
 		return j, tx.Commit()
@@ -143,10 +212,16 @@ func (s *Store) Complete(jobID, attemptID, result string) (Job, error) {
 		return Job{}, fmt.Errorf("job status is %s", j.Status)
 	}
 	stamp := now()
-	if _, err = tx.Exec(`UPDATE jobs SET status='succeeded',result=?,updated_at=? WHERE id=? AND status='leased' AND attempt_id=?`, result, stamp, jobID, attemptID); err != nil {
+	if _, err = tx.Exec(`UPDATE jobs SET status=?,result=?,candidate_sha=?,error_text=?,updated_at=? WHERE id=? AND status='leased' AND attempt_id=?`, status, result, candidateSHA, failure, stamp, jobID, attemptID); err != nil {
 		return Job{}, err
 	}
-	if _, err = tx.Exec(`INSERT INTO events(job_id,kind,detail,at) VALUES(?,?,?,?)`, jobID, "succeeded", "result stored", stamp); err != nil {
+	detail := "result stored"
+	if failure != "" {
+		detail = "failure_code=" + failure
+	} else if candidateSHA != "" {
+		detail = "candidate_sha=" + candidateSHA
+	}
+	if _, err = tx.Exec(`INSERT INTO events(job_id,kind,detail,at) VALUES(?,?,?,?)`, jobID, status, detail, stamp); err != nil {
 		return Job{}, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -159,10 +234,16 @@ type scanner interface{ Scan(...any) error }
 
 func scanJob(r scanner) (Job, error) {
 	var j Job
-	var c, u string
-	err := r.Scan(&j.ID, &j.Input, &j.Status, &j.AttemptID, &j.WorkerID, &j.Result, &c, &u)
+	var taskJSON, c, u string
+	err := r.Scan(&j.ID, &j.Input, &taskJSON, &j.Status, &j.AttemptID, &j.WorkerID, &j.Result, &j.CandidateSHA, &j.Error, &c, &u)
 	if err != nil {
 		return j, err
+	}
+	if taskJSON != "" {
+		j.Task = new(protocol.CodingTask)
+		if err = json.Unmarshal([]byte(taskJSON), j.Task); err != nil {
+			return j, err
+		}
 	}
 	j.CreatedAt, err = time.Parse(time.RFC3339Nano, c)
 	if err != nil {
@@ -172,7 +253,7 @@ func scanJob(r scanner) (Job, error) {
 	return j, err
 }
 func (s *Store) Job(id string) (Job, error) {
-	return scanJob(s.db.QueryRow(`SELECT id,input,status,attempt_id,worker_id,result,created_at,updated_at FROM jobs WHERE id=?`, id))
+	return scanJob(s.db.QueryRow(`SELECT id,input,task_json,status,attempt_id,worker_id,result,candidate_sha,error_text,created_at,updated_at FROM jobs WHERE id=?`, id))
 }
 func (s *Store) Events(id string) ([]Event, error) {
 	rows, err := s.db.Query(`SELECT id,job_id,kind,detail,at FROM events WHERE job_id=? ORDER BY id`, id)

@@ -18,7 +18,7 @@ Use synthetic fixtures and clearly fake example credentials. When reporting fail
 Two test scopes are intentionally separate:
 
 1. **Repository CI** runs the broad generic suite (`go test ./...`, `go vet ./...`, and builds both binaries). CI protects the public Agent Forge codebase.
-2. **Task execution** runs only tests selected by the managed repository manifest or explicit task policy. A Worker must not invent or expand test scope on its own.
+2. **Task execution** runs only explicit argv test commands in the job payload. A Worker must not add a shell wrapper, invent tests, or expand test scope on its own.
 
 A task may request broader tests only through an explicit, bounded repository policy. Runtime evidence must contain sanitized summaries, not raw private output.
 
