@@ -1,16 +1,101 @@
 package store
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"agent-forge/internal/protocol"
 )
+
+func TestOpenPersistsOneValidDebugCursorSecret(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "forge.db")
+	const opens = 8
+	secrets := make(chan []byte, opens)
+	errs := make(chan error, opens)
+	var wg sync.WaitGroup
+	for range opens {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s, err := Open(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer s.Close()
+			var secret []byte
+			err = s.db.QueryRow(`SELECT value FROM metadata WHERE key='debug_cursor_secret'`).Scan(&secret)
+			if err != nil {
+				errs <- err
+				return
+			}
+			secrets <- secret
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	close(secrets)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	var first []byte
+	for secret := range secrets {
+		if len(secret) != 32 {
+			t.Fatalf("secret length = %d, want 32", len(secret))
+		}
+		if first == nil {
+			first = secret
+		} else if !bytes.Equal(first, secret) {
+			t.Fatal("concurrent opens loaded different secrets")
+		}
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var reopened []byte
+	if err := s.db.QueryRow(`SELECT value FROM metadata WHERE key='debug_cursor_secret'`).Scan(&reopened); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, reopened) {
+		t.Fatal("reopen changed debug cursor secret")
+	}
+}
+
+func TestOpenRejectsMalformedDebugCursorSecret(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "forge.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE metadata SET value=x'00' WHERE key='debug_cursor_secret'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s, err = Open(path); err == nil {
+		s.Close()
+		t.Fatal("Open accepted malformed debug cursor secret")
+	}
+}
 
 func TestDebugReadModelsAreBoundedStableAndReadOnly(t *testing.T) {
 	s := testStore(t)

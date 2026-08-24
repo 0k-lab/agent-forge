@@ -69,7 +69,7 @@ func TestDebugCursorsAreAuthenticatedScopedAndStableAcrossRestart(t *testing.T) 
 		})
 	}
 
-	codec := newDebugCursorCodec("owner-secret")
+	codec := newDebugCursorCodec(s.DebugCursorKey("owner-secret"))
 	wrongVersion := signedDebugCursor(t, codec, debugCursorPayload{Version: 2, Purpose: debugJobsPurpose, Stamp: time.Now().UTC().Format(time.RFC3339Nano), ID: "job"})
 	unsigned := base64.RawURLEncoding.EncodeToString([]byte(time.Now().UTC().Format(time.RFC3339Nano) + "\x00job"))
 	replacement := "A"
@@ -89,6 +89,41 @@ func TestDebugCursorsAreAuthenticatedScopedAndStableAcrossRestart(t *testing.T) 
 			assertDebugStatus(t, h, "/v1/debug/jobs?cursor="+cursor, "owner-secret", http.StatusBadRequest)
 		})
 	}
+}
+
+func TestDebugCursorKeyBindsDatabaseAndOwnerToken(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "forge.db")
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := s.CreateJob("secret"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cursor := debugResponseCursor(t, NewHandler(s, nil, "owner-secret"), "/v1/debug/jobs?limit=1", "owner-secret")
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	assertDebugStatus(t, NewHandler(s, nil, "owner-secret"), "/v1/debug/jobs?cursor="+cursor, "owner-secret", http.StatusOK)
+	assertDebugStatus(t, NewHandler(s, nil, "changed-owner"), "/v1/debug/jobs?cursor="+cursor, "changed-owner", http.StatusBadRequest)
+
+	other, err := store.Open(filepath.Join(t.TempDir(), "other.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	assertDebugStatus(t, NewHandler(other, nil, "owner-secret"), "/v1/debug/jobs?cursor="+cursor, "owner-secret", http.StatusBadRequest)
+
+	payload := debugCursorPayload{Version: debugCursorVersion, Purpose: debugJobsPurpose, Stamp: time.Now().UTC().Format(time.RFC3339Nano), ID: "job"}
+	assertDebugStatus(t, NewHandler(s, nil, "owner-secret"), "/v1/debug/jobs?cursor="+ownerTokenOnlyCursor(t, "owner-secret", payload), "owner-secret", http.StatusBadRequest)
 }
 
 func TestDebugLimitsRejectNonPositiveAndCapLargeValues(t *testing.T) {
@@ -223,6 +258,18 @@ func signedDebugCursor(t *testing.T, codec debugCursorCodec, payload debugCursor
 		t.Fatal(err)
 	}
 	mac := hmac.New(sha256.New, codec.key[:])
+	_, _ = mac.Write(body)
+	return base64.RawURLEncoding.EncodeToString(append(body, mac.Sum(nil)...))
+}
+
+func ownerTokenOnlyCursor(t *testing.T, ownerToken string, payload debugCursorPayload) string {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := sha256.Sum256([]byte("agent-forge/debug-cursor/v1\x00" + ownerToken))
+	mac := hmac.New(sha256.New, key[:])
 	_, _ = mac.Write(body)
 	return base64.RawURLEncoding.EncodeToString(append(body, mac.Sum(nil)...))
 }

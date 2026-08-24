@@ -48,8 +48,8 @@ type debugCursorPayload struct {
 	ID      string `json:"id"`
 }
 
-func newDebugCursorCodec(ownerToken string) debugCursorCodec {
-	return debugCursorCodec{key: sha256.Sum256([]byte("agent-forge/debug-cursor/v1\x00" + ownerToken))}
+func newDebugCursorCodec(key [sha256.Size]byte) debugCursorCodec {
+	return debugCursorCodec{key: key}
 }
 
 func (c debugCursorCodec) encode(purpose string, position *store.DebugPosition) string {
@@ -106,7 +106,7 @@ func NewHandler(s *store.Store, tokens map[string]string, ownerToken string) htt
 			ownerToken = ""
 		}
 	}
-	x := &server{store: s, tokens: tokens, owner: ownerToken, cursor: newDebugCursorCodec(ownerToken)}
+	x := &server{store: s, tokens: tokens, owner: ownerToken, cursor: newDebugCursorCodec(s.DebugCursorKey(ownerToken))}
 	m := http.NewServeMux()
 	m.HandleFunc("POST /v1/jobs", x.ownerAuth(x.submit))
 	m.HandleFunc("GET /v1/jobs/{id}", x.ownerAuth(x.getJob))

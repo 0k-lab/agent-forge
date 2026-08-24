@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -15,7 +17,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db                *sql.DB
+	debugCursorSecret [32]byte
+}
 
 type Job struct {
 	ID           string               `json:"id"`
@@ -60,7 +65,8 @@ func Open(path string) (*Store, error) {
 	_, err = db.Exec(`PRAGMA busy_timeout=5000;
 CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, input TEXT NOT NULL, status TEXT NOT NULL, attempt_id TEXT NOT NULL DEFAULT '', worker_id TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL, at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, connected INTEGER NOT NULL, last_seen TEXT NOT NULL);`)
+CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, connected INTEGER NOT NULL, last_seen TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value BLOB NOT NULL);`)
 	if err != nil {
 		db.Close()
 		return nil, err
@@ -77,9 +83,35 @@ CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, connected INTEGER NOT N
 		db.Close()
 		return nil, err
 	}
+	candidate := make([]byte, len(s.debugCursorSecret))
+	if _, err = rand.Read(candidate); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if _, err = db.Exec(`INSERT OR IGNORE INTO metadata(key,value) VALUES('debug_cursor_secret',?)`, candidate); err != nil {
+		db.Close()
+		return nil, err
+	}
+	var secret []byte
+	if err = db.QueryRow(`SELECT value FROM metadata WHERE key='debug_cursor_secret'`).Scan(&secret); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if len(secret) != len(s.debugCursorSecret) {
+		db.Close()
+		return nil, errors.New("invalid debug cursor secret")
+	}
+	copy(s.debugCursorSecret[:], secret)
 	return s, nil
 }
 func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) DebugCursorKey(ownerToken string) [sha256.Size]byte {
+	mac := hmac.New(sha256.New, s.debugCursorSecret[:])
+	_, _ = mac.Write([]byte("agent-forge/debug-cursor/key/v1\x00" + ownerToken))
+	var key [sha256.Size]byte
+	copy(key[:], mac.Sum(nil))
+	return key
+}
 func newID() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
