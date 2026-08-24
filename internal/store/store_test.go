@@ -65,3 +65,37 @@ func TestWorkerLivenessTracksConnectionState(t *testing.T) {
 		t.Fatalf("disconnected worker reported live: %#v %v", w, err)
 	}
 }
+
+func TestCandidateResultIsExactAndImmutable(t *testing.T) {
+	s := testStore(t)
+	job, err := s.CreateJob("coding task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, ok, err := s.LeaseNext("worker-1")
+	if err != nil || !ok {
+		t.Fatalf("lease: ok=%v err=%v", ok, err)
+	}
+	want := "1111111111111111111111111111111111111111"
+	first, err := s.CompleteCandidate(job.ID, lease.AttemptID, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.CompleteCandidate(job.ID, lease.AttemptID, want)
+	if err != nil {
+		t.Fatalf("identical retry must be idempotent: %v", err)
+	}
+	if first.CandidateSHA != want || second.CandidateSHA != want {
+		t.Fatalf("candidate SHA not preserved: %#v %#v", first, second)
+	}
+	events, err := s.Events(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := events[len(events)-1].Detail; got != "candidate_sha="+want {
+		t.Fatalf("terminal event detail = %q", got)
+	}
+	if _, err := s.CompleteCandidate(job.ID, lease.AttemptID, "2222222222222222222222222222222222222222"); err == nil {
+		t.Fatal("conflicting candidate accepted")
+	}
+}

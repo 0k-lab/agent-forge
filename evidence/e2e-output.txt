@@ -1,6 +1,6 @@
 E2E PASS
-submit={"id":"844d2ab9105dc0f122abe1d9225dc208","input":"hello agent forge","status":"pending","created_at":"2026-08-24T19:23:38.386580035Z","updated_at":"2026-08-24T19:23:38.386580095Z"}
-terminal_job={"id":"844d2ab9105dc0f122abe1d9225dc208","input":"hello agent forge","status":"succeeded","attempt_id":"ca6c7fd0d1f470fd5dfb24ac3f7036ec","worker_id":"worker-1","result":"FORGE: HELLO AGENT FORGE","created_at":"2026-08-24T19:23:38.386580035Z","updated_at":"2026-08-24T19:23:38.498069238Z"}
-events=[{"id":1,"job_id":"844d2ab9105dc0f122abe1d9225dc208","kind":"submitted","detail":"job accepted","at":"2026-08-24T19:23:38.386580035Z"},{"id":2,"job_id":"844d2ab9105dc0f122abe1d9225dc208","kind":"leased","detail":"worker=worker-1 attempt=ca6c7fd0d1f470fd5dfb24ac3f7036ec","at":"2026-08-24T19:23:38.478862195Z"},{"id":3,"job_id":"844d2ab9105dc0f122abe1d9225dc208","kind":"succeeded","detail":"result stored","at":"2026-08-24T19:23:38.498069238Z"}]
-worker_live={"id":"worker-1","connected":true,"last_seen":"2026-08-24T19:23:38.361558624Z"}
-worker_after_stop={"id":"worker-1","connected":false,"last_seen":"2026-08-24T19:23:38.577325881Z"}
+submit={"id":"c614c709a3a9029e5601aec283ffe16a","input":"hello agent forge","status":"pending","created_at":"2026-08-24T20:03:25.695238328Z","updated_at":"2026-08-24T20:03:25.695238399Z"}
+terminal_job={"id":"c614c709a3a9029e5601aec283ffe16a","input":"hello agent forge","status":"succeeded","attempt_id":"d5b0dc7f6347ff603fc8c57e13d627ec","worker_id":"worker-1","result":"FORGE: HELLO AGENT FORGE","created_at":"2026-08-24T20:03:25.695238328Z","updated_at":"2026-08-24T20:03:25.800065373Z"}
+events=[{"id":1,"job_id":"c614c709a3a9029e5601aec283ffe16a","kind":"submitted","detail":"job accepted","at":"2026-08-24T20:03:25.695238328Z"},{"id":2,"job_id":"c614c709a3a9029e5601aec283ffe16a","kind":"leased","detail":"worker=worker-1 attempt=d5b0dc7f6347ff603fc8c57e13d627ec","at":"2026-08-24T20:03:25.787593678Z"},{"id":3,"job_id":"c614c709a3a9029e5601aec283ffe16a","kind":"succeeded","detail":"result stored","at":"2026-08-24T20:03:25.800065373Z"}]
+worker_live={"id":"worker-1","connected":true,"last_seen":"2026-08-24T20:03:25.676243408Z"}
+worker_after_stop={"id":"worker-1","connected":false,"last_seen":"2026-08-24T20:03:25.885911896Z"}
