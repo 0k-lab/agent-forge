@@ -1,9 +1,11 @@
 CODING E2E PASS
-terminal_job={"status":"succeeded","candidate_sha":"cbb8b3dc7b8d7b00cf36b92331093ba238f1d1cd","created_at":"2026-08-24T20:13:29.444666641Z","updated_at":"2026-08-24T20:13:46.081159805Z"}
-base_sha=299089e31d37729039d0bd9d70f4fac96d58ff36
-candidate_sha=cbb8b3dc7b8d7b00cf36b92331093ba238f1d1cd
-candidate_parent=299089e31d37729039d0bd9d70f4fac96d58ff36
+terminal_job={"status":"succeeded","candidate_sha":"998cfc79edef03ee2c92b28b44081e2c74ab1cea","created_at":"2026-08-24T20:26:31.742706323Z","updated_at":"2026-08-24T20:26:59.360009308Z"}
+base_sha=9870b5fc8e951de36665274af06d6506b520ab72
+candidate_sha=998cfc79edef03ee2c92b28b44081e2c74ab1cea
+candidate_parent=9870b5fc8e951de36665274af06d6506b520ab72
+candidate_ref=refs/agent-forge/candidates/f6c57fbc52a37b22a92b7853f740438d/f8f086c8dd1910d3e8ba5ba477648115
 candidate_object=verified
 event_candidate_sha=verified
 scoped_test=passed
 worktrees_cleaned=verified
+candidate_survives_gc=verified

@@ -2,6 +2,7 @@ package gate
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,17 +20,43 @@ import (
 type server struct {
 	store  *store.Store
 	tokens map[string]string
+	owner  string
 }
 
-func NewHandler(s *store.Store, tokens map[string]string) http.Handler {
-	x := &server{store: s, tokens: tokens}
+func NewHandler(s *store.Store, tokens map[string]string, ownerToken string) http.Handler {
+	for workerToken := range tokens {
+		if subtle.ConstantTimeCompare([]byte(ownerToken), []byte(workerToken)) == 1 {
+			ownerToken = ""
+		}
+	}
+	x := &server{store: s, tokens: tokens, owner: ownerToken}
 	m := http.NewServeMux()
-	m.HandleFunc("POST /v1/jobs", x.submit)
-	m.HandleFunc("GET /v1/jobs/{id}", x.getJob)
-	m.HandleFunc("GET /v1/jobs/{id}/events", x.getEvents)
-	m.HandleFunc("GET /v1/workers/{id}", x.getWorker)
+	m.HandleFunc("POST /v1/jobs", x.ownerAuth(x.submit))
+	m.HandleFunc("GET /v1/jobs/{id}", x.ownerAuth(x.getJob))
+	m.HandleFunc("GET /v1/jobs/{id}/events", x.ownerAuth(x.getEvents))
+	m.HandleFunc("GET /v1/workers/{id}", x.ownerAuth(x.getWorker))
 	m.HandleFunc("GET /v1/workers/connect", x.connect)
 	return m
+}
+
+func (x *server) ownerAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := bearerToken(r)
+		if x.owner == "" || token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(x.owner)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func bearerToken(r *http.Request) string {
+	const prefix = "Bearer "
+	header := r.Header.Get("Authorization")
+	if !strings.HasPrefix(header, prefix) {
+		return ""
+	}
+	return strings.TrimPrefix(header, prefix)
 }
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -113,8 +140,14 @@ func (x *server) getWorker(w http.ResponseWriter, r *http.Request) {
 }
 func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 	workerID := r.URL.Query().Get("worker_id")
-	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if workerID == "" || x.tokens[token] != workerID {
+	token := bearerToken(r)
+	authorized := false
+	for expected, id := range x.tokens {
+		if id == workerID && expected != "" && token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1 {
+			authorized = true
+		}
+	}
+	if workerID == "" || !authorized {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}

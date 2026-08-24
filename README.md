@@ -4,8 +4,8 @@ A minimal Go vertical slice: submit a job to **forge-gate**, persist it in SQLit
 
 ## Boundaries
 
-- **Gate** owns HTTP/WebSocket APIs, per-worker bearer-token authentication, leases, and authoritative SQLite state.
-- **Worker** initiates the only worker connection (outbound WebSocket), creates a detached worktree at the approved base SHA, executes one configured plugin, runs only the supplied argv test commands, and creates/verifies the candidate commit.
+- **Gate** owns HTTP/WebSocket APIs, a distinct owner bearer token for every HTTP endpoint, per-worker bearer-token authentication, leases, and authoritative SQLite state.
+- **Worker** initiates the only worker connection (outbound WebSocket), accepts coding jobs only inside configured repository roots, creates a detached worktree at the approved base SHA, executes one configured plugin, runs only the supplied argv test commands in a sanitized environment, and retains the verified candidate under `refs/agent-forge/candidates/<job_id>/<attempt_id>`.
 - **Plugin** is an edit-only subprocess contract. The reference plugin accepts legacy input; `forge-codex-plugin` accepts a workspace and instruction, invokes `CODEX_BIN` (default `codex`) with bounded output and a timeout, and never reports business success or commits.
 - This MVP deliberately has no frontend, Docker, GitHub integration, reviewer, mTLS, PostgreSQL, or plugin marketplace.
 
@@ -30,27 +30,29 @@ go build -o bin/forge-codex-plugin ./cmd/forge-codex-plugin
 Terminal 1:
 
 ```sh
-./bin/forge-gate -addr 127.0.0.1:18080 -db ./forge.db \
-  -worker-id worker-1 -worker-token dev-token
+FORGE_OWNER_TOKEN=fake-owner-token FORGE_WORKER_TOKEN=fake-worker-token \
+  ./bin/forge-gate -addr 127.0.0.1:18080 -db ./forge.db -worker-id worker-1
 ```
 
 Terminal 2:
 
 ```sh
-./bin/forge-worker -gate ws://127.0.0.1:18080 -id worker-1 \
-  -token dev-token -plugin ./bin/forge-ref-plugin
+FORGE_WORKER_TOKEN=fake-worker-token ./bin/forge-worker \
+  -gate ws://127.0.0.1:18080 -id worker-1 \
+  -repo-root /srv/forge/repos -plugin ./bin/forge-ref-plugin
 ```
 
 Submit and inspect:
 
 ```sh
 JOB_JSON=$(curl -sS -X POST http://127.0.0.1:18080/v1/jobs \
+  -H 'Authorization: Bearer fake-owner-token' \
   -H 'Content-Type: application/json' -d '{"input":"hello agent forge"}')
 echo "$JOB_JSON"
 JOB_ID=$(printf '%s' "$JOB_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
-curl -sS "http://127.0.0.1:18080/v1/jobs/$JOB_ID"
-curl -sS "http://127.0.0.1:18080/v1/jobs/$JOB_ID/events"
-curl -sS "http://127.0.0.1:18080/v1/workers/worker-1"
+curl -sS -H 'Authorization: Bearer fake-owner-token' "http://127.0.0.1:18080/v1/jobs/$JOB_ID"
+curl -sS -H 'Authorization: Bearer fake-owner-token' "http://127.0.0.1:18080/v1/jobs/$JOB_ID/events"
+curl -sS -H 'Authorization: Bearer fake-owner-token' "http://127.0.0.1:18080/v1/workers/worker-1"
 ```
 
 Job results are accepted only for the currently bound attempt. Repeating the identical result is idempotent; a different result or wrong attempt is rejected. Worker `connected` state is set on authenticated WebSocket establishment and cleared when that connection ends.
@@ -58,7 +60,11 @@ Job results are accepted only for the currently bound attempt. Repeating the ide
 Submit a coding task with an absolute local repository path, full base SHA, instruction, and explicit argv arrays:
 
 ```json
-{"repository":"/absolute/path/to/repository","base_sha":"0123456789abcdef0123456789abcdef01234567","instruction":"Fix the failing focused test.","tests":[["go","test","./internal/example","-run","TestFocused"]]}
+{"repository":"/srv/forge/repos/synthetic-project","base_sha":"0123456789abcdef0123456789abcdef01234567","instruction":"Fix the failing focused test.","tests":[["go","test","./internal/example","-run","TestFocused"]]}
 ```
 
-The terminal job contains `candidate_sha`. Run `scripts/e2e.sh` for the reference transport proof and `CODEX_BIN=/path/to/codex scripts/coding-e2e.sh` for the real coding proof. Both scripts use only synthetic data; the coding script deletes its temporary repository and worktrees.
+The terminal job contains `candidate_sha`; its deterministic candidate ref keeps that commit reachable after worktree removal, reflog expiration, and garbage collection. With no configured repository roots, legacy jobs still run and coding jobs fail with a bounded reason.
+
+Owner-token holders are authorized to request commands only inside configured repository roots. Production Workers should run as dedicated unprivileged accounts or containers. The plugin receives only `PATH`, `HOME`, `CODEX_HOME`, `CODEX_BIN`, and `TMPDIR` when set; scoped tests receive an isolated home, temp, and cache.
+
+Run `scripts/e2e.sh` for the reference transport proof and `CODEX_BIN=/path/to/codex scripts/coding-e2e.sh` for the real coding proof. Both scripts use only synthetic data; the coding script deletes its temporary repository and worktrees.
