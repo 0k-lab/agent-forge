@@ -41,6 +41,14 @@ func TestWorkerWebSocketRequiresMatchingBearerToken(t *testing.T) {
 		t.Fatalf("valid token rejected: %v", err)
 	}
 	c.Close(websocket.StatusNormalClosure, "done")
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if worker, err := s.Worker("worker-1"); err == nil && !worker.Connected {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("worker still connected after WebSocket close")
 }
 
 func TestOwnerHTTPAPIRequiresDistinctBearerToken(t *testing.T) {
