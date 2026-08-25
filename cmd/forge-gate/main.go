@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"agent-forge/internal/gate"
 	"agent-forge/internal/store"
@@ -24,41 +23,34 @@ func main() {
 }
 
 func run() error {
-	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
-	db := flag.String("db", "forge.db", "SQLite path")
-	workerID := flag.String("worker-id", "worker-1", "authorized worker ID")
-	workerToken := flag.String("worker-token", os.Getenv("FORGE_WORKER_TOKEN"), "worker bearer token (default FORGE_WORKER_TOKEN)")
-	ownerToken := flag.String("owner-token", os.Getenv("FORGE_OWNER_TOKEN"), "owner bearer token (default FORGE_OWNER_TOKEN)")
-	leaseTTL := flag.Duration("lease-ttl", 30*time.Second, "lease TTL")
-	retryBase := flag.Duration("retry-base", time.Second, "base retry backoff")
-	maxAttempts := flag.Int("max-attempts", 3, "maximum attempts per job")
-	recoveryInterval := flag.Duration("recovery-interval", time.Second, "expired lease sweep interval")
+	configPath := flag.String("config", "", "Gate JSON config path")
 	flag.Parse()
-	if *workerToken == "" || *ownerToken == "" || *workerToken == *ownerToken {
-		return errors.New("distinct non-empty worker and owner tokens are required")
+	if *configPath == "" || flag.NArg() != 0 {
+		return errors.New("-config is required")
 	}
-	options := gate.DefaultOptions()
-	options.Policy = store.RecoveryPolicy{LeaseTTL: *leaseTTL, BaseRetryBackoff: *retryBase, MaxAttempts: *maxAttempts}
-	options.RecoveryInterval = *recoveryInterval
-	if err := options.Validate(); err != nil {
+	config, err := gate.LoadConfig(*configPath)
+	if err != nil {
 		return err
 	}
-	s, err := store.Open(*db)
+	options := gate.DefaultOptions()
+	options.RecoveryInterval = config.RecoveryInterval
+	options.LeasePollInterval = config.LeasePollInterval
+	s, err := store.Open(config.Database)
 	if err != nil {
 		return err
 	}
 	defer s.Close()
-	handler, err := gate.NewHandlerWithOptions(s, map[string]string{*workerToken: *workerID}, *ownerToken, options)
+	handler, err := gate.NewConfiguredHandler(s, config, options)
 	if err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	recoveryErr, err := gate.StartRecovery(ctx, s, options)
+	recoveryErr, err := gate.StartConfiguredRecovery(ctx, s, config.RecoveryInterval, options.Now)
 	if err != nil {
 		return fmt.Errorf("recovery startup: %w", err)
 	}
-	listener, err := net.Listen("tcp", *addr)
+	listener, err := net.Listen("tcp", config.Listen)
 	if err != nil {
 		stop()
 		<-recoveryErr
@@ -67,7 +59,7 @@ func run() error {
 	server := &http.Server{Handler: handler}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.Serve(listener) }()
-	log.Printf("forge-gate listening on %s", *addr)
+	log.Printf("forge-gate listening on %s", config.Listen)
 	select {
 	case err := <-recoveryErr:
 		_ = server.Shutdown(context.Background())

@@ -17,7 +17,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -p "$REPO" "$ROOT/evidence"
-git -C "$REPO" init -q
+git -C "$REPO" init -q -b main
 git -C "$REPO" config user.name "Forge E2E"
 git -C "$REPO" config user.email "forge@example.invalid"
 cat >"$REPO/go.mod" <<'EOF'
@@ -45,22 +45,23 @@ git -C "$REPO" add .
 git -C "$REPO" commit -qm "test: add failing synthetic task"
 BASE=$(git -C "$REPO" rev-parse HEAD)
 
-FORGE_OWNER_TOKEN=$OWNER_TOKEN FORGE_WORKER_TOKEN=$WORKER_TOKEN "$ROOT/bin/forge-gate" -addr 127.0.0.1:18081 -db "$RUN/forge.db" -worker-id coding-worker >"$RUN/gate.log" 2>&1 &
+python3 "$ROOT/scripts/write-configs.py" "$RUN/gate.json" "$RUN/worker.json" 127.0.0.1:18081 "$RUN/forge.db" ws://127.0.0.1:18081 coding-worker synthetic "$REPO" codex "$ROOT/bin/forge-codex-plugin" 30s 1s 3 10s
+FORGE_OWNER_TOKEN=$OWNER_TOKEN FORGE_WORKER_TOKEN=$WORKER_TOKEN "$ROOT/bin/forge-gate" -config "$RUN/gate.json" >"$RUN/gate.log" 2>&1 &
 GATE_PID=$!
 i=0
 until curl -sS -o /dev/null -H "Authorization: Bearer $OWNER_TOKEN" http://127.0.0.1:18081/v1/workers/coding-worker 2>/dev/null; do
   i=$((i+1)); [ "$i" -lt 50 ] || { echo "gate failed to become ready"; exit 1; }; sleep 0.1
 done
-CODEX_BIN=${CODEX_BIN:-codex} FORGE_WORKER_TOKEN=$WORKER_TOKEN "$ROOT/bin/forge-worker" -gate ws://127.0.0.1:18081 -id coding-worker -repo-root "$RUN" -plugin "$ROOT/bin/forge-codex-plugin" >"$RUN/worker.log" 2>&1 &
+CODEX_BIN=${CODEX_BIN:-codex} FORGE_WORKER_TOKEN=$WORKER_TOKEN "$ROOT/bin/forge-worker" -config "$RUN/worker.json" >"$RUN/worker.log" 2>&1 &
 WORKER_PID=$!
 i=0
 until curl -fsS -H "Authorization: Bearer $OWNER_TOKEN" http://127.0.0.1:18081/v1/workers/coding-worker 2>/dev/null | python3 -c 'import json,sys; assert json.load(sys.stdin)["connected"]' 2>/dev/null; do
   i=$((i+1)); [ "$i" -lt 50 ] || { echo "worker failed to connect"; exit 1; }; sleep 0.1
 done
 
-SUBMIT=$(python3 - "$REPO" "$BASE" <<'PY' | curl -fsS -X POST http://127.0.0.1:18081/v1/jobs -H "Authorization: Bearer $OWNER_TOKEN" -H 'Content-Type: application/json' --data-binary @-
+SUBMIT=$(python3 - "$BASE" <<'PY' | curl -fsS -X POST http://127.0.0.1:18081/v1/jobs -H "Authorization: Bearer $OWNER_TOKEN" -H 'Content-Type: application/json' --data-binary @-
 import json,sys
-json.dump({"repository":sys.argv[1],"base_sha":sys.argv[2],"instruction":"Change Answer in answer.go to return 42. Edit files only; do not commit or run tests.","tests":[["go","test","./..."]],"commit_author_name":"kricha","commit_author_email":"4619899+kricha@users.noreply.github.com"},sys.stdout)
+json.dump({"repository_id":"synthetic","base_sha":sys.argv[1],"instruction":"Change Answer in answer.go to return 42. Edit files only; do not commit or run tests.","tests":[["go","test","./..."]],"commit_author_name":"kricha","commit_author_email":"4619899+kricha@users.noreply.github.com"},sys.stdout)
 PY
 )
 JOB_ID=$(printf '%s' "$SUBMIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')

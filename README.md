@@ -4,8 +4,8 @@ A minimal Go vertical slice: submit a job to **forge-gate**, persist it in SQLit
 
 ## Boundaries
 
-- **Gate** owns HTTP/WebSocket APIs, a distinct owner bearer token for every HTTP endpoint, per-worker bearer-token authentication, leases, and authoritative SQLite state.
-- **Worker** initiates the only worker connection (outbound WebSocket), accepts coding jobs only inside configured repository roots, creates a detached worktree at the approved base SHA, executes one configured plugin, runs only the supplied argv test commands in a sanitized environment, and retains the verified candidate under `refs/agent-forge/candidates/<job_id>/<attempt_id>`.
+- **Gate** owns repository IDs/default branches, Worker pools and authenticated slots, submission-time lifecycle/execution policy resolution, leases, and authoritative SQLite state.
+- **Worker** owns repository-ID-to-local-path and plugin-ID-to-local-argv mappings, canonical repository/worktree/runtime roots, inherited-environment allowlisting, and local timeout/output ceilings. Local paths and plugin argv never cross the Worker/Gate boundary.
 - **Plugin** is an edit-only subprocess contract. The reference plugin accepts legacy input; `forge-codex-plugin` accepts a workspace and instruction, invokes `CODEX_BIN` (default `codex`) with bounded output and a timeout, and never reports business success or commits.
 - This MVP deliberately has no control panel, Docker, GitHub integration, reviewer, mTLS, PostgreSQL, or plugin marketplace. Its only browser UI is a read-only debug viewer.
 
@@ -27,23 +27,26 @@ go build -o bin/forge-codex-plugin ./cmd/forge-codex-plugin
 
 ## Run
 
-Terminal 1:
+Both commands accept only `-config`. Config files name secret environment variables; secret values never enter config, SQLite, leases, evidence, or logs.
 
-```sh
-install -d -m 0700 ./forge-state
-FORGE_OWNER_TOKEN=fake-owner-token FORGE_WORKER_TOKEN=fake-worker-token \
-  ./bin/forge-gate -addr 127.0.0.1:18080 -db ./forge-state/forge.db -worker-id worker-1 \
-  -lease-ttl 30s -retry-base 1s -max-attempts 3 -recovery-interval 1s
+Gate config (`gate.json`):
+
+```json
+{"version":1,"listen":"127.0.0.1:18080","database":"/srv/forge/state/forge.db","owner_token_env":"FORGE_OWNER_TOKEN","recovery_interval":"1s","lease_poll_interval":"100ms","default_pool":"coding","lifecycle":{"lease_ttl":"30s","retry_base":"1s","max_attempts":3},"default_execution":{"plugin_id":"reference","environment":["PATH"],"plugin_timeout":"15m","check_timeout":"10m","git_timeout":"1m","cleanup_timeout":"10s","plugin_output_bytes":1048576,"check_output_bytes":2048,"git_output_bytes":1048576},"workers":[{"id":"worker-1","pool":"coding","token_env":"FORGE_WORKER_TOKEN","concurrency":2}],"repositories":[{"id":"agent-forge","default_branch":"main","worker_pool":"coding","execution":{"plugin_id":"codex","environment":["PATH","CODEX_HOME","CODEX_BIN"],"plugin_timeout":"15m","check_timeout":"10m","git_timeout":"1m","cleanup_timeout":"10s","plugin_output_bytes":1048576,"check_output_bytes":2048,"git_output_bytes":1048576}}]}
 ```
 
-Terminal 2:
+Worker config (`worker.json`):
+
+```json
+{"version":1,"gate_url":"ws://127.0.0.1:18080","id":"worker-1","token_env":"FORGE_WORKER_TOKEN","heartbeat_interval":"10s","concurrency":2,"repository_roots":["/srv/forge/repos"],"worktree_root":"/srv/forge/worktrees","runtime_root":"/srv/forge/runtime","repositories":[{"id":"agent-forge","path":"/srv/forge/repos/agent-forge"}],"plugins":[{"id":"codex","argv":["/srv/forge/bin/forge-codex-plugin"]},{"id":"reference","argv":["/srv/forge/bin/forge-ref-plugin"]}],"environment_allowlist":["PATH","CODEX_HOME","CODEX_BIN"],"ceilings":{"plugin_timeout":"15m","check_timeout":"10m","git_timeout":"1m","cleanup_timeout":"10s","plugin_output_bytes":1048576,"check_output_bytes":2048,"git_output_bytes":1048576}}
+```
 
 ```sh
-FORGE_WORKER_TOKEN=fake-worker-token ./bin/forge-worker \
-  -gate ws://127.0.0.1:18080 -id worker-1 \
-  -repo-root /srv/forge/repos -plugin ./bin/forge-ref-plugin \
-  -heartbeat-interval 10s
+FORGE_OWNER_TOKEN=fake-owner-token FORGE_WORKER_TOKEN=fake-worker-token ./bin/forge-gate -config gate.json
+FORGE_WORKER_TOKEN=fake-worker-token ./bin/forge-worker -config worker.json
 ```
+
+Configs are strict versioned JSON: unknown/duplicate fields, trailing data, unsafe or duplicate IDs/references, missing/colliding token values, noncanonical paths, and contradictory bounds fail startup with bounded value-free errors. `concurrency: 2` opens two independent outbound lanes (`worker-1` and `worker-1#1` server-side); attempts are never multiplexed on one WebSocket.
 
 ## SQLite storage security
 
@@ -51,8 +54,9 @@ File-backed storage provides cross-UID confidentiality when Gate's immediate dat
 
 ```sh
 install -d -m 0700 /srv/forge/state
-./bin/forge-gate -db /srv/forge/state/forge.db # plus the required tokens/options
-./bin/forge-gate -db 'file:///srv/forge/state/forge.db?mode=rwc&cache=private' # equivalent URI form
+# Set the Gate config's database field to either:
+/srv/forge/state/forge.db
+file:///srv/forge/state/forge.db?mode=rwc&cache=private
 ```
 
 Gate requires trusted, non-symlink path ancestors and checks that the immediate parent is private and effective-UID owned. The database and any existing `-journal`, `-wal`, and `-shm` files must be regular, non-symlink, effective-UID-owned files with exact mode `0600`. A missing database is atomically pre-created and verified as `0600`; startup always performs schema writes/migrations. Existing insecure files fail closed without chmod, removal, or replacement. Repair one offline only after taking a backup and verifying its owner and contents.
@@ -101,26 +105,26 @@ Job results are accepted only for the currently bound attempt. Repeating the ide
 
 ## Leases, retries, and recovery
 
-Gate owns lease and retry policy. Defaults are a 30-second lease TTL, 1-second exponential retry base, 3 attempts, and a 1-second recovery sweep interval. All values must be positive and bounded; the recovery interval cannot exceed the lease TTL. `scoped_test_failed` and `invalid_task` are terminal, while `execution_failed` is retryable. Gate rejects unknown codes and conflicting claimed dispositions without spending another attempt.
+Gate resolves lifecycle and portable execution policy when accepting a job. The canonical policy is persisted on the job and copied byte-for-byte to every attempt. `exponential-v1` schedules `min(retry_base * 2^(attempt_ordinal-1), 24h)` with saturation; `retry_at` is written once in the terminating transaction. Startup config changes never rewrite queued, leased, or retry-waiting jobs. Active legacy rows without resolved policy block configured startup; terminal legacy history remains readable. `scoped_test_failed` and `invalid_task` are terminal, while `execution_failed` is retryable.
 
 A job moves through `pending -> leased -> succeeded`, `leased -> failed` for terminal failures, or `leased -> retry_wait -> leased` for retryable failures and expired leases. Each lease creates a durable attempt with a new ID and ordinal. Backoff is based on that ordinal. When the maximum is reached, the job becomes `failed` with `max_attempts_exceeded`; it is not leased again.
 
-Workers heartbeat the exact job/attempt/Worker tuple while executing. The Worker default is 10 seconds, one third of the default Gate TTL; configure `-heartbeat-interval` shorter than `-lease-ttl`. Gate closes or rejects a stale connection, and Worker cancellation is best-effort, so old execution may physically overlap a retry. SQLite attempt and lease fencing ensures that old work can never publish an authoritative result or candidate. Candidate refs already created for an attempt remain preserved.
+Workers heartbeat the exact job/attempt/effective-slot/live-generation tuple while executing. Heartbeats are valid strictly before the deadline and extend it by the persisted attempt TTL without shortening it. Same-slot takeover fences the old random generation; compare-and-clear disconnect handling cannot mark its replacement offline. Gate closes or rejects a stale connection, and Worker cancellation is best-effort, so old execution may physically overlap a retry. SQLite fencing prevents old work from publishing evidence, failure, success, or a candidate.
 
-Gate performs an expiry sweep before it starts serving, then repeats at `-recovery-interval`. Restarting Gate with the same SQLite database preserves attempt history and recovers expired leases. A sweep or Store failure stops Gate rather than disabling recovery. Run Gate and Worker under supervisors: Workers return after Gate disconnects and the supervisor should reconnect them; Gate should also be restarted after a fatal recovery error.
+Gate performs an expiry sweep before it starts serving, then repeats at the configured recovery interval. The interval is operational scan cadence only; persisted attempt policy controls deadlines/retries. Restarting Gate preserves attempt history and marks stale slot sessions disconnected. A sweep or Store failure stops Gate rather than disabling recovery.
 
 The sanitized timeline exposes attempt ordinals, lease expiry, retry scheduling, dispositions, bounded failure codes, and success without task content, result bodies, tokens, private repository paths, or cursor secrets.
 
-Submit a coding task with an absolute local repository path, full base SHA, instruction, explicit argv arrays, and an optional paired commit author:
+Submit a coding task with a stable repository ID, full base SHA, instruction, explicit scoped argv arrays, and an optional paired commit author:
 
 ```json
-{"repository":"/srv/forge/repos/synthetic-project","base_sha":"0123456789abcdef0123456789abcdef01234567","instruction":"Fix the failing focused test.","tests":[["go","test","./internal/example","-run","TestFocused"]],"commit_author_name":"kricha","commit_author_email":"4619899+kricha@users.noreply.github.com"}
+{"repository_id":"agent-forge","base_sha":"0123456789abcdef0123456789abcdef01234567","instruction":"Fix the failing focused test.","tests":[["go","test","./internal/example","-run","TestFocused"]],"commit_author_name":"kricha","commit_author_email":"4619899+kricha@users.noreply.github.com"}
 ```
 
 `commit_author_name` and `commit_author_email` must be supplied together or both omitted. Names are limited to 256 bytes and emails to 254 bytes; leading or trailing Unicode whitespace, unsafe Git-header characters, and malformed addresses are rejected. A supplied identity becomes the exact Git Author, while Git Committer remains `Agent Forge <forge@example.invalid>`. If both fields are omitted, both identities use that Agent Forge fallback for compatibility.
 
 The terminal job contains `candidate_sha`; its deterministic candidate ref keeps that commit reachable after worktree removal, reflog expiration, and garbage collection. With no configured repository roots, legacy jobs still run and coding jobs fail with a bounded reason.
 
-Owner-token holders are authorized to request commands only inside configured repository roots. Production Workers should run as dedicated unprivileged accounts or containers. The plugin receives only `PATH`, `HOME`, `CODEX_HOME`, `CODEX_BIN`, and `TMPDIR` when set; scoped tests receive an isolated home, temp, and cache.
+Before worktree creation, Worker requires the exact base commit to exist and be an ancestor of its configured local `refs/heads/<default_branch>`. It never fetches. Unknown IDs, default-branch mismatch, symlink/canonical drift, root escape, or Gate limits above local ceilings fail closed with path/argv/secret-free errors. Scoped argv remains task data; no central verification profile or global command allowlist is introduced. Production Workers should run as dedicated unprivileged accounts or containers.
 
 Run `scripts/e2e.sh` for the reference transport proof, `scripts/recovery-e2e.sh` for restart/expiry/retry/late-result recovery, `scripts/evidence-e2e.sh` for the self-contained bounded-evidence/privacy proof, `scripts/sqlite-permissions-e2e.sh` for the Gate SQLite permission/startup proof, and `CODEX_BIN=/path/to/codex scripts/coding-e2e.sh` for the real coding proof. The scripts use synthetic data; recovery artifacts stay in a temporary directory and all spawned processes are cleaned up.

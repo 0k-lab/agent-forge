@@ -26,7 +26,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	h := http.Header{"Authorization": []string{"Bearer " + *token}}
-	c, _, err := websocket.Dial(ctx, *gate+"/v1/workers/connect?worker_id="+*id, &websocket.DialOptions{HTTPHeader: h})
+	c, _, err := websocket.Dial(ctx, *gate+"/v1/workers/connect?worker_id="+*id+"&slot=0", &websocket.DialOptions{HTTPHeader: h})
 	if err != nil {
 		fail(err)
 	}

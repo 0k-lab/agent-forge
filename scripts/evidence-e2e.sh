@@ -31,7 +31,7 @@ go build -o "$RUN/forge-worker" ./cmd/forge-worker
 go build -o "$RUN/raw-worker" ./internal/gate/testdata/raw-worker
 
 mkdir -p "$REPO"
-git -C "$REPO" init -q
+git -C "$REPO" init -q -b main
 git -C "$REPO" config user.name "Evidence E2E"
 git -C "$REPO" config user.email "evidence@example.invalid"
 cat >"$REPO/answer.txt" <<'EOF'
@@ -71,9 +71,9 @@ EOF
 chmod +x "$RUN/plugin"
 
 start_gate() {
+	python3 "$ROOT/scripts/write-configs.py" "$RUN/gate.json" "$RUN/worker.json" "127.0.0.1:$PORT" "$RUN/forge.db" "$WS" worker-1 synthetic "$REPO" evidence "$RUN/plugin" 5s 100ms 2 20ms
 	FORGE_OWNER_TOKEN=$OWNER_TOKEN FORGE_WORKER_TOKEN=$WORKER_TOKEN "$RUN/forge-gate" \
-		-addr "127.0.0.1:$PORT" -db "$RUN/forge.db" -worker-id worker-1 \
-		-lease-ttl 5s -retry-base 100ms -max-attempts 2 -recovery-interval 100ms >"$RUN/gate.log" 2>&1 &
+		-config "$RUN/gate.json" >"$RUN/gate.log" 2>&1 &
 	GATE_PID=$!
 	i=0
 	until curl -fsS -o /dev/null -H "Authorization: Bearer $OWNER_TOKEN" "$HTTP/v1/debug/jobs" 2>/dev/null; do
@@ -83,8 +83,7 @@ start_gate() {
 }
 
 start_gate
-FORGE_WORKER_TOKEN=$WORKER_TOKEN "$RUN/forge-worker" -gate "$WS" -id worker-1 \
-	-repo-root "$RUN" -plugin "$RUN/plugin" -heartbeat-interval 20ms >"$RUN/worker.log" 2>&1 &
+FORGE_WORKER_TOKEN=$WORKER_TOKEN "$RUN/forge-worker" -config "$RUN/worker.json" >"$RUN/worker.log" 2>&1 &
 WORKER_PID=$!
 i=0
 until curl -fsS -H "Authorization: Bearer $OWNER_TOKEN" "$HTTP/v1/workers/worker-1" 2>/dev/null | python3 -c 'import json,sys; assert json.load(sys.stdin)["connected"]' 2>/dev/null; do
@@ -92,9 +91,9 @@ until curl -fsS -H "Authorization: Bearer $OWNER_TOKEN" "$HTTP/v1/workers/worker
 	sleep 0.02
 done
 
-SUBMIT=$(python3 - "$REPO" "$BASE" <<'PY' | curl -fsS -X POST "$HTTP/v1/jobs" -H "Authorization: Bearer $OWNER_TOKEN" -H 'Content-Type: application/json' --data-binary @-
+SUBMIT=$(python3 - "$BASE" <<'PY' | curl -fsS -X POST "$HTTP/v1/jobs" -H "Authorization: Bearer $OWNER_TOKEN" -H 'Content-Type: application/json' --data-binary @-
 import json,sys
-json.dump({"repository":sys.argv[1],"base_sha":sys.argv[2],"instruction":"make the synthetic edit","tests":[["sh","./check.sh","--endpoint=https://synthetic-argv-user:synthetic-argv-pass@example.invalid/?authorization=synthetic-argv-query","credential:synthetic-argv-colon","workspace:/synthetic/private/argv-file",r"config:C:\synthetic\private\argv-file",'{"token":"synthetic-argv-json secret","safe":"kept"}',"--credential synthetic-argv-cli secret --later tail; safe","[api_key]: synthetic-argv-bracket secret","Access Token: synthetic-argv-access-token","--client secret synthetic-argv-client-secret; safe",r"workspace: \\synthetic-argv-server\private\file",'["Authorization","Bearer synthetic-argv-json-array-secret"]',"file:///private/reviewer/evidence-argv","synthetic-argv-unlabeled-secret"]]},sys.stdout)
+json.dump({"repository_id":"synthetic","base_sha":sys.argv[1],"instruction":"make the synthetic edit","tests":[["sh","./check.sh","--endpoint=https://synthetic-argv-user:synthetic-argv-pass@example.invalid/?authorization=synthetic-argv-query","credential:synthetic-argv-colon","workspace:/synthetic/private/argv-file",r"config:C:\synthetic\private\argv-file",'{"token":"synthetic-argv-json secret","safe":"kept"}',"--credential synthetic-argv-cli secret --later tail; safe","[api_key]: synthetic-argv-bracket secret","Access Token: synthetic-argv-access-token","--client secret synthetic-argv-client-secret; safe",r"workspace: \\synthetic-argv-server\private\file",'["Authorization","Bearer synthetic-argv-json-array-secret"]',"file:///private/reviewer/evidence-argv","synthetic-argv-unlabeled-secret"]]},sys.stdout)
 PY
 )
 JOB_ID=$(printf '%s' "$SUBMIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
@@ -116,18 +115,28 @@ wait "$WORKER_PID" 2>/dev/null || true
 WORKER_PID=
 MISSING_PLUGIN="$RUN/missing-plugin"
 [ ! -e "$MISSING_PLUGIN" ]
-FORGE_WORKER_TOKEN=$WORKER_TOKEN "$RUN/forge-worker" -gate "$WS" -id worker-1 \
-	-repo-root "$RUN" -plugin "$MISSING_PLUGIN" -heartbeat-interval 20ms >"$RUN/missing-plugin-worker.log" 2>&1 &
+python3 "$ROOT/scripts/write-configs.py" "$RUN/gate.json" "$RUN/worker.json" "127.0.0.1:$PORT" "$RUN/forge.db" "$WS" worker-1 synthetic "$REPO" evidence "$MISSING_PLUGIN" 5s 100ms 2 20ms
+if FORGE_WORKER_TOKEN=$WORKER_TOKEN "$RUN/forge-worker" -config "$RUN/worker.json" >"$RUN/missing-plugin-startup.log" 2>&1; then
+	echo "evidence E2E: missing plugin passed startup validation"
+	exit 1
+fi
+! grep -F "$MISSING_PLUGIN" "$RUN/missing-plugin-startup.log"
+
+printf '#!/bin/sh\nexit 1\n' >"$MISSING_PLUGIN"
+chmod 700 "$MISSING_PLUGIN"
+python3 "$ROOT/scripts/write-configs.py" "$RUN/gate.json" "$RUN/worker.json" "127.0.0.1:$PORT" "$RUN/forge.db" "$WS" worker-1 synthetic "$REPO" evidence "$MISSING_PLUGIN" 5s 100ms 2 20ms
+FORGE_WORKER_TOKEN=$WORKER_TOKEN "$RUN/forge-worker" -config "$RUN/worker.json" >"$RUN/missing-plugin-worker.log" 2>&1 &
 WORKER_PID=$!
 i=0
 until curl -fsS -H "Authorization: Bearer $OWNER_TOKEN" "$HTTP/v1/workers/worker-1" 2>/dev/null | python3 -c 'import json,sys; assert json.load(sys.stdin)["connected"]' 2>/dev/null; do
-	i=$((i+1)); [ "$i" -lt 200 ] || { echo "evidence E2E: Missing-plugin worker readiness failed"; exit 1; }
+	i=$((i+1)); [ "$i" -lt 200 ] || { echo "evidence E2E: plugin worker readiness failed"; exit 1; }
 	sleep 0.02
 done
+rm -f "$MISSING_PLUGIN"
 
-PLUGIN_SUBMIT=$(python3 - "$REPO" "$BASE" <<'PY' | curl -fsS -X POST "$HTTP/v1/jobs" -H "Authorization: Bearer $OWNER_TOKEN" -H 'Content-Type: application/json' --data-binary @-
+PLUGIN_SUBMIT=$(python3 - "$BASE" <<'PY' | curl -fsS -X POST "$HTTP/v1/jobs" -H "Authorization: Bearer $OWNER_TOKEN" -H 'Content-Type: application/json' --data-binary @-
 import json,sys
-json.dump({"repository":sys.argv[1],"base_sha":sys.argv[2],"instruction":"prove synthetic plugin start failure","tests":[["sh","./check.sh"]]},sys.stdout)
+json.dump({"repository_id":"synthetic","base_sha":sys.argv[1],"instruction":"prove synthetic plugin start failure","tests":[["sh","./check.sh"]]},sys.stdout)
 PY
 )
 PLUGIN_JOB_ID=$(printf '%s' "$PLUGIN_SUBMIT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')

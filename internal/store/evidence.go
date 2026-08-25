@@ -19,11 +19,27 @@ const (
 )
 
 func (s *Store) BindEvidenceAt(jobID, attemptID, workerID string, records []protocol.AttemptEvidence, at time.Time) error {
+	return s.bindEvidenceAt(jobID, attemptID, workerID, "", records, at, false)
+}
+
+func (s *Store) BindEvidenceLeaseAt(jobID, attemptID, slot, generation string, records []protocol.AttemptEvidence, at time.Time) error {
+	return s.bindEvidenceAt(jobID, attemptID, slot, generation, records, at, true)
+}
+
+func (s *Store) bindEvidenceAt(jobID, attemptID, workerID, generation string, records []protocol.AttemptEvidence, at time.Time, enforceOwnership bool) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	var execution *ExecutionPolicy
+	if enforceOwnership {
+		policy, err := ownedPolicy(tx, jobID, attemptID, workerID, generation)
+		if err != nil {
+			return err
+		}
+		execution = &policy.Execution
+	}
 	var taskJSON string
 	var deadline int64
 	if err := tx.QueryRow(`SELECT j.task_json,a.deadline_at FROM jobs j JOIN attempts a ON a.id=j.attempt_id AND a.job_id=j.id
@@ -48,7 +64,7 @@ func (s *Store) BindEvidenceAt(jobID, attemptID, workerID string, records []prot
 		return errors.New("too many evidence records")
 	}
 	for i := range records {
-		if err := validateEvidence(records[i], task); err != nil {
+		if err := validateEvidence(records[i], task, execution); err != nil {
 			return err
 		}
 	}
@@ -132,7 +148,7 @@ func redactArgv(argv []string) ([]string, bool) {
 	return out, len(out) != 0
 }
 
-func validateEvidence(record protocol.AttemptEvidence, task protocol.CodingTask) error {
+func validateEvidence(record protocol.AttemptEvidence, task protocol.CodingTask, execution *ExecutionPolicy) error {
 	if !lowerHex(record.EvidenceID, 32) {
 		return errors.New("invalid evidence ID")
 	}
@@ -161,6 +177,18 @@ func validateEvidence(record protocol.AttemptEvidence, task protocol.CodingTask)
 		maxDuration = int64((10 * time.Minute) / time.Millisecond)
 	} else if record.Phase == protocol.EvidencePhaseCleanup {
 		maxDuration = int64((10 * time.Second) / time.Millisecond)
+	}
+	if execution != nil {
+		switch record.Phase {
+		case protocol.EvidencePhasePlugin:
+			maxDuration = time.Duration(execution.PluginTimeoutNanos).Milliseconds()
+		case protocol.EvidencePhaseScopedCheck:
+			maxDuration = time.Duration(execution.CheckTimeoutNanos).Milliseconds()
+		case protocol.EvidencePhaseCleanup:
+			maxDuration = time.Duration(execution.CleanupTimeoutNanos).Milliseconds()
+		default:
+			maxDuration = time.Duration(execution.GitTimeoutNanos).Milliseconds()
+		}
 	}
 	if record.DurationMS < 0 || record.DurationMS > maxDuration {
 		return errors.New("invalid evidence duration")

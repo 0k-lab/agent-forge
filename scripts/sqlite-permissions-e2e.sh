@@ -11,8 +11,9 @@ go build -o "$RUN/forge-gate" "$ROOT/cmd/forge-gate"
 
 start_gate() {
 	local db=$1 log=$2
+	python3 "$ROOT/scripts/write-configs.py" "$log.gate.json" "$log.worker.json" 127.0.0.1:0 "$db" ws://127.0.0.1:1 worker-1 unused - reference /bin/true 30s 1s 3 10s
 	FORGE_OWNER_TOKEN=synthetic-owner FORGE_WORKER_TOKEN=synthetic-worker \
-		"$RUN/forge-gate" -addr 127.0.0.1:0 -db "$db" >"$log" 2>&1 &
+		"$RUN/forge-gate" -config "$log.gate.json" >"$log" 2>&1 &
 	PID=$!
 	PIDS+=("$PID")
 	for _ in {1..100}; do
@@ -31,8 +32,9 @@ stop_gate() {
 
 expect_failure() {
 	local db=$1 log=$2
+	python3 "$ROOT/scripts/write-configs.py" "$log.gate.json" "$log.worker.json" 127.0.0.1:0 "$db" ws://127.0.0.1:1 worker-1 unused - reference /bin/true 30s 1s 3 10s
 	if FORGE_OWNER_TOKEN=synthetic-owner FORGE_WORKER_TOKEN=synthetic-worker \
-		"$RUN/forge-gate" -addr 127.0.0.1:0 -db "$db" >"$log" 2>&1; then
+		"$RUN/forge-gate" -config "$log.gate.json" >"$log" 2>&1; then
 		return 1
 	fi
 	! grep -q 'forge-gate listening' "$log"

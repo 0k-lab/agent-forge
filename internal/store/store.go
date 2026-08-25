@@ -10,7 +10,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"agent-forge/internal/protocol"
@@ -21,6 +23,8 @@ type Store struct {
 	db                *sql.DB
 	debugCursorSecret [32]byte
 }
+
+var initializationMu sync.Mutex
 
 type RecoveryPolicy struct {
 	LeaseTTL         time.Duration
@@ -59,30 +63,38 @@ func (p RecoveryPolicy) Validate() error {
 }
 
 type Job struct {
-	ID           string               `json:"id"`
-	Input        string               `json:"input,omitempty"`
-	Task         *protocol.CodingTask `json:"task,omitempty"`
-	Status       string               `json:"status"`
-	AttemptID    string               `json:"attempt_id,omitempty"`
-	WorkerID     string               `json:"worker_id,omitempty"`
-	Result       string               `json:"result,omitempty"`
-	CandidateSHA string               `json:"candidate_sha,omitempty"`
-	Error        string               `json:"error,omitempty"`
-	CreatedAt    time.Time            `json:"created_at"`
-	UpdatedAt    time.Time            `json:"updated_at"`
+	ID            string               `json:"id"`
+	Input         string               `json:"input,omitempty"`
+	Task          *protocol.CodingTask `json:"task,omitempty"`
+	Status        string               `json:"status"`
+	AttemptID     string               `json:"attempt_id,omitempty"`
+	WorkerID      string               `json:"worker_id,omitempty"`
+	Result        string               `json:"result,omitempty"`
+	CandidateSHA  string               `json:"candidate_sha,omitempty"`
+	Error         string               `json:"error,omitempty"`
+	WorkerPool    string               `json:"worker_pool,omitempty"`
+	PolicyVersion int                  `json:"policy_version,omitempty"`
+	CreatedAt     time.Time            `json:"created_at"`
+	UpdatedAt     time.Time            `json:"updated_at"`
 }
 
 type Lease struct {
-	JobID     string               `json:"job_id"`
-	AttemptID string               `json:"attempt_id"`
-	Input     string               `json:"input,omitempty"`
-	Task      *protocol.CodingTask `json:"task,omitempty"`
+	JobID      string               `json:"job_id"`
+	AttemptID  string               `json:"attempt_id"`
+	Input      string               `json:"input,omitempty"`
+	Task       *protocol.CodingTask `json:"task,omitempty"`
+	WorkerPool string               `json:"worker_pool,omitempty"`
+	Slot       string               `json:"slot,omitempty"`
+	Policy     ResolvedPolicy       `json:"policy"`
 }
 type Attempt struct {
 	ID                 string    `json:"id"`
 	JobID              string    `json:"job_id"`
 	Ordinal            int       `json:"ordinal"`
 	WorkerID           string    `json:"worker_id"`
+	WorkerPool         string    `json:"worker_pool,omitempty"`
+	Slot               string    `json:"slot,omitempty"`
+	PolicyVersion      int       `json:"policy_version,omitempty"`
 	Status             string    `json:"status"`
 	LeasedAt           time.Time `json:"leased_at"`
 	DeadlineAt         time.Time `json:"deadline_at"`
@@ -100,12 +112,19 @@ type Event struct {
 	At     time.Time `json:"at"`
 }
 type Worker struct {
-	ID        string    `json:"id"`
-	Connected bool      `json:"connected"`
-	LastSeen  time.Time `json:"last_seen"`
+	ID         string    `json:"id"`
+	Connected  bool      `json:"connected"`
+	LastSeen   time.Time `json:"last_seen"`
+	BaseID     string    `json:"base_id,omitempty"`
+	Slot       int       `json:"slot,omitempty"`
+	Pool       string    `json:"pool,omitempty"`
+	Generation string    `json:"-"`
 }
 
 func Open(path string) (_ *Store, retErr error) {
+	// ponytail: process-local serialization; use a cross-process lock if multiple Gates ever initialize one database.
+	initializationMu.Lock()
+	defer initializationMu.Unlock()
 	dsn, err := parseSQLiteDSN(path)
 	if err != nil {
 		return nil, err
@@ -128,87 +147,11 @@ func Open(path string) (_ *Store, retErr error) {
 	}
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db}
-	_, err = db.Exec(`PRAGMA busy_timeout=5000;
-CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, input TEXT NOT NULL, status TEXT NOT NULL, attempt_id TEXT NOT NULL DEFAULT '', worker_id TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL, at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, connected INTEGER NOT NULL, last_seen TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value BLOB NOT NULL);`)
-	if err != nil {
+	if _, err = db.Exec(`PRAGMA busy_timeout=5000`); err != nil {
 		db.Close()
 		return nil, err
 	}
-	if _, err = db.Exec(`ALTER TABLE jobs ADD COLUMN candidate_sha TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
-		db.Close()
-		return nil, err
-	}
-	if _, err = db.Exec(`ALTER TABLE jobs ADD COLUMN task_json TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
-		db.Close()
-		return nil, err
-	}
-	if _, err = db.Exec(`ALTER TABLE jobs ADD COLUMN error_text TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
-		db.Close()
-		return nil, err
-	}
-	if _, err = db.Exec(`ALTER TABLE jobs ADD COLUMN retry_at INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
-		db.Close()
-		return nil, err
-	}
-	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS attempts (
-		id TEXT PRIMARY KEY,
-		job_id TEXT NOT NULL,
-		ordinal INTEGER NOT NULL CHECK(ordinal > 0),
-		worker_id TEXT NOT NULL,
-		status TEXT NOT NULL CHECK(status IN ('leased','succeeded','terminal_failed','retryable_failed','expired')),
-		leased_at INTEGER NOT NULL,
-		deadline_at INTEGER NOT NULL,
-		completed_at INTEGER NOT NULL DEFAULT 0,
-		failure_disposition TEXT NOT NULL DEFAULT '',
-		failure_code TEXT NOT NULL DEFAULT '',
-		result TEXT NOT NULL DEFAULT '',
-		candidate_sha TEXT NOT NULL DEFAULT '',
-		UNIQUE(job_id, ordinal)
-	);
-	CREATE UNIQUE INDEX IF NOT EXISTS attempts_one_active_worker ON attempts(worker_id) WHERE status='leased';
-	CREATE UNIQUE INDEX IF NOT EXISTS attempts_one_active_job ON attempts(job_id) WHERE status='leased';`); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS attempt_evidence (
-		sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-		job_id TEXT NOT NULL,
-		attempt_id TEXT NOT NULL,
-		evidence_id TEXT NOT NULL,
-		phase TEXT NOT NULL,
-		reason TEXT NOT NULL,
-		check_index INTEGER,
-		exit_code INTEGER,
-		duration_ms INTEGER NOT NULL,
-		output TEXT NOT NULL,
-		output_redacted INTEGER NOT NULL,
-		output_truncated INTEGER NOT NULL,
-		base_sha TEXT NOT NULL,
-		candidate_sha TEXT NOT NULL,
-		argv_json TEXT NOT NULL,
-		argv_redacted INTEGER NOT NULL,
-		payload_hash BLOB NOT NULL,
-		bound_at INTEGER NOT NULL,
-		UNIQUE(attempt_id,evidence_id)
-	);
-	CREATE INDEX IF NOT EXISTS attempt_evidence_attempt ON attempt_evidence(job_id,attempt_id,sequence);`); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if _, err = db.Exec(`ALTER TABLE attempt_evidence ADD COLUMN output_redacted INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
-		db.Close()
-		return nil, err
-	}
-	migrationNow := time.Now().UTC()
-	if _, err = db.Exec(`INSERT OR IGNORE INTO attempts(id,job_id,ordinal,worker_id,status,leased_at,deadline_at,completed_at,failure_disposition,failure_code,result,candidate_sha)
-		SELECT attempt_id,id,1,worker_id,
-			CASE status WHEN 'leased' THEN 'leased' WHEN 'succeeded' THEN 'succeeded' ELSE 'terminal_failed' END,
-			?,?,CASE WHEN status='leased' THEN 0 ELSE ? END,
-			CASE WHEN status='failed' THEN 'terminal' ELSE '' END,error_text,result,candidate_sha
-		FROM jobs WHERE attempt_id<>''`, migrationNow.UnixNano(), migrationNow.Add(defaultLeaseTTL).UnixNano(), migrationNow.UnixNano()); err != nil {
+	if err = migrate(db); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -265,7 +208,25 @@ func (s *Store) CreateCodingJob(task protocol.CodingTask) (Job, error) {
 	return s.createJob("", &task)
 }
 
+func (s *Store) CreateJobWithPolicy(input string, policy ResolvedPolicy) (Job, error) {
+	if policy.Execution.RepositoryID != "" {
+		return Job{}, errors.New("invalid non-coding policy")
+	}
+	return s.createJobWithPolicy(input, nil, &policy)
+}
+
+func (s *Store) CreateCodingJobWithPolicy(task protocol.CodingTask, policy ResolvedPolicy) (Job, error) {
+	if err := validateStoredTask(task, policy); err != nil {
+		return Job{}, err
+	}
+	return s.createJobWithPolicy("", &task, &policy)
+}
+
 func (s *Store) createJob(input string, task *protocol.CodingTask) (Job, error) {
+	return s.createJobWithPolicy(input, task, nil)
+}
+
+func (s *Store) createJobWithPolicy(input string, task *protocol.CodingTask, policy *ResolvedPolicy) (Job, error) {
 	j := Job{ID: newID(), Input: input, Task: task, Status: "pending", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	taskJSON := ""
 	if task != nil {
@@ -275,19 +236,136 @@ func (s *Store) createJob(input string, task *protocol.CodingTask) (Job, error) 
 		}
 		taskJSON = string(body)
 	}
+	var workerPool any
+	var policyVersion any
+	var policyBytes any
+	if policy != nil {
+		body, err := CanonicalPolicy(*policy)
+		if err != nil {
+			return Job{}, err
+		}
+		workerPool, policyVersion, policyBytes = policy.WorkerPool, policy.Version, body
+		j.WorkerPool, j.PolicyVersion = policy.WorkerPool, policy.Version
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Job{}, err
 	}
 	defer tx.Rollback()
 	stamp := j.CreatedAt.Format(time.RFC3339Nano)
-	if _, err = tx.Exec(`INSERT INTO jobs(id,input,task_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?)`, j.ID, j.Input, taskJSON, j.Status, stamp, stamp); err != nil {
+	if _, err = tx.Exec(`INSERT INTO jobs(id,input,task_json,status,created_at,updated_at,worker_pool,policy_version,resolved_policy) VALUES(?,?,?,?,?,?,?,?,?)`, j.ID, j.Input, taskJSON, j.Status, stamp, stamp, workerPool, policyVersion, policyBytes); err != nil {
 		return Job{}, err
 	}
 	if _, err = tx.Exec(`INSERT INTO events(job_id,kind,detail,at) VALUES(?,?,?,?)`, j.ID, "submitted", "job accepted", stamp); err != nil {
 		return Job{}, err
 	}
 	return j, tx.Commit()
+}
+
+func (s *Store) ClaimWorkerSlot(baseID string, slotIndex int, effectiveID, pool, generation string, at time.Time) error {
+	if !policyID.MatchString(baseID) || slotIndex < 0 || slotIndex > 63 || effectiveID == "" || len(effectiveID) > 80 || !policyID.MatchString(pool) || !validSessionGeneration(generation) {
+		return errors.New("invalid worker session")
+	}
+	result, err := s.db.Exec(`INSERT INTO workers(id,connected,last_seen,base_worker_id,slot,worker_pool,generation) VALUES(?,1,?,?,?,?,?)
+		ON CONFLICT(id) DO UPDATE SET connected=1,last_seen=excluded.last_seen,base_worker_id=excluded.base_worker_id,slot=excluded.slot,worker_pool=excluded.worker_pool,generation=excluded.generation WHERE workers.connected=0`, effectiveID, at.UTC().Format(time.RFC3339Nano), baseID, slotIndex, pool, generation)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return errors.New("worker slot unavailable")
+	}
+	return nil
+}
+
+func (s *Store) ReleaseWorkerSlot(effectiveID, generation string, at time.Time) error {
+	if !validSessionGeneration(generation) {
+		return errors.New("invalid worker session")
+	}
+	_, err := s.db.Exec(`UPDATE workers SET connected=0,last_seen=? WHERE id=? AND generation=?`, at.UTC().Format(time.RFC3339Nano), effectiveID, generation)
+	return err
+}
+
+func (s *Store) MarkWorkersDisconnected(at time.Time) error {
+	_, err := s.db.Exec(`UPDATE workers SET connected=0,last_seen=? WHERE connected=1`, at.UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func (s *Store) LeaseNextForPool(slot, pool, generation string, at time.Time) (Lease, bool, error) {
+	if slot == "" || !policyID.MatchString(pool) || !validSessionGeneration(generation) {
+		return Lease{}, false, errors.New("invalid worker session")
+	}
+	at = at.UTC()
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return Lease{}, false, err
+	}
+	defer tx.Rollback()
+	var live int
+	if err := tx.QueryRow(`SELECT 1 FROM workers WHERE id=? AND connected=1 AND worker_pool=? AND generation=?`, slot, pool, generation).Scan(&live); err != nil {
+		return Lease{}, false, errors.New("worker session is not active")
+	}
+	var id, input, taskJSON string
+	var policyVersion int
+	var policyBytes []byte
+	err = tx.QueryRow(`SELECT id,input,task_json,policy_version,resolved_policy FROM jobs
+		WHERE worker_pool=? AND (status='pending' OR status='retry_wait' AND retry_at<=?)
+		AND NOT EXISTS (SELECT 1 FROM attempts WHERE status='leased' AND slot=?)
+		ORDER BY created_at,id LIMIT 1`, pool, at.UnixNano(), slot).Scan(&id, &input, &taskJSON, &policyVersion, &policyBytes)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Lease{}, false, tx.Commit()
+	}
+	if err != nil {
+		return Lease{}, false, err
+	}
+	policy, err := DecodeCanonicalPolicy(policyBytes)
+	if err != nil || policy.Version != policyVersion || policy.WorkerPool != pool {
+		return Lease{}, false, errors.New("corrupt resolved policy")
+	}
+	lease := Lease{JobID: id, Input: input, WorkerPool: pool, Slot: slot, Policy: policy}
+	if taskJSON != "" {
+		lease.Task = new(protocol.CodingTask)
+		decoder := json.NewDecoder(strings.NewReader(taskJSON))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(lease.Task); err != nil || decoder.Decode(&struct{}{}) != io.EOF || validateStoredTask(*lease.Task, policy) != nil {
+			return Lease{}, false, errors.New("corrupt task")
+		}
+	}
+	attempt := newID()
+	lease.AttemptID = attempt
+	stamp := at.Format(time.RFC3339Nano)
+	var ordinal int
+	if err = tx.QueryRow(`SELECT COALESCE(MAX(ordinal),0)+1 FROM attempts WHERE job_id=?`, id).Scan(&ordinal); err != nil {
+		return Lease{}, false, err
+	}
+	if ordinal > policy.MaxAttempts {
+		return Lease{}, false, errors.New("corrupt retry budget")
+	}
+	result, err := tx.Exec(`INSERT INTO attempts(id,job_id,ordinal,worker_id,status,leased_at,deadline_at,worker_pool,slot,session_generation,policy_version,resolved_policy)
+		SELECT ?,id,?,?,'leased',?,?,worker_pool,?,?,policy_version,resolved_policy FROM jobs WHERE id=? AND worker_pool=? AND policy_version=? AND resolved_policy=?`, attempt, ordinal, slot, at.UnixNano(), at.Add(time.Duration(policy.LeaseTTLNanos)).UnixNano(), slot, generation, id, pool, policyVersion, policyBytes)
+	if err != nil {
+		return Lease{}, false, err
+	}
+	if n, err := result.RowsAffected(); err != nil || n != 1 {
+		if err != nil {
+			return Lease{}, false, err
+		}
+		return Lease{}, false, errors.New("policy copy failed")
+	}
+	result, err = tx.Exec(`UPDATE jobs SET status='leased',attempt_id=?,worker_id=?,retry_at=0,updated_at=? WHERE id=? AND worker_pool=? AND (status='pending' OR status='retry_wait' AND retry_at<=?)`, attempt, slot, stamp, id, pool, at.UnixNano())
+	if err != nil {
+		return Lease{}, false, err
+	}
+	if n, err := result.RowsAffected(); err != nil || n != 1 {
+		if err != nil {
+			return Lease{}, false, err
+		}
+		return Lease{}, false, errors.New("job lease failed")
+	}
+	if _, err = tx.Exec(`INSERT INTO events(job_id,kind,detail,at) VALUES(?,?,?,?)`, id, "leased", fmt.Sprintf("attempt=%s ordinal=%d lease_expires=%s", attempt, ordinal, at.Add(time.Duration(policy.LeaseTTLNanos)).Format(time.RFC3339Nano)), stamp); err != nil {
+		return Lease{}, false, err
+	}
+	return lease, true, tx.Commit()
 }
 
 func (s *Store) LeaseNext(workerID string) (Lease, bool, error) {
@@ -676,12 +754,21 @@ func (s *Store) retryableFailure(jobID, attemptID, code string, at time.Time, po
 }
 
 func (s *Store) terminal(jobID, attemptID, attemptStatus, result, candidateSHA, failure string, at time.Time) (Job, error) {
+	return s.terminalOwned(jobID, attemptID, attemptStatus, result, candidateSHA, failure, at, "", "", false)
+}
+
+func (s *Store) terminalOwned(jobID, attemptID, attemptStatus, result, candidateSHA, failure string, at time.Time, slot, generation string, enforceOwnership bool) (Job, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Job{}, err
 	}
 	defer tx.Rollback()
-	j, err := scanJob(tx.QueryRow(`SELECT id,input,task_json,status,attempt_id,worker_id,result,candidate_sha,error_text,created_at,updated_at FROM jobs WHERE id=?`, jobID))
+	if enforceOwnership {
+		if _, err := ownedPolicy(tx, jobID, attemptID, slot, generation); err != nil {
+			return Job{}, err
+		}
+	}
+	j, err := scanJob(tx.QueryRow(`SELECT id,input,task_json,status,attempt_id,worker_id,result,candidate_sha,error_text,created_at,updated_at,worker_pool,policy_version FROM jobs WHERE id=?`, jobID))
 	if err != nil {
 		return Job{}, err
 	}
@@ -768,7 +855,7 @@ func (s *Store) terminal(jobID, attemptID, attemptStatus, result, candidateSHA, 
 }
 
 func (s *Store) Attempts(jobID string) ([]Attempt, error) {
-	rows, err := s.db.Query(`SELECT id,job_id,ordinal,worker_id,status,leased_at,deadline_at,completed_at,failure_disposition,failure_code,result,candidate_sha FROM attempts WHERE job_id=? ORDER BY ordinal`, jobID)
+	rows, err := s.db.Query(`SELECT id,job_id,ordinal,worker_id,status,leased_at,deadline_at,completed_at,failure_disposition,failure_code,result,candidate_sha,worker_pool,slot,policy_version FROM attempts WHERE job_id=? ORDER BY ordinal`, jobID)
 	if err != nil {
 		return nil, err
 	}
@@ -777,9 +864,12 @@ func (s *Store) Attempts(jobID string) ([]Attempt, error) {
 	for rows.Next() {
 		var a Attempt
 		var leased, deadline, completed int64
-		if err := rows.Scan(&a.ID, &a.JobID, &a.Ordinal, &a.WorkerID, &a.Status, &leased, &deadline, &completed, &a.FailureDisposition, &a.FailureCode, &a.Result, &a.CandidateSHA); err != nil {
+		var pool, slot sql.NullString
+		var policyVersion sql.NullInt64
+		if err := rows.Scan(&a.ID, &a.JobID, &a.Ordinal, &a.WorkerID, &a.Status, &leased, &deadline, &completed, &a.FailureDisposition, &a.FailureCode, &a.Result, &a.CandidateSHA, &pool, &slot, &policyVersion); err != nil {
 			return nil, err
 		}
+		a.WorkerPool, a.Slot, a.PolicyVersion = pool.String, slot.String, int(policyVersion.Int64)
 		a.LeasedAt = time.Unix(0, leased).UTC()
 		a.DeadlineAt = time.Unix(0, deadline).UTC()
 		if completed != 0 {
@@ -795,10 +885,13 @@ type scanner interface{ Scan(...any) error }
 func scanJob(r scanner) (Job, error) {
 	var j Job
 	var taskJSON, c, u string
-	err := r.Scan(&j.ID, &j.Input, &taskJSON, &j.Status, &j.AttemptID, &j.WorkerID, &j.Result, &j.CandidateSHA, &j.Error, &c, &u)
+	var pool sql.NullString
+	var policyVersion sql.NullInt64
+	err := r.Scan(&j.ID, &j.Input, &taskJSON, &j.Status, &j.AttemptID, &j.WorkerID, &j.Result, &j.CandidateSHA, &j.Error, &c, &u, &pool, &policyVersion)
 	if err != nil {
 		return j, err
 	}
+	j.WorkerPool, j.PolicyVersion = pool.String, int(policyVersion.Int64)
 	if taskJSON != "" {
 		j.Task = new(protocol.CodingTask)
 		if err = json.Unmarshal([]byte(taskJSON), j.Task); err != nil {
@@ -813,7 +906,7 @@ func scanJob(r scanner) (Job, error) {
 	return j, err
 }
 func (s *Store) Job(id string) (Job, error) {
-	return scanJob(s.db.QueryRow(`SELECT id,input,task_json,status,attempt_id,worker_id,result,candidate_sha,error_text,created_at,updated_at FROM jobs WHERE id=?`, id))
+	return scanJob(s.db.QueryRow(`SELECT id,input,task_json,status,attempt_id,worker_id,result,candidate_sha,error_text,created_at,updated_at,worker_pool,policy_version FROM jobs WHERE id=?`, id))
 }
 func (s *Store) Events(id string) ([]Event, error) {
 	rows, err := s.db.Query(`SELECT id,job_id,kind,detail,at FROM events WHERE job_id=? ORDER BY id`, id)
@@ -843,10 +936,13 @@ func (s *Store) SetWorkerConnected(id string, connected bool) error {
 func (s *Store) Worker(id string) (Worker, error) {
 	var w Worker
 	var at string
-	err := s.db.QueryRow(`SELECT id,connected,last_seen FROM workers WHERE id=?`, id).Scan(&w.ID, &w.Connected, &at)
+	var base, pool, generation sql.NullString
+	var slot sql.NullInt64
+	err := s.db.QueryRow(`SELECT id,connected,last_seen,base_worker_id,slot,worker_pool,generation FROM workers WHERE id=?`, id).Scan(&w.ID, &w.Connected, &at, &base, &slot, &pool, &generation)
 	if err != nil {
 		return w, err
 	}
+	w.BaseID, w.Slot, w.Pool, w.Generation = base.String, int(slot.Int64), pool.String, generation.String
 	w.LastSeen, err = time.Parse(time.RFC3339Nano, at)
 	return w, err
 }

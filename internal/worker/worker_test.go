@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +15,72 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 )
+
+func TestRunConfiguredReconnectsOnlyFailedSlotAndJoinsOnCancel(t *testing.T) {
+	var mu sync.Mutex
+	connections := [2]int{}
+	connected := make(chan int, 4)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/workers/connect" || r.URL.Query().Get("worker_id") != "worker-1" {
+			http.Error(w, "bad endpoint", http.StatusBadRequest)
+			return
+		}
+		slot, err := strconv.Atoi(r.URL.Query().Get("slot"))
+		if err != nil || slot < 0 || slot > 1 {
+			http.Error(w, "bad slot", http.StatusBadRequest)
+			return
+		}
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		mu.Lock()
+		connections[slot]++
+		attempt := connections[slot]
+		mu.Unlock()
+		connected <- slot
+		if slot == 0 && attempt == 1 {
+			c.CloseNow()
+			return
+		}
+		defer c.CloseNow()
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- RunConfigured(ctx, Config{GateURL: "ws" + strings.TrimPrefix(ts.URL, "http") + "/ignored", ID: "worker-1", token: "token", Concurrency: 2, HeartbeatInterval: time.Second})
+	}()
+	deadline := time.After(2 * time.Second)
+	for {
+		mu.Lock()
+		ready := connections[0] >= 2 && connections[1] == 1
+		mu.Unlock()
+		if ready {
+			break
+		}
+		select {
+		case <-connected:
+		case <-deadline:
+			t.Fatal("failed slot did not reconnect independently")
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunConfigured cancellation = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RunConfigured did not join slot supervisors")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if connections[1] != 1 {
+		t.Fatalf("healthy slot reconnected %d times", connections[1])
+	}
+}
 
 func TestWorkerHeartbeatsStopBeforeResult(t *testing.T) {
 	release := make(chan struct{})

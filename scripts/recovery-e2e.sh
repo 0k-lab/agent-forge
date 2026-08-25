@@ -30,9 +30,9 @@ go build -o "$RUN/forge-ref-plugin" ./cmd/forge-ref-plugin
 go build -o "$RUN/raw-worker" ./internal/gate/testdata/raw-worker
 
 start_gate() {
+	python3 "$ROOT/scripts/write-configs.py" "$RUN/gate.json" "$RUN/worker.json" "127.0.0.1:$PORT" "$RUN/forge.db" "$WS" worker-1 unused - reference "$RUN/forge-ref-plugin" 300ms 200ms 3 50ms
 	FORGE_OWNER_TOKEN=$OWNER_TOKEN FORGE_WORKER_TOKEN=$WORKER_TOKEN "$RUN/forge-gate" \
-		-addr "127.0.0.1:$PORT" -db "$RUN/forge.db" -worker-id worker-1 \
-		-lease-ttl 300ms -retry-base 200ms -max-attempts 3 -recovery-interval 50ms >"$RUN/gate.log" 2>&1 &
+		-config "$RUN/gate.json" >"$RUN/gate.log" 2>&1 &
 	GATE_PID=$!
 	i=0
 	until curl -fsS -o /dev/null -H "Authorization: Bearer $OWNER_TOKEN" "$HTTP/v1/debug/jobs" 2>/dev/null; do
@@ -68,8 +68,7 @@ while True:
 PY
 
 start_gate
-FORGE_WORKER_TOKEN=$WORKER_TOKEN "$RUN/forge-worker" -gate "$WS" -id worker-1 \
-	-heartbeat-interval 50ms -plugin "$RUN/forge-ref-plugin" >"$RUN/worker.log" 2>&1 &
+FORGE_WORKER_TOKEN=$WORKER_TOKEN "$RUN/forge-worker" -config "$RUN/worker.json" >"$RUN/worker.log" 2>&1 &
 WORKER_PID=$!
 i=0
 while :; do

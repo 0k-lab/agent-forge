@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -71,6 +72,33 @@ func TestOpenPersistsOneValidDebugCursorSecret(t *testing.T) {
 	}
 	if !bytes.Equal(first, reopened) {
 		t.Fatal("reopen changed debug cursor secret")
+	}
+}
+
+func TestOpenSerializesFilesystemInitialization(t *testing.T) {
+	path := filepath.Join(secureTempDir(t), "forge.db")
+	initializationMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		s, err := Open(path)
+		if err == nil {
+			err = s.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		initializationMu.Unlock()
+		t.Fatalf("Open bypassed initialization lock: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		initializationMu.Unlock()
+		t.Fatalf("database created while initialization lock held: %v", err)
+	}
+	initializationMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 

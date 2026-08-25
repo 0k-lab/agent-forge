@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
 	"embed"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -16,8 +18,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"agent-forge/internal/configjson"
 	"agent-forge/internal/protocol"
 	"agent-forge/internal/store"
 	"github.com/coder/websocket"
@@ -25,11 +29,19 @@ import (
 )
 
 type server struct {
-	store   *store.Store
-	tokens  map[string]string
-	owner   string
-	cursor  debugCursorCodec
-	options Options
+	store           *store.Store
+	tokens          map[string]string
+	ownerDigest     [sha256.Size]byte
+	ownerConfigured bool
+	cursor          debugCursorCodec
+	options         Options
+	config          *Config
+	mu              sync.Mutex
+	sessions        map[string]workerSession
+}
+
+type workerSession struct {
+	generation string
 }
 
 type Options struct {
@@ -87,6 +99,35 @@ func StartRecovery(ctx context.Context, s *store.Store, options Options) (<-chan
 		defer ticker.Stop()
 		errs <- recoveryLoop(ctx, s, options.Policy, ticker.C)
 		close(errs)
+	}()
+	return errs, nil
+}
+
+func StartConfiguredRecovery(ctx context.Context, s *store.Store, interval time.Duration, now func() time.Time) (<-chan error, error) {
+	if interval <= 0 || interval > time.Hour || now == nil {
+		return nil, errors.New("invalid recovery configuration")
+	}
+	if err := s.SweepExpiredPolicies(now().UTC()); err != nil {
+		return nil, err
+	}
+	ticker := time.NewTicker(interval)
+	errs := make(chan error, 1)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				errs <- ctx.Err()
+				close(errs)
+				return
+			case at := <-ticker.C:
+				if err := s.SweepExpiredPolicies(at.UTC()); err != nil {
+					errs <- err
+					close(errs)
+					return
+				}
+			}
+		}
 	}()
 	return errs, nil
 }
@@ -182,24 +223,32 @@ func (c debugCursorCodec) decode(cursor, purpose string) (*store.DebugPosition, 
 //go:embed debug/index.html debug/app.css debug/app.js
 var debugFiles embed.FS
 
-func NewHandler(s *store.Store, tokens map[string]string, ownerToken string) http.Handler {
-	return newHandler(s, tokens, ownerToken, DefaultOptions())
-}
-
-func NewHandlerWithOptions(s *store.Store, tokens map[string]string, ownerToken string, options Options) (http.Handler, error) {
+func NewConfiguredHandler(s *store.Store, config Config, options Options) (http.Handler, error) {
 	if err := options.Validate(); err != nil {
 		return nil, err
 	}
-	return newHandler(s, tokens, ownerToken, options), nil
+	if err := s.ValidateActivePolicies(); err != nil {
+		return nil, err
+	}
+	if err := s.MarkWorkersDisconnected(options.Now().UTC()); err != nil {
+		return nil, errors.New("worker startup state failed")
+	}
+	cursorKey := s.DebugCursorKey(config.ownerToken)
+	config.ownerToken = ""
+	x := newServerWithOwner(s, nil, config.ownerDigest, true, cursorKey, options)
+	x.config = &config
+	return x.routes(), nil
 }
 
-func newHandler(s *store.Store, tokens map[string]string, ownerToken string, options Options) http.Handler {
-	for workerToken := range tokens {
-		if subtle.ConstantTimeCompare([]byte(ownerToken), []byte(workerToken)) == 1 {
-			ownerToken = ""
-		}
-	}
-	x := &server{store: s, tokens: tokens, owner: ownerToken, cursor: newDebugCursorCodec(s.DebugCursorKey(ownerToken)), options: options}
+func newServer(s *store.Store, tokens map[string]string, ownerToken string, options Options) *server {
+	return newServerWithOwner(s, tokens, sha256.Sum256([]byte(ownerToken)), ownerToken != "", s.DebugCursorKey(ownerToken), options)
+}
+
+func newServerWithOwner(s *store.Store, tokens map[string]string, ownerDigest [sha256.Size]byte, ownerConfigured bool, cursorKey [sha256.Size]byte, options Options) *server {
+	return &server{store: s, tokens: tokens, ownerDigest: ownerDigest, ownerConfigured: ownerConfigured, cursor: newDebugCursorCodec(cursorKey), options: options, sessions: map[string]workerSession{}}
+}
+
+func (x *server) routes() http.Handler {
 	m := http.NewServeMux()
 	m.HandleFunc("POST /v1/jobs", x.ownerAuth(x.submit))
 	m.HandleFunc("GET /v1/jobs/{id}", x.ownerAuth(x.getJob))
@@ -230,8 +279,8 @@ func getOnly(next http.HandlerFunc) http.HandlerFunc {
 
 func (x *server) ownerAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token := bearerToken(r)
-		if x.owner == "" || token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(x.owner)) != 1 {
+		digest := sha256.Sum256([]byte(bearerToken(r)))
+		if subtle.ConstantTimeCompare(digest[:], x.ownerDigest[:]) != 1 || !x.ownerConfigured {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -377,6 +426,10 @@ func writeErr(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error()})
 }
 func (x *server) submit(w http.ResponseWriter, r *http.Request) {
+	if x.config != nil {
+		x.submitConfigured(w, r)
+		return
+	}
 	var in struct {
 		Input string `json:"input"`
 		protocol.CodingTask
@@ -404,9 +457,67 @@ func (x *server) submit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, j)
 }
 
+func (x *server) submitConfigured(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Input             string     `json:"input"`
+		RepositoryID      string     `json:"repository_id"`
+		BaseSHA           string     `json:"base_sha"`
+		Instruction       string     `json:"instruction"`
+		Tests             [][]string `json:"tests"`
+		CommitAuthorName  string     `json:"commit_author_name"`
+		CommitAuthorEmail string     `json:"commit_author_email"`
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil || configjson.Decode(body, &in) != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+		return
+	}
+	if in.RepositoryID == "" {
+		if in.Input == "" || in.BaseSHA != "" || in.Instruction != "" || in.Tests != nil || in.CommitAuthorName != "" || in.CommitAuthorEmail != "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+			return
+		}
+		policy := x.config.resolvedPolicy(x.config.DefaultPool, x.config.DefaultExecution, "", "")
+		job, err := x.store.CreateJobWithPolicy(in.Input, policy)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "request failed"})
+			return
+		}
+		writeJSON(w, http.StatusCreated, job)
+		return
+	}
+	var repository *RepositoryRegistration
+	for i := range x.config.Repositories {
+		if x.config.Repositories[i].ID == in.RepositoryID {
+			repository = &x.config.Repositories[i]
+			break
+		}
+	}
+	if repository == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+		return
+	}
+	task := protocol.CodingTask{RepositoryID: in.RepositoryID, BaseSHA: in.BaseSHA, Instruction: in.Instruction, Tests: in.Tests, CommitAuthorName: in.CommitAuthorName, CommitAuthorEmail: in.CommitAuthorEmail}
+	if err := validateTask(task); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+		return
+	}
+	policy := x.config.resolvedPolicy(repository.WorkerPool, repository.Execution, repository.ID, repository.DefaultBranch)
+	job, err := x.store.CreateCodingJobWithPolicy(task, policy)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "request failed"})
+		return
+	}
+	writeJSON(w, http.StatusCreated, job)
+}
+
 func validateTask(task protocol.CodingTask) error {
-	if !filepath.IsAbs(task.Repository) || len(task.Repository) > 4096 {
-		return errors.New("repository must be an absolute path")
+	if task.RepositoryID == "" {
+		if !filepath.IsAbs(task.Repository) || len(task.Repository) > 4096 {
+			return errors.New("repository must be an absolute path")
+		}
+	} else if task.Repository != "" || !configID.MatchString(task.RepositoryID) {
+		return errors.New("invalid repository ID")
 	}
 	if err := protocol.ValidateBaseSHA(task.BaseSHA); err != nil {
 		return err
@@ -465,27 +576,74 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 	workerID := r.URL.Query().Get("worker_id")
 	token := bearerToken(r)
 	authorized := false
-	for expected, id := range x.tokens {
-		if id == workerID && expected != "" && token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1 {
-			authorized = true
+	pool, generation := "", ""
+	slotIndex := 0
+	effectiveID := workerID
+	baseWorkerID := workerID
+	if x.config != nil {
+		slotText := r.URL.Query().Get("slot")
+		parsed, err := strconv.Atoi(slotText)
+		var registration WorkerRegistration
+		found := false
+		digest := sha256.Sum256([]byte(token))
+		for _, credential := range x.config.workerTokens {
+			if subtle.ConstantTimeCompare(digest[:], credential.digest[:]) == 1 {
+				registration, found = credential.registration, true
+			}
+		}
+		if err == nil && strconv.Itoa(parsed) == slotText && parsed >= 0 && found && registration.ID == workerID && parsed < registration.Concurrency && token != "" {
+			authorized, pool, slotIndex = true, registration.Pool, parsed
+			if parsed > 0 {
+				effectiveID = workerID + "#" + slotText
+			}
+		}
+	} else {
+		for expected, id := range x.tokens {
+			if id == workerID && expected != "" && token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1 {
+				authorized = true
+			}
 		}
 	}
 	if workerID == "" || !authorized {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	if x.config != nil {
+		generation = newSessionGeneration()
+		if err := x.store.ClaimWorkerSlot(baseWorkerID, slotIndex, effectiveID, pool, generation, x.options.Now().UTC()); err != nil {
+			http.Error(w, "worker slot unavailable", http.StatusConflict)
+			return
+		}
+	}
 	c, err := websocket.Accept(w, r, nil)
 	if err != nil {
+		if x.config != nil {
+			_ = x.store.ReleaseWorkerSlot(effectiveID, generation, x.options.Now().UTC())
+		}
 		return
 	}
 	defer c.CloseNow()
 	c.SetReadLimit(protocol.MaxWorkerMessageBytes)
-	if err = x.store.SetWorkerConnected(workerID, true); err != nil {
-		return
-	}
-	defer x.store.SetWorkerConnected(workerID, false)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	if x.config != nil {
+		x.mu.Lock()
+		x.sessions[effectiveID] = workerSession{generation: generation}
+		x.mu.Unlock()
+		defer func() {
+			x.mu.Lock()
+			if x.sessions[effectiveID].generation == generation {
+				delete(x.sessions, effectiveID)
+			}
+			x.mu.Unlock()
+			_ = x.store.ReleaseWorkerSlot(effectiveID, generation, x.options.Now().UTC())
+		}()
+	} else {
+		if err = x.store.SetWorkerConnected(workerID, true); err != nil {
+			return
+		}
+		defer x.store.SetWorkerConnected(workerID, false)
+	}
 	incoming := make(chan protocol.Message, 1)
 	readErr := make(chan error, 1)
 	go func() {
@@ -523,7 +681,7 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 			return
 		case m := <-incoming:
 			if completed != nil && m.Type == protocol.MessageHeartbeat && m.JobID == completed.JobID && m.AttemptID == completed.AttemptID {
-				if m.WorkerID != workerID || m.Input != "" || m.Task != nil || m.Result != "" || m.CandidateSHA != "" || m.Disposition != "" || m.Error != "" || len(m.Evidence) != 0 {
+				if m.WorkerID != baseWorkerID || m.Input != "" || m.Task != nil || m.Policy != nil || m.Result != "" || m.CandidateSHA != "" || m.Disposition != "" || m.Error != "" || len(m.Evidence) != 0 {
 					reject()
 					return
 				}
@@ -534,16 +692,22 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if m.Type == protocol.MessageHeartbeat {
-				if m.WorkerID != workerID || m.Input != "" || m.Task != nil || m.Result != "" || m.CandidateSHA != "" || m.Disposition != "" || m.Error != "" || len(m.Evidence) != 0 || x.store.Heartbeat(m.JobID, m.AttemptID, workerID, x.options.Now().UTC(), x.options.Policy) != nil {
+				var heartbeatErr error
+				if x.config != nil {
+					heartbeatErr = x.store.HeartbeatLease(m.JobID, m.AttemptID, effectiveID, generation, x.options.Now().UTC())
+				} else {
+					heartbeatErr = x.store.Heartbeat(m.JobID, m.AttemptID, workerID, x.options.Now().UTC(), x.options.Policy)
+				}
+				if m.WorkerID != baseWorkerID || m.Input != "" || m.Task != nil || m.Policy != nil || m.Result != "" || m.CandidateSHA != "" || m.Disposition != "" || m.Error != "" || len(m.Evidence) != 0 || heartbeatErr != nil {
 					reject()
 					return
 				}
 				continue
 			}
 			if m.Type == protocol.MessageEvidence {
-				if m.WorkerID != "" || m.Input != "" || m.Task != nil || m.Result != "" || m.CandidateSHA != "" || m.Error != "" || m.Disposition != "" ||
+				if m.WorkerID != "" || m.Input != "" || m.Task != nil || m.Policy != nil || m.Result != "" || m.CandidateSHA != "" || m.Error != "" || m.Disposition != "" ||
 					len(m.Evidence) == 0 || len(m.Evidence) > protocol.MaxEvidenceRecordsPerBatch ||
-					x.store.BindEvidenceAt(m.JobID, m.AttemptID, workerID, m.Evidence, x.options.Now().UTC()) != nil {
+					x.bindEvidence(m.JobID, m.AttemptID, effectiveID, generation, m.Evidence) != nil {
 					reject()
 					return
 				}
@@ -552,7 +716,7 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
-			if m.Type != protocol.MessageResult || m.WorkerID != "" || m.Input != "" || m.Task != nil || len(m.Evidence) != 0 {
+			if m.Type != protocol.MessageResult || m.WorkerID != "" || m.Input != "" || m.Task != nil || m.Policy != nil || len(m.Evidence) != 0 {
 				reject()
 				return
 			}
@@ -564,14 +728,26 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 					reject()
 					return
 				}
-				_, resultErr = x.store.FailAt(m.JobID, m.AttemptID, m.Error, disposition, at, x.options.Policy)
+				if x.config != nil {
+					_, resultErr = x.store.FailLeaseAt(m.JobID, m.AttemptID, effectiveID, generation, m.Error, disposition, at)
+				} else {
+					_, resultErr = x.store.FailAt(m.JobID, m.AttemptID, m.Error, disposition, at, x.options.Policy)
+				}
 			} else if m.Disposition != "" {
 				reject()
 				return
 			} else if m.CandidateSHA != "" {
-				_, resultErr = x.store.CompleteCandidateAt(m.JobID, m.AttemptID, m.CandidateSHA, at)
+				if x.config != nil {
+					_, resultErr = x.store.CompleteCandidateLeaseAt(m.JobID, m.AttemptID, effectiveID, generation, m.CandidateSHA, at)
+				} else {
+					_, resultErr = x.store.CompleteCandidateAt(m.JobID, m.AttemptID, m.CandidateSHA, at)
+				}
 			} else {
-				_, resultErr = x.store.CompleteAt(m.JobID, m.AttemptID, m.Result, at)
+				if x.config != nil {
+					_, resultErr = x.store.CompleteLeaseAt(m.JobID, m.AttemptID, effectiveID, generation, m.Result, at)
+				} else {
+					_, resultErr = x.store.CompleteAt(m.JobID, m.AttemptID, m.Result, at)
+				}
 			}
 			if resultErr != nil {
 				reject()
@@ -585,7 +761,14 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 			if active != nil {
 				continue
 			}
-			lease, ok, err := x.store.LeaseNextAt(workerID, x.options.Now().UTC(), x.options.Policy)
+			var lease store.Lease
+			var ok bool
+			var err error
+			if x.config != nil {
+				lease, ok, err = x.store.LeaseNextForPool(effectiveID, pool, generation, x.options.Now().UTC())
+			} else {
+				lease, ok, err = x.store.LeaseNextAt(workerID, x.options.Now().UTC(), x.options.Policy)
+			}
 			if err != nil {
 				return
 			}
@@ -593,12 +776,31 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			m := protocol.Message{Type: protocol.MessageLease, JobID: lease.JobID, AttemptID: lease.AttemptID, Input: lease.Input, Task: lease.Task}
+			if x.config != nil {
+				policy := protocol.ResolvedPolicy(lease.Policy)
+				m.Policy = &policy
+			}
 			if err := wsjson.Write(ctx, c, m); err != nil {
 				return
 			}
 			active = &lease
 		}
 	}
+}
+
+func newSessionGeneration() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		panic("crypto/rand failed")
+	}
+	return hex.EncodeToString(value[:])
+}
+
+func (x *server) bindEvidence(jobID, attemptID, slot, generation string, evidence []protocol.AttemptEvidence) error {
+	if x.config != nil {
+		return x.store.BindEvidenceLeaseAt(jobID, attemptID, slot, generation, evidence, x.options.Now().UTC())
+	}
+	return x.store.BindEvidenceAt(jobID, attemptID, slot, evidence, x.options.Now().UTC())
 }
 
 func readWorkerMessage(ctx context.Context, c *websocket.Conn, message *protocol.Message) error {
@@ -609,15 +811,7 @@ func readWorkerMessage(ctx context.Context, c *websocket.Conn, message *protocol
 	if typ != websocket.MessageText {
 		return errors.New("worker message must be text")
 	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(message); err != nil {
-		return err
-	}
-	if decoder.Decode(&struct{}{}) != io.EOF {
-		return errors.New("worker message has trailing data")
-	}
-	return nil
+	return configjson.Decode(body, message)
 }
 
 func failureDisposition(code string) (store.FailureDisposition, bool) {
