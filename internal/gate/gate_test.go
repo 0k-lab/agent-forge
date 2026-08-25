@@ -346,12 +346,15 @@ func TestGateOwnsBoundedFailurePolicy(t *testing.T) {
 			ts := httptest.NewServer(h)
 			defer ts.Close()
 			c := dialWorker(t, ts.URL, "worker", "token")
+			defer func() {
+				c.CloseNow()
+				waitWorkerDisconnected(t, s, "worker")
+			}()
 			lease := readMessage(t, c)
 			writeMessage(t, c, protocol.Message{Type: protocol.MessageResult, JobID: lease.JobID, AttemptID: lease.AttemptID, Error: tc.code, Disposition: tc.disposition})
 			if ack := readMessage(t, c); ack.Type != protocol.MessageAck {
 				t.Fatalf("ack = %#v", ack)
 			}
-			c.CloseNow()
 			stored, err := s.Job(job.ID)
 			if err != nil || stored.Status != tc.status {
 				t.Fatalf("job = %#v, %v", stored, err)
@@ -376,6 +379,10 @@ func TestGateOwnsBoundedFailurePolicy(t *testing.T) {
 		ts := httptest.NewServer(h)
 		defer ts.Close()
 		c := dialWorker(t, ts.URL, "worker", "token")
+		defer func() {
+			c.CloseNow()
+			waitWorkerDisconnected(t, s, "worker")
+		}()
 		lease := readMessage(t, c)
 		writeMessage(t, c, protocol.Message{Type: protocol.MessageResult, JobID: lease.JobID, AttemptID: lease.AttemptID, Error: "invented", Disposition: protocol.DispositionRetryable})
 		if got := readMessage(t, c); got.Type != protocol.MessageError || got.Error != "request failed" {
