@@ -31,7 +31,8 @@ Terminal 1:
 
 ```sh
 FORGE_OWNER_TOKEN=fake-owner-token FORGE_WORKER_TOKEN=fake-worker-token \
-  ./bin/forge-gate -addr 127.0.0.1:18080 -db ./forge.db -worker-id worker-1
+  ./bin/forge-gate -addr 127.0.0.1:18080 -db ./forge.db -worker-id worker-1 \
+  -lease-ttl 30s -retry-base 1s -max-attempts 3 -recovery-interval 1s
 ```
 
 Terminal 2:
@@ -39,7 +40,8 @@ Terminal 2:
 ```sh
 FORGE_WORKER_TOKEN=fake-worker-token ./bin/forge-worker \
   -gate ws://127.0.0.1:18080 -id worker-1 \
-  -repo-root /srv/forge/repos -plugin ./bin/forge-ref-plugin
+  -repo-root /srv/forge/repos -plugin ./bin/forge-ref-plugin \
+  -heartbeat-interval 10s
 ```
 
 Submit and inspect:
@@ -65,6 +67,18 @@ These routes cannot submit, retry, cancel, approve, edit policy, manage reposito
 
 Job results are accepted only for the currently bound attempt. Repeating the identical result is idempotent; a different result or wrong attempt is rejected. Worker `connected` state is set on authenticated WebSocket establishment and cleared when that connection ends.
 
+## Leases, retries, and recovery
+
+Gate owns lease and retry policy. Defaults are a 30-second lease TTL, 1-second exponential retry base, 3 attempts, and a 1-second recovery sweep interval. All values must be positive and bounded; the recovery interval cannot exceed the lease TTL. `scoped_test_failed` and `invalid_task` are terminal, while `execution_failed` is retryable. Gate rejects unknown codes and conflicting claimed dispositions without spending another attempt.
+
+A job moves through `pending -> leased -> succeeded`, `leased -> failed` for terminal failures, or `leased -> retry_wait -> leased` for retryable failures and expired leases. Each lease creates a durable attempt with a new ID and ordinal. Backoff is based on that ordinal. When the maximum is reached, the job becomes `failed` with `max_attempts_exceeded`; it is not leased again.
+
+Workers heartbeat the exact job/attempt/Worker tuple while executing. The Worker default is 10 seconds, one third of the default Gate TTL; configure `-heartbeat-interval` shorter than `-lease-ttl`. Gate closes or rejects a stale connection, and Worker cancellation is best-effort, so old execution may physically overlap a retry. SQLite attempt and lease fencing ensures that old work can never publish an authoritative result or candidate. Candidate refs already created for an attempt remain preserved.
+
+Gate performs an expiry sweep before it starts serving, then repeats at `-recovery-interval`. Restarting Gate with the same SQLite database preserves attempt history and recovers expired leases. A sweep or Store failure stops Gate rather than disabling recovery. Run Gate and Worker under supervisors: Workers return after Gate disconnects and the supervisor should reconnect them; Gate should also be restarted after a fatal recovery error.
+
+The sanitized timeline exposes attempt ordinals, lease expiry, retry scheduling, dispositions, bounded failure codes, and success without task content, result bodies, tokens, private repository paths, or cursor secrets. Storage ownership and filesystem permissions are separate issue #13 hardening and are not implemented here.
+
 Submit a coding task with an absolute local repository path, full base SHA, instruction, explicit argv arrays, and an optional paired commit author:
 
 ```json
@@ -77,4 +91,4 @@ The terminal job contains `candidate_sha`; its deterministic candidate ref keeps
 
 Owner-token holders are authorized to request commands only inside configured repository roots. Production Workers should run as dedicated unprivileged accounts or containers. The plugin receives only `PATH`, `HOME`, `CODEX_HOME`, `CODEX_BIN`, and `TMPDIR` when set; scoped tests receive an isolated home, temp, and cache.
 
-Run `scripts/e2e.sh` for the reference transport proof and `CODEX_BIN=/path/to/codex scripts/coding-e2e.sh` for the real coding proof. Both scripts use only synthetic data; the coding script deletes its temporary repository and worktrees.
+Run `scripts/e2e.sh` for the reference transport proof, `scripts/recovery-e2e.sh` for restart/expiry/retry/late-result recovery, and `CODEX_BIN=/path/to/codex scripts/coding-e2e.sh` for the real coding proof. The scripts use synthetic data; recovery artifacts stay in a temporary directory and all spawned processes are cleaned up.
