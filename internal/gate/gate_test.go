@@ -62,6 +62,7 @@ func TestWorkerConnectionHeartbeatFailureAndLaterLease(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	writeMessage(t, c, protocol.Message{Type: protocol.MessageResult, JobID: lease.JobID, AttemptID: lease.AttemptID, Error: protocol.FailureExecution, Disposition: protocol.DispositionRetryable})
+	writeMessage(t, c, protocol.Message{Type: protocol.MessageHeartbeat, JobID: lease.JobID, AttemptID: lease.AttemptID, WorkerID: "worker-1"})
 	if ack := readMessage(t, c); ack.Type != protocol.MessageAck {
 		t.Fatalf("failure ack = %#v", ack)
 	}
@@ -90,11 +91,56 @@ func TestWorkerConnectionHeartbeatFailureAndLaterLease(t *testing.T) {
 	t.Fatal("worker connection did not close")
 }
 
+func TestWorkerConnectionBindsEvidenceWithoutClearingLease(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	base := strings.Repeat("a", 40)
+	job, err := s.CreateCodingJob(protocol.CodingTask{Repository: "/repo", BaseSHA: base, Instruction: "edit", Tests: [][]string{{"true"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	options := DefaultOptions()
+	options.LeasePollInterval = time.Millisecond
+	options.Now = func() time.Time { return start }
+	h, err := NewHandlerWithOptions(s, map[string]string{"token": "worker-1"}, "owner", options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+	c := dialWorker(t, ts.URL, "worker-1", "token")
+	defer c.CloseNow()
+	lease := readMessage(t, c)
+	record := protocol.AttemptEvidence{EvidenceID: strings.Repeat("1", 32), Phase: protocol.EvidencePhasePlugin, Reason: protocol.EvidenceReasonPluginFailed, BaseSHA: base}
+	writeMessage(t, c, protocol.Message{Type: protocol.MessageEvidence, JobID: lease.JobID, AttemptID: lease.AttemptID, Evidence: []protocol.AttemptEvidence{record}})
+	if ack := readMessage(t, c); ack.Type != protocol.MessageAck || ack.JobID != lease.JobID || ack.AttemptID != lease.AttemptID {
+		t.Fatalf("evidence ACK = %#v", ack)
+	}
+	writeMessage(t, c, protocol.Message{Type: protocol.MessageResult, JobID: lease.JobID, AttemptID: lease.AttemptID, Error: protocol.FailureExecution, Disposition: protocol.DispositionRetryable})
+	if ack := readMessage(t, c); ack.Type != protocol.MessageAck || ack.JobID != lease.JobID || ack.AttemptID != lease.AttemptID {
+		t.Fatalf("result ACK = %#v", ack)
+	}
+	records, err := s.AttemptEvidence(job.ID, lease.AttemptID)
+	if err != nil || len(records) != 1 || records[0].EvidenceID != record.EvidenceID {
+		t.Fatalf("stored evidence = %#v, %v", records, err)
+	}
+	c.CloseNow()
+	waitWorkerDisconnected(t, s, "worker-1")
+}
+
 func TestWorkerConnectionRejectsMismatchedLeaseMessagesGenerically(t *testing.T) {
 	for name, bad := range map[string]func(protocol.Message) protocol.Message{
 		"job":     func(m protocol.Message) protocol.Message { m.JobID = "wrong"; return m },
 		"attempt": func(m protocol.Message) protocol.Message { m.AttemptID = "wrong"; return m },
 		"worker":  func(m protocol.Message) protocol.Message { m.WorkerID = "worker-2"; return m },
+		"mixed heartbeat": func(m protocol.Message) protocol.Message {
+			m.Evidence = []protocol.AttemptEvidence{{EvidenceID: strings.Repeat("1", 32)}}
+			return m
+		},
 		"disposition": func(m protocol.Message) protocol.Message {
 			m.Type, m.Error, m.Disposition = protocol.MessageResult, protocol.FailureExecution, protocol.DispositionTerminal
 			return m
@@ -132,6 +178,141 @@ func TestWorkerConnectionRejectsMismatchedLeaseMessagesGenerically(t *testing.T)
 			}
 			waitWorkerDisconnected(t, s, "worker-1")
 		})
+	}
+}
+
+func TestWorkerConnectionRejectsUnknownMessageFields(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.CreateJob("work"); err != nil {
+		t.Fatal(err)
+	}
+	options := DefaultOptions()
+	options.LeasePollInterval = time.Millisecond
+	h, _ := NewHandlerWithOptions(s, map[string]string{"token": "worker"}, "owner", options)
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+	c := dialWorker(t, ts.URL, "worker", "token")
+	lease := readMessage(t, c)
+	body := `{"type":"heartbeat","job_id":"` + lease.JobID + `","attempt_id":"` + lease.AttemptID + `","worker_id":"worker","unknown":true}`
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := c.Write(ctx, websocket.MessageText, []byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	if got := readMessage(t, c); got.Type != protocol.MessageError {
+		t.Fatalf("unknown field response = %#v", got)
+	}
+	c.CloseNow()
+	waitWorkerDisconnected(t, s, "worker")
+}
+
+func TestWorkerConnectionRejectsInvalidEvidenceWithoutMutation(t *testing.T) {
+	for name, mutate := range map[string]func(*protocol.Message){
+		"empty":         func(m *protocol.Message) { m.Evidence = nil },
+		"mixed":         func(m *protocol.Message) { m.Result = "not evidence" },
+		"payload owner": func(m *protocol.Message) { m.WorkerID = "worker-1" },
+		"malformed":     func(m *protocol.Message) { m.Evidence[0].Reason = "invented" },
+		"truncated partial record": func(m *protocol.Message) {
+			m.Evidence[0].Output = "[REDACTED]\nhttps://synthetic-user:synthetic-password"
+			m.Evidence[0].OutputRedacted = true
+			m.Evidence[0].OutputTruncated = true
+		},
+		"too many": func(m *protocol.Message) {
+			m.Evidence = make([]protocol.AttemptEvidence, protocol.MaxEvidenceRecordsPerBatch+1)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			base := strings.Repeat("a", 40)
+			job, err := s.CreateCodingJob(protocol.CodingTask{Repository: "/repo", BaseSHA: base, Instruction: "edit", Tests: [][]string{{"true"}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			options := DefaultOptions()
+			options.LeasePollInterval = time.Millisecond
+			h, _ := NewHandlerWithOptions(s, map[string]string{"token": "worker-1"}, "owner", options)
+			ts := httptest.NewServer(h)
+			defer ts.Close()
+			c := dialWorker(t, ts.URL, "worker-1", "token")
+			lease := readMessage(t, c)
+			message := protocol.Message{Type: protocol.MessageEvidence, JobID: lease.JobID, AttemptID: lease.AttemptID, Evidence: []protocol.AttemptEvidence{{
+				EvidenceID: strings.Repeat("1", 32), Phase: protocol.EvidencePhasePlugin, Reason: protocol.EvidenceReasonPluginFailed, BaseSHA: base,
+			}}}
+			mutate(&message)
+			writeMessage(t, c, message)
+			if got := readMessage(t, c); got.Type != protocol.MessageError || got.Error != "request failed" || got.JobID != "" || got.AttemptID != "" {
+				t.Fatalf("rejection = %#v", got)
+			}
+			records, err := s.AttemptEvidence(job.ID, lease.AttemptID)
+			if err != nil || len(records) != 0 {
+				t.Fatalf("rejected evidence persisted: %#v, %v", records, err)
+			}
+			c.CloseNow()
+			waitWorkerDisconnected(t, s, "worker-1")
+		})
+	}
+}
+
+func TestEvidenceSurvivesGateRestartBeforeTerminalResult(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "forge.db")
+	start := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	policy := store.RecoveryPolicy{LeaseTTL: time.Minute, BaseRetryBackoff: time.Second, MaxAttempts: 3}
+	base := strings.Repeat("a", 40)
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := s.CreateCodingJob(protocol.CodingTask{Repository: "/repo", BaseSHA: base, Instruction: "edit", Tests: [][]string{{"true"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := DefaultOptions()
+	options.Policy = policy
+	options.LeasePollInterval = time.Millisecond
+	options.Now = func() time.Time { return start }
+	h, _ := NewHandlerWithOptions(s, map[string]string{"token": "worker-1"}, "owner", options)
+	ts := httptest.NewServer(h)
+	c := dialWorker(t, ts.URL, "worker-1", "token")
+	lease := readMessage(t, c)
+	record := protocol.AttemptEvidence{EvidenceID: strings.Repeat("1", 32), Phase: protocol.EvidencePhasePlugin, Reason: protocol.EvidenceReasonPluginFailed, BaseSHA: base}
+	writeMessage(t, c, protocol.Message{Type: protocol.MessageEvidence, JobID: lease.JobID, AttemptID: lease.AttemptID, Evidence: []protocol.AttemptEvidence{record}})
+	if ack := readMessage(t, c); ack.Type != protocol.MessageAck {
+		t.Fatalf("evidence ACK = %#v", ack)
+	}
+	c.CloseNow()
+	waitWorkerDisconnected(t, s, "worker-1")
+	ts.Close()
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	restarted := NewHandler(s, map[string]string{"token": "worker-1"}, "owner")
+	res := debugRequest(t, restarted, "/v1/jobs/"+job.ID+"/attempts/"+lease.AttemptID+"/evidence", "owner")
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), record.EvidenceID) {
+		t.Fatalf("restarted evidence = %d %s", res.Code, res.Body.String())
+	}
+	stored, err := s.Job(job.ID)
+	if err != nil || stored.Status != "leased" {
+		t.Fatalf("job after evidence-only restart = %#v, %v", stored, err)
+	}
+	if err := s.SweepExpired(start.Add(policy.LeaseTTL), policy); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindEvidenceAt(job.ID, lease.AttemptID, "worker-1", []protocol.AttemptEvidence{{EvidenceID: strings.Repeat("2", 32), Phase: protocol.EvidencePhasePlugin, Reason: protocol.EvidenceReasonPluginFailed, BaseSHA: base}}, start.Add(policy.LeaseTTL+time.Second)); err == nil {
+		t.Fatal("expired prior attempt appended evidence")
 	}
 }
 
@@ -642,6 +823,80 @@ func TestDebugAPIRequiresOwnerAndReturnsOnlySanitizedData(t *testing.T) {
 	}
 }
 
+func TestAttemptEvidenceAPIRequiresOwnerAndReturnsOnlyStructuredEvidence(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	start := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	base, repository := strings.Repeat("a", 40), "/private/alice/repository"
+	job, err := s.CreateCodingJob(protocol.CodingTask{
+		Repository: repository, BaseSHA: base, Instruction: "private prompt",
+		Tests: [][]string{{"check", repository + "/secret", "--token=argv-secret", "Access Token: synthetic-gate-access-token", "--client secret synthetic-gate-client-secret; safe"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, ok, err := s.LeaseNextAt("worker-1", start, store.RecoveryPolicy{LeaseTTL: time.Minute, BaseRetryBackoff: time.Second, MaxAttempts: 3})
+	if err != nil || !ok {
+		t.Fatalf("lease = %#v, %v, %v", lease, ok, err)
+	}
+	checkIndex := 0
+	safeOutput := protocol.EvidenceRedactedMarker
+	if err := s.BindEvidenceAt(job.ID, lease.AttemptID, "worker-1", []protocol.AttemptEvidence{{
+		EvidenceID: strings.Repeat("1", 32), Phase: protocol.EvidencePhaseScopedCheck, Reason: protocol.EvidenceReasonScopedCheckFailed,
+		CheckIndex: &checkIndex, DurationMS: 5, Output: safeOutput, OutputRedacted: true, OutputTruncated: true, BaseSHA: base,
+	}}, start.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(s, map[string]string{"worker-secret": "worker-1"}, "owner-secret")
+	path := "/v1/jobs/" + job.ID + "/attempts/" + lease.AttemptID + "/evidence"
+
+	for name, tc := range map[string]struct {
+		token string
+		want  int
+	}{
+		"missing token": {want: http.StatusUnauthorized},
+		"worker token":  {token: "worker-secret", want: http.StatusUnauthorized},
+		"owner":         {token: "owner-secret", want: http.StatusOK},
+	} {
+		t.Run(name, func(t *testing.T) {
+			res := debugRequest(t, h, path, tc.token)
+			if res.Code != tc.want {
+				t.Fatalf("GET evidence = %d: %s, want %d", res.Code, res.Body.String(), tc.want)
+			}
+			if tc.want != http.StatusOK {
+				return
+			}
+			body := res.Body.String()
+			for _, private := range []string{repository, "private prompt", "argv-secret", "output-secret", "worker-secret", "PRIVATE_ENV=output-secret", "synthetic-user:synthetic-password", "synthetic-gate-access-token", "synthetic-gate-client-secret"} {
+				if strings.Contains(body, private) {
+					t.Fatalf("evidence API exposed %q: %s", private, body)
+				}
+			}
+			var value any
+			if err := json.Unmarshal([]byte(body), &value); err != nil {
+				t.Fatal(err)
+			}
+			assertNoDebugSensitiveKeys(t, value)
+			if !strings.Contains(body, base) || !strings.Contains(body, `"argv_redacted":true`) || !strings.Contains(body, `"output_redacted":true`) || !strings.Contains(body, `"check_index":0`) {
+				t.Fatalf("evidence API omitted structured binding: %s", body)
+			}
+		})
+	}
+
+	for _, missing := range []string{
+		"/v1/jobs/missing/attempts/" + lease.AttemptID + "/evidence",
+		"/v1/jobs/" + job.ID + "/attempts/missing/evidence",
+	} {
+		res := debugRequest(t, h, missing, "owner-secret")
+		if res.Code != http.StatusNotFound {
+			t.Fatalf("GET %s = %d: %s, want 404", missing, res.Code, res.Body.String())
+		}
+	}
+}
+
 func assertNoDebugSensitiveKeys(t *testing.T, value any) {
 	t.Helper()
 	forbidden := map[string]bool{"input": true, "task": true, "instruction": true, "repository": true, "tests": true, "result": true, "detail": true, "error": true, "authorization": true}
@@ -789,6 +1044,26 @@ func TestValidateTaskAcceptsAbsentOrPairedCommitAuthor(t *testing.T) {
 		if err := validateTask(task); err != nil {
 			t.Fatalf("author %q <%s> rejected: %v", author[0], author[1], err)
 		}
+	}
+}
+
+func TestSubmitRejectsUppercaseBaseSHAWithoutPersistingJob(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	h := NewHandler(s, nil, "owner-secret")
+	body := `{"repository":"/repo","base_sha":"` + strings.Repeat("A", 40) + `","instruction":"edit","tests":[["true"]]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer owner-secret")
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, req)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("POST uppercase base_sha = %d, want 400", res.Code)
+	}
+	if _, ok, err := s.LeaseNext("worker-1"); err != nil || ok {
+		t.Fatalf("rejected job persisted: ok=%v err=%v", ok, err)
 	}
 }
 

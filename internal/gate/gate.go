@@ -9,7 +9,6 @@ import (
 	"database/sql"
 	"embed"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -205,6 +204,7 @@ func newHandler(s *store.Store, tokens map[string]string, ownerToken string, opt
 	m.HandleFunc("POST /v1/jobs", x.ownerAuth(x.submit))
 	m.HandleFunc("GET /v1/jobs/{id}", x.ownerAuth(x.getJob))
 	m.HandleFunc("GET /v1/jobs/{id}/events", x.ownerAuth(x.getEvents))
+	m.HandleFunc("GET /v1/jobs/{id}/attempts/{attempt_id}/evidence", x.ownerAuth(x.getAttemptEvidence))
 	m.HandleFunc("GET /v1/workers/{id}", x.ownerAuth(x.getWorker))
 	m.HandleFunc("GET /v1/workers/connect", x.connect)
 	m.HandleFunc("/v1/debug/jobs", getOnly(x.ownerAuth(x.debugJobs)))
@@ -408,11 +408,8 @@ func validateTask(task protocol.CodingTask) error {
 	if !filepath.IsAbs(task.Repository) || len(task.Repository) > 4096 {
 		return errors.New("repository must be an absolute path")
 	}
-	if len(task.BaseSHA) != 40 {
-		return errors.New("base_sha must be a full SHA")
-	}
-	if _, err := hex.DecodeString(task.BaseSHA); err != nil {
-		return errors.New("base_sha must be hexadecimal")
+	if err := protocol.ValidateBaseSHA(task.BaseSHA); err != nil {
+		return err
 	}
 	if task.Instruction == "" || len(task.Instruction) > 65536 || len(task.Tests) == 0 || len(task.Tests) > 32 {
 		return errors.New("instruction and scoped tests are required")
@@ -443,6 +440,19 @@ func (x *server) getEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, e)
 }
+func (x *server) getAttemptEvidence(w http.ResponseWriter, r *http.Request) {
+	records, err := x.store.AttemptEvidence(r.PathValue("id"), r.PathValue("attempt_id"))
+	if err != nil {
+		status, message := http.StatusInternalServerError, "request failed"
+		if errors.Is(err, sql.ErrNoRows) {
+			status, message = http.StatusNotFound, "not found"
+		}
+		writeJSON(w, status, map[string]string{"message": message})
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, records)
+}
 func (x *server) getWorker(w http.ResponseWriter, r *http.Request) {
 	v, err := x.store.Worker(r.PathValue("id"))
 	if err != nil {
@@ -469,6 +479,7 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer c.CloseNow()
+	c.SetReadLimit(protocol.MaxWorkerMessageBytes)
 	if err = x.store.SetWorkerConnected(workerID, true); err != nil {
 		return
 	}
@@ -480,7 +491,7 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		for {
 			var m protocol.Message
-			if err := wsjson.Read(ctx, c, &m); err != nil {
+			if err := readWorkerMessage(ctx, c, &m); err != nil {
 				select {
 				case readErr <- err:
 				case <-ctx.Done():
@@ -497,6 +508,7 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 	ticker := time.NewTicker(x.options.LeasePollInterval)
 	defer ticker.Stop()
 	var active *store.Lease
+	var completed *store.Lease
 	reject := func() {
 		_ = wsjson.Write(ctx, c, protocol.Message{Type: protocol.MessageError, Error: "request failed"})
 	}
@@ -504,21 +516,43 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-readErr:
+		case err := <-readErr:
+			if websocket.CloseStatus(err) == -1 {
+				reject()
+			}
 			return
 		case m := <-incoming:
-			if active == nil || m.JobID != active.JobID || m.AttemptID != active.AttemptID {
-				reject()
-				return
-			}
-			if m.Type == protocol.MessageHeartbeat {
-				if m.WorkerID != workerID || m.Disposition != "" || m.Error != "" || x.store.Heartbeat(m.JobID, m.AttemptID, workerID, x.options.Now().UTC(), x.options.Policy) != nil {
+			if completed != nil && m.Type == protocol.MessageHeartbeat && m.JobID == completed.JobID && m.AttemptID == completed.AttemptID {
+				if m.WorkerID != workerID || m.Input != "" || m.Task != nil || m.Result != "" || m.CandidateSHA != "" || m.Disposition != "" || m.Error != "" || len(m.Evidence) != 0 {
 					reject()
 					return
 				}
 				continue
 			}
-			if m.Type != protocol.MessageResult || m.WorkerID != "" {
+			if active == nil || m.JobID != active.JobID || m.AttemptID != active.AttemptID {
+				reject()
+				return
+			}
+			if m.Type == protocol.MessageHeartbeat {
+				if m.WorkerID != workerID || m.Input != "" || m.Task != nil || m.Result != "" || m.CandidateSHA != "" || m.Disposition != "" || m.Error != "" || len(m.Evidence) != 0 || x.store.Heartbeat(m.JobID, m.AttemptID, workerID, x.options.Now().UTC(), x.options.Policy) != nil {
+					reject()
+					return
+				}
+				continue
+			}
+			if m.Type == protocol.MessageEvidence {
+				if m.WorkerID != "" || m.Input != "" || m.Task != nil || m.Result != "" || m.CandidateSHA != "" || m.Error != "" || m.Disposition != "" ||
+					len(m.Evidence) == 0 || len(m.Evidence) > protocol.MaxEvidenceRecordsPerBatch ||
+					x.store.BindEvidenceAt(m.JobID, m.AttemptID, workerID, m.Evidence, x.options.Now().UTC()) != nil {
+					reject()
+					return
+				}
+				if wsjson.Write(ctx, c, protocol.Message{Type: protocol.MessageAck, JobID: m.JobID, AttemptID: m.AttemptID}) != nil {
+					return
+				}
+				continue
+			}
+			if m.Type != protocol.MessageResult || m.WorkerID != "" || m.Input != "" || m.Task != nil || len(m.Evidence) != 0 {
 				reject()
 				return
 			}
@@ -546,7 +580,7 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 			if wsjson.Write(ctx, c, protocol.Message{Type: protocol.MessageAck, JobID: m.JobID, AttemptID: m.AttemptID}) != nil {
 				return
 			}
-			active = nil
+			completed, active = active, nil
 		case <-ticker.C:
 			if active != nil {
 				continue
@@ -565,6 +599,25 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 			active = &lease
 		}
 	}
+}
+
+func readWorkerMessage(ctx context.Context, c *websocket.Conn, message *protocol.Message) error {
+	typ, body, err := c.Read(ctx)
+	if err != nil {
+		return err
+	}
+	if typ != websocket.MessageText {
+		return errors.New("worker message must be text")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(message); err != nil {
+		return err
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return errors.New("worker message has trailing data")
+	}
+	return nil
 }
 
 func failureDisposition(code string) (store.FailureDisposition, bool) {

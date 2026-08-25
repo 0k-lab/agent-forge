@@ -157,6 +157,35 @@ CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value BLOB NOT NULL);
 		db.Close()
 		return nil, err
 	}
+	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS attempt_evidence (
+		sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+		job_id TEXT NOT NULL,
+		attempt_id TEXT NOT NULL,
+		evidence_id TEXT NOT NULL,
+		phase TEXT NOT NULL,
+		reason TEXT NOT NULL,
+		check_index INTEGER,
+		exit_code INTEGER,
+		duration_ms INTEGER NOT NULL,
+		output TEXT NOT NULL,
+		output_redacted INTEGER NOT NULL,
+		output_truncated INTEGER NOT NULL,
+		base_sha TEXT NOT NULL,
+		candidate_sha TEXT NOT NULL,
+		argv_json TEXT NOT NULL,
+		argv_redacted INTEGER NOT NULL,
+		payload_hash BLOB NOT NULL,
+		bound_at INTEGER NOT NULL,
+		UNIQUE(attempt_id,evidence_id)
+	);
+	CREATE INDEX IF NOT EXISTS attempt_evidence_attempt ON attempt_evidence(job_id,attempt_id,sequence);`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if _, err = db.Exec(`ALTER TABLE attempt_evidence ADD COLUMN output_redacted INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		db.Close()
+		return nil, err
+	}
 	migrationNow := time.Now().UTC()
 	if _, err = db.Exec(`INSERT OR IGNORE INTO attempts(id,job_id,ordinal,worker_id,status,leased_at,deadline_at,completed_at,failure_disposition,failure_code,result,candidate_sha)
 		SELECT attempt_id,id,1,worker_id,
@@ -210,6 +239,9 @@ func (s *Store) CreateJob(input string) (Job, error) {
 }
 
 func (s *Store) CreateCodingJob(task protocol.CodingTask) (Job, error) {
+	if err := protocol.ValidateBaseSHA(task.BaseSHA); err != nil {
+		return Job{}, err
+	}
 	return s.createJob("", &task)
 }
 
@@ -646,6 +678,15 @@ func (s *Store) terminal(jobID, attemptID, attemptStatus, result, candidateSHA, 
 	}
 	if attemptStatus == "succeeded" && (j.Task != nil) != (candidateSHA != "") {
 		return Job{}, errors.New("result kind does not match job kind")
+	}
+	if candidateSHA != "" {
+		var conflicts int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM attempt_evidence WHERE job_id=? AND attempt_id=? AND (candidate_sha<>'' AND candidate_sha<>? OR phase='scoped_check' AND candidate_sha<>?)`, jobID, attemptID, candidateSHA, candidateSHA).Scan(&conflicts); err != nil {
+			return Job{}, err
+		}
+		if conflicts != 0 {
+			return Job{}, errors.New("candidate SHA conflicts with evidence")
+		}
 	}
 	if j.Status == "succeeded" || j.Status == "failed" {
 		if j.Status != jobStatus || j.Result != result || j.CandidateSHA != candidateSHA || j.Error != failure {

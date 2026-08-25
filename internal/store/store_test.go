@@ -256,6 +256,22 @@ func testStore(t *testing.T) *Store {
 	return s
 }
 
+func TestCreateCodingJobValidatesBaseSHA(t *testing.T) {
+	s := testStore(t)
+	task := protocol.CodingTask{Repository: "/repo", BaseSHA: strings.Repeat("A", 40), Instruction: "edit", Tests: [][]string{{"true"}}}
+	if _, err := s.CreateCodingJob(task); err == nil {
+		t.Fatal("CreateCodingJob accepted uppercase base_sha")
+	}
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM jobs`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("rejected job count = %d, err=%v", count, err)
+	}
+	task.BaseSHA = strings.Repeat("a", 40)
+	if _, err := s.CreateCodingJob(task); err != nil {
+		t.Fatalf("CreateCodingJob rejected lowercase base_sha: %v", err)
+	}
+}
+
 func TestResultIsBoundToLeaseAttemptAndIdempotent(t *testing.T) {
 	s := testStore(t)
 	job, err := s.CreateJob("hello")
@@ -341,7 +357,7 @@ func TestWorkerLivenessTracksConnectionState(t *testing.T) {
 
 func TestCandidateResultIsExactAndImmutable(t *testing.T) {
 	s := testStore(t)
-	job, err := s.CreateCodingJob(protocol.CodingTask{Instruction: "coding task"})
+	job, err := s.CreateCodingJob(protocol.CodingTask{BaseSHA: strings.Repeat("a", 40), Instruction: "coding task"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,6 +392,7 @@ func TestCandidateResultIsExactAndImmutable(t *testing.T) {
 func TestCodingTaskCommitAuthorRoundTripsThroughJobAndLease(t *testing.T) {
 	s := testStore(t)
 	task := protocol.CodingTask{
+		BaseSHA:           strings.Repeat("a", 40),
 		Instruction:       "coding task",
 		CommitAuthorName:  "kricha",
 		CommitAuthorEmail: "4619899+kricha@users.noreply.github.com",
@@ -401,7 +418,7 @@ func TestCodingTaskCommitAuthorRoundTripsThroughJobAndLease(t *testing.T) {
 
 func TestCodingJobRejectsLegacyTextCompletion(t *testing.T) {
 	s := testStore(t)
-	job, err := s.CreateCodingJob(protocol.CodingTask{Instruction: "coding task"})
+	job, err := s.CreateCodingJob(protocol.CodingTask{BaseSHA: strings.Repeat("a", 40), Instruction: "coding task"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -449,7 +466,7 @@ func TestFailureEventNamesFailureCode(t *testing.T) {
 	if got := events[len(events)-1].Detail; got != "failure_code=scoped_test_failed" {
 		t.Fatalf("terminal failure event detail = %q", got)
 	}
-	coding, err := s.CreateCodingJob(protocol.CodingTask{Instruction: "coding task"})
+	coding, err := s.CreateCodingJob(protocol.CodingTask{BaseSHA: strings.Repeat("a", 40), Instruction: "coding task"})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -33,6 +34,29 @@ type pluginResponse struct {
 	Error   string `json:"error,omitempty"`
 }
 
+type pluginFailure struct{ reason string }
+
+func (e pluginFailure) Error() string { return "plugin failed" }
+
+type codingOutcome struct {
+	candidateSHA string
+	err          error
+	evidence     []protocol.AttemptEvidence
+	cleanup      func() *protocol.AttemptEvidence
+}
+
+type scopedCheckResult struct {
+	output    string
+	redacted  bool
+	truncated bool
+	exitCode  *int
+	duration  time.Duration
+	timedOut  bool
+	err       error
+}
+
+type scopedCheckRunner func(context.Context, string, []string, []string) scopedCheckResult
+
 var (
 	errInvalidTask = errors.New("invalid task")
 	errScopedTest  = errors.New("scoped test failed")
@@ -59,6 +83,16 @@ func invalidTask(err error) error { return invalidTaskError{err} }
 
 type leaseExecutor func(context.Context, protocol.Message) (string, string, error)
 
+type leaseOutcome struct {
+	result       string
+	candidateSHA string
+	err          error
+	evidence     []protocol.AttemptEvidence
+	cleanup      func() *protocol.AttemptEvidence
+}
+
+type outcomeExecutor func(context.Context, protocol.Message) leaseOutcome
+
 func Run(ctx context.Context, gateURL, workerID, token, pluginPath string, repositoryRoots []string) error {
 	return RunWithOptions(ctx, gateURL, workerID, token, pluginPath, repositoryRoots, DefaultWorkerOptions())
 }
@@ -71,17 +105,24 @@ func RunWithOptions(ctx context.Context, gateURL, workerID, token, pluginPath st
 	if err != nil {
 		return err
 	}
-	return runWithExecutor(ctx, gateURL, workerID, token, options, func(ctx context.Context, m protocol.Message) (string, string, error) {
+	return runWithOutcomeExecutor(ctx, gateURL, workerID, token, options, func(ctx context.Context, m protocol.Message) leaseOutcome {
 		if m.Task == nil {
 			result, err := invoke(ctx, pluginPath, pluginRequest{Version: "v1", Input: m.Input})
-			return result, "", err
+			return leaseOutcome{result: result, err: err}
 		}
-		candidate, err := executeCodingTask(ctx, pluginPath, roots, m.JobID, m.AttemptID, *m.Task)
-		return "", candidate, err
+		outcome := executeCodingOutcome(ctx, pluginPath, roots, m.JobID, m.AttemptID, *m.Task)
+		return leaseOutcome{candidateSHA: outcome.candidateSHA, err: outcome.err, evidence: outcome.evidence, cleanup: outcome.cleanup}
 	})
 }
 
 func runWithExecutor(ctx context.Context, gateURL, workerID, token string, options WorkerOptions, execute leaseExecutor) error {
+	return runWithOutcomeExecutor(ctx, gateURL, workerID, token, options, func(ctx context.Context, m protocol.Message) leaseOutcome {
+		result, candidateSHA, err := execute(ctx, m)
+		return leaseOutcome{result: result, candidateSHA: candidateSHA, err: err}
+	})
+}
+
+func runWithOutcomeExecutor(ctx context.Context, gateURL, workerID, token string, options WorkerOptions, execute outcomeExecutor) error {
 	if err := options.Validate(); err != nil {
 		return err
 	}
@@ -91,14 +132,15 @@ func runWithExecutor(ctx context.Context, gateURL, workerID, token string, optio
 		return err
 	}
 	defer c.Close(websocket.StatusNormalClosure, "worker stopping")
+	c.SetReadLimit(protocol.MaxWorkerMessageBytes)
 	var writeMu sync.Mutex
 	for {
 		var m protocol.Message
-		if err := wsjson.Read(ctx, c, &m); err != nil {
+		if err := readGateMessage(ctx, c, &m); err != nil {
 			return err
 		}
 		if m.Type != protocol.MessageLease {
-			continue
+			return errors.New("unexpected Gate message")
 		}
 		taskCtx, cancelTask := context.WithCancel(ctx)
 		stopHeartbeat := make(chan struct{})
@@ -124,31 +166,89 @@ func runWithExecutor(ctx context.Context, gateURL, workerID, token string, optio
 				}
 			}
 		}()
-		result, candidateSHA, executeErr := execute(taskCtx, m)
-		close(stopHeartbeat)
-		<-heartbeatDone
-		select {
-		case err := <-heartbeatErr:
-			cancelTask()
-			return err
-		default:
-		}
-		cancelTask()
-		failure, disposition := classifyFailure(executeErr)
-		writeMu.Lock()
-		err = wsjson.Write(ctx, c, protocol.Message{Type: protocol.MessageResult, JobID: m.JobID, AttemptID: m.AttemptID, Result: result, CandidateSHA: candidateSHA, Error: failure, Disposition: disposition})
-		writeMu.Unlock()
+		outcome := execute(taskCtx, m)
+		failed := true
+		func() {
+			defer func() {
+				if failed && outcome.cleanup != nil {
+					_ = outcome.cleanup()
+				}
+				close(stopHeartbeat)
+				<-heartbeatDone
+				cancelTask()
+			}()
+			send := func(message protocol.Message) error {
+				writeMu.Lock()
+				err := wsjson.Write(taskCtx, c, message)
+				writeMu.Unlock()
+				return err
+			}
+			readACK := func() error {
+				var ack protocol.Message
+				if err := readGateMessage(taskCtx, c, &ack); err != nil {
+					return err
+				}
+				if ack.Type != protocol.MessageAck || ack.JobID != m.JobID || ack.AttemptID != m.AttemptID || ack.WorkerID != "" || ack.Input != "" || ack.Task != nil || ack.Result != "" || ack.CandidateSHA != "" || ack.Error != "" || ack.Disposition != "" || len(ack.Evidence) != 0 {
+					return errors.New("invalid Gate ACK")
+				}
+				return nil
+			}
+			bind := func(records []protocol.AttemptEvidence) error {
+				if len(records) == 0 {
+					return nil
+				}
+				if err := send(protocol.Message{Type: protocol.MessageEvidence, JobID: m.JobID, AttemptID: m.AttemptID, Evidence: records}); err != nil {
+					return err
+				}
+				return readACK()
+			}
+			if err = bind(outcome.evidence); err != nil {
+				return
+			}
+			if outcome.cleanup != nil {
+				if cleanupEvidence := outcome.cleanup(); cleanupEvidence != nil {
+					if err = bind([]protocol.AttemptEvidence{*cleanupEvidence}); err != nil {
+						return
+					}
+				}
+			}
+			failure, disposition := classifyFailure(outcome.err)
+			if err = send(protocol.Message{Type: protocol.MessageResult, JobID: m.JobID, AttemptID: m.AttemptID, Result: outcome.result, CandidateSHA: outcome.candidateSHA, Error: failure, Disposition: disposition}); err != nil {
+				return
+			}
+			if err = readACK(); err != nil {
+				return
+			}
+			failed = false
+		}()
 		if err != nil {
 			return err
 		}
-		var ack protocol.Message
-		if err := wsjson.Read(ctx, c, &ack); err != nil {
-			return err
-		}
-		if ack.Type != protocol.MessageAck {
-			return fmt.Errorf("gate rejected result: %s", ack.Error)
+		select {
+		case heartbeatErr := <-heartbeatErr:
+			return heartbeatErr
+		default:
 		}
 	}
+}
+
+func readGateMessage(ctx context.Context, c *websocket.Conn, message *protocol.Message) error {
+	typ, body, err := c.Read(ctx)
+	if err != nil {
+		return err
+	}
+	if typ != websocket.MessageText {
+		return errors.New("Gate message must be text")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(message); err != nil {
+		return err
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return errors.New("Gate message has trailing data")
+	}
+	return nil
 }
 
 func classifyFailure(err error) (code, disposition string) {
@@ -177,44 +277,72 @@ func invoke(parent context.Context, path string, request pluginRequest) (string,
 	cmd.Stdout = &limitedWriter{w: &out, n: 1 << 20}
 	cmd.Stderr = &limitedWriter{w: io.Discard, n: 1 << 20}
 	if err := cmd.Run(); err != nil {
-		return "", err
+		var startErr *exec.Error
+		var pathErr *os.PathError
+		if errors.As(err, &startErr) || errors.As(err, &pathErr) {
+			return "", pluginFailure{protocol.EvidenceReasonPluginStartFailed}
+		}
+		return "", pluginFailure{protocol.EvidenceReasonPluginProtocolFailed}
 	}
 	var response pluginResponse
 	if err := json.Unmarshal(out.Bytes(), &response); err != nil {
-		return "", err
+		return "", pluginFailure{protocol.EvidenceReasonPluginProtocolFailed}
 	}
 	if response.Version != "v1" {
-		return "", fmt.Errorf("unsupported plugin response version %q", response.Version)
+		return "", pluginFailure{protocol.EvidenceReasonPluginProtocolFailed}
 	}
 	if response.Error != "" {
-		return "", errors.New(response.Error)
+		return "", pluginFailure{protocol.EvidenceReasonPluginReportedFailure}
 	}
 	return response.Result, nil
 }
 
 func executeCodingTask(ctx context.Context, pluginPath string, roots []string, jobID, attemptID string, task protocol.CodingTask) (sha string, err error) {
+	outcome := executeCodingOutcome(ctx, pluginPath, roots, jobID, attemptID, task)
+	if outcome.cleanup != nil {
+		_ = outcome.cleanup()
+	}
+	return outcome.candidateSHA, outcome.err
+}
+
+func executeCodingOutcome(ctx context.Context, pluginPath string, roots []string, jobID, attemptID string, task protocol.CodingTask) codingOutcome {
+	return executeCodingOutcomeWithRunner(ctx, pluginPath, roots, jobID, attemptID, task, runScopedCheck)
+}
+
+func executeCodingOutcomeWithRunner(ctx context.Context, pluginPath string, roots []string, jobID, attemptID string, task protocol.CodingTask, runCheck scopedCheckRunner) codingOutcome {
+	noCleanup := func() *protocol.AttemptEvidence { return nil }
+	fail := func(phase, reason string, err error) codingOutcome {
+		return codingOutcome{err: err, evidence: []protocol.AttemptEvidence{newEvidence(task.BaseSHA, phase, reason)}, cleanup: noCleanup}
+	}
 	if err := protocol.ValidateCommitAuthor(task.CommitAuthorName, task.CommitAuthorEmail); err != nil {
-		return "", invalidTask(err)
+		return fail(protocol.EvidencePhasePreparation, protocol.EvidenceReasonInvalidTask, invalidTask(err))
+	}
+	if len(task.Tests) == 0 || len(task.Tests) > 32 || !fixedLowerHex(task.BaseSHA, 40) {
+		return fail(protocol.EvidencePhasePreparation, protocol.EvidenceReasonInvalidTask, invalidTask(errors.New("invalid coding task")))
+	}
+	for _, argv := range task.Tests {
+		if len(argv) == 0 || len(argv) > 64 {
+			return fail(protocol.EvidencePhasePreparation, protocol.EvidenceReasonInvalidTask, invalidTask(errors.New("invalid coding task")))
+		}
 	}
 	repository, err := allowedRepository(task.Repository, roots)
 	if err != nil {
-		return "", invalidTask(err)
+		return fail(protocol.EvidencePhasePreparation, protocol.EvidenceReasonInvalidRepository, invalidTask(err))
 	}
 	ref, err := candidateRef(jobID, attemptID)
 	if err != nil {
-		return "", invalidTask(err)
-	}
-	if len(task.Tests) == 0 {
-		return "", invalidTask(errors.New("scoped tests required"))
+		return fail(protocol.EvidencePhasePreparation, protocol.EvidenceReasonInvalidTask, invalidTask(err))
 	}
 	runtimeDir, err := os.MkdirTemp("", "forge-runtime-")
 	if err != nil {
-		return "", err
+		return fail(protocol.EvidencePhasePreparation, protocol.EvidenceReasonRuntimeSetupFailed, err)
 	}
-	defer os.RemoveAll(runtimeDir)
+	cleanup := cleanupCallback(repository, "", runtimeDir, task.BaseSHA, func() string { return "" })
 	for _, name := range []string{"home", "tmp", "cache"} {
 		if err := os.Mkdir(filepath.Join(runtimeDir, name), 0o700); err != nil {
-			return "", err
+			out := fail(protocol.EvidencePhasePreparation, protocol.EvidenceReasonRuntimeSetupFailed, err)
+			out.cleanup = cleanup
+			return out
 		}
 	}
 	testEnv := []string{
@@ -225,45 +353,71 @@ func executeCodingTask(ctx context.Context, pluginPath string, roots []string, j
 	}
 	worktree, err := os.MkdirTemp("", "forge-worktree-")
 	if err != nil {
-		return "", err
+		out := fail(protocol.EvidencePhasePreparation, protocol.EvidenceReasonWorktreeSetupFailed, err)
+		out.cleanup = cleanup
+		return out
 	}
+	candidate := ""
+	cleanup = cleanupCallback(repository, worktree, runtimeDir, task.BaseSHA, func() string { return candidate })
 	if err := os.Remove(worktree); err != nil {
-		return "", err
+		return codingOutcome{err: err, evidence: []protocol.AttemptEvidence{newEvidence(task.BaseSHA, protocol.EvidencePhasePreparation, protocol.EvidenceReasonWorktreeSetupFailed)}, cleanup: cleanup}
 	}
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = gitCommand(cleanupCtx, repository, "worktree", "remove", "--force", worktree)
-		_ = os.RemoveAll(worktree)
-	}()
 	if err := gitCommand(ctx, repository, "worktree", "add", "--detach", worktree, task.BaseSHA); err != nil {
-		return "", err
+		return codingOutcome{err: err, evidence: []protocol.AttemptEvidence{newEvidence(task.BaseSHA, protocol.EvidencePhasePreparation, protocol.EvidenceReasonWorktreeSetupFailed)}, cleanup: cleanup}
 	}
 	base, err := gitOutput(ctx, worktree, "rev-parse", "HEAD")
 	if err != nil || base != task.BaseSHA {
-		return "", fmt.Errorf("worktree base mismatch")
+		return codingOutcome{err: errors.New("worktree base mismatch"), evidence: []protocol.AttemptEvidence{newEvidence(task.BaseSHA, protocol.EvidencePhasePreparation, protocol.EvidenceReasonWorktreeSetupFailed)}, cleanup: cleanup}
 	}
+	pluginStarted := time.Now()
 	if _, err := invoke(ctx, pluginPath, pluginRequest{Version: "v1", Workspace: worktree, Instruction: task.Instruction}); err != nil {
-		return "", err
+		reason := protocol.EvidenceReasonPluginProtocolFailed
+		var failure pluginFailure
+		if errors.As(err, &failure) {
+			reason = failure.reason
+		}
+		record := newEvidence(task.BaseSHA, protocol.EvidencePhasePlugin, reason)
+		record.DurationMS = boundedDurationMS(time.Since(pluginStarted), 15*time.Minute)
+		return codingOutcome{err: err, evidence: []protocol.AttemptEvidence{record}, cleanup: cleanup}
 	}
-	for _, argv := range task.Tests {
-		if len(argv) == 0 {
-			return "", invalidTask(errors.New("empty test command"))
+	head, headErr := gitOutput(ctx, worktree, "rev-parse", "HEAD")
+	if headErr != nil || head != task.BaseSHA {
+		return codingOutcome{err: errors.New("invalid workspace"), evidence: []protocol.AttemptEvidence{newEvidence(task.BaseSHA, protocol.EvidencePhaseWorkspaceValidation, protocol.EvidenceReasonInvalidWorkspaceChange)}, cleanup: cleanup}
+	}
+	changes, statusErr := gitOutput(ctx, worktree, "status", "--porcelain")
+	if statusErr != nil {
+		return codingOutcome{err: statusErr, evidence: []protocol.AttemptEvidence{newEvidence(task.BaseSHA, protocol.EvidencePhaseWorkspaceValidation, protocol.EvidenceReasonInvalidWorkspaceChange)}, cleanup: cleanup}
+	}
+	if changes == "" {
+		return codingOutcome{err: errors.New("no changes"), evidence: []protocol.AttemptEvidence{newEvidence(task.BaseSHA, protocol.EvidencePhaseWorkspaceValidation, protocol.EvidenceReasonNoChanges)}, cleanup: cleanup}
+	}
+	var evidence []protocol.AttemptEvidence
+	candidateFailure := func() protocol.AttemptEvidence {
+		record := newEvidence(task.BaseSHA, protocol.EvidencePhaseCandidateCommit, protocol.EvidenceReasonCandidateCommitFailed)
+		record.CandidateSHA = candidate
+		return record
+	}
+	for index, argv := range task.Tests {
+		result := runCheck(ctx, worktree, testEnv, argv)
+		record := newEvidence(task.BaseSHA, protocol.EvidencePhaseScopedCheck, protocol.EvidenceReasonScopedCheckPassed)
+		record.CheckIndex = &index
+		record.DurationMS = boundedDurationMS(result.duration, 10*time.Minute)
+		record.Output = result.output
+		record.OutputRedacted = result.redacted
+		record.OutputTruncated = result.truncated
+		record.ExitCode = result.exitCode
+		if result.err != nil {
+			record.Reason = protocol.EvidenceReasonScopedCheckFailed
+			if result.timedOut {
+				record.Reason = protocol.EvidenceReasonScopedCheckTimeout
+			}
+			evidence = append(evidence, record)
+			return codingOutcome{err: errScopedTest, evidence: evidence, cleanup: cleanup}
 		}
-		commandCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-		cmd := exec.CommandContext(commandCtx, argv[0], argv[1:]...)
-		cmd.Dir = worktree
-		cmd.Env = testEnv
-		cmd.Stdout = &limitedWriter{w: io.Discard, n: 1 << 20}
-		cmd.Stderr = &limitedWriter{w: io.Discard, n: 1 << 20}
-		err := cmd.Run()
-		cancel()
-		if err != nil {
-			return "", errScopedTest
-		}
+		evidence = append(evidence, record)
 	}
 	if err := gitCommand(ctx, worktree, "add", "-A"); err != nil {
-		return "", err
+		return codingOutcome{err: err, evidence: append(evidence, candidateFailure()), cleanup: cleanup}
 	}
 	authorName, authorEmail := task.CommitAuthorName, task.CommitAuthorEmail
 	if authorName == "" && authorEmail == "" {
@@ -276,31 +430,135 @@ func executeCodingTask(ctx context.Context, pluginPath string, roots []string, j
 		"GIT_COMMITTER_EMAIL=forge@example.invalid",
 	}
 	if err := gitCommandEnv(ctx, worktree, identityEnv, "commit", "-m", "chore: apply coding task"); err != nil {
-		return "", err
+		return codingOutcome{err: err, evidence: append(evidence, candidateFailure()), cleanup: cleanup}
 	}
-	sha, err = gitOutput(ctx, worktree, "rev-parse", "HEAD")
+	sha, err := gitOutput(ctx, worktree, "rev-parse", "HEAD")
 	if err != nil {
-		return "", err
+		return codingOutcome{err: err, evidence: append(evidence, candidateFailure()), cleanup: cleanup}
 	}
+	candidate = sha
 	parent, err := gitOutput(ctx, worktree, "rev-parse", sha+"^")
 	if err != nil || parent != task.BaseSHA {
-		return "", fmt.Errorf("candidate parent mismatch")
+		return codingOutcome{err: errors.New("candidate parent mismatch"), evidence: append(evidence, candidateFailure()), cleanup: cleanup}
 	}
 	if err := gitCommand(ctx, repository, "cat-file", "-e", sha+"^{commit}"); err != nil {
-		return "", fmt.Errorf("candidate object missing")
+		return codingOutcome{err: errors.New("candidate object missing"), evidence: append(evidence, candidateFailure()), cleanup: cleanup}
 	}
 	if err := gitCommand(ctx, repository, "update-ref", ref, sha, ""); err != nil {
-		return "", fmt.Errorf("candidate ref conflict")
+		return codingOutcome{err: errors.New("candidate ref conflict"), evidence: append(evidence, candidateFailure()), cleanup: cleanup}
 	}
 	retained, err := gitOutput(ctx, repository, "rev-parse", "--verify", ref+"^{commit}")
 	if err != nil || retained != sha {
-		return "", fmt.Errorf("candidate ref mismatch")
+		return codingOutcome{err: errors.New("candidate ref mismatch"), evidence: append(evidence, candidateFailure()), cleanup: cleanup}
 	}
 	parent, err = gitOutput(ctx, repository, "rev-parse", retained+"^")
 	if err != nil || parent != task.BaseSHA {
-		return "", fmt.Errorf("retained candidate parent mismatch")
+		return codingOutcome{err: errors.New("retained candidate parent mismatch"), evidence: append(evidence, candidateFailure()), cleanup: cleanup}
 	}
-	return sha, nil
+	for i := range evidence {
+		evidence[i].CandidateSHA = sha
+	}
+	return codingOutcome{candidateSHA: sha, evidence: evidence, cleanup: cleanup}
+}
+
+func boundedDurationMS(duration, limit time.Duration) int64 {
+	return max(time.Duration(0), min(duration, limit)).Milliseconds()
+}
+
+func fixedLowerHex(value string, size int) bool {
+	if len(value) != size {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && hex.EncodeToString(decoded) == value
+}
+
+func runScopedCheck(parent context.Context, worktree string, env, argv []string) scopedCheckResult {
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(parent, 10*time.Minute)
+	defer cancel()
+	capture := &boundedCapture{limit: protocol.MaxEvidenceOutputBytes}
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Dir = worktree
+	cmd.Env = env
+	cmd.Stdout = capture
+	cmd.Stderr = capture
+	err := cmd.Run()
+	output, redacted, truncated := capture.safeOutput()
+	result := scopedCheckResult{output: output, redacted: redacted, truncated: truncated, duration: time.Since(started), timedOut: errors.Is(ctx.Err(), context.DeadlineExceeded), err: err}
+	if cmd.ProcessState != nil {
+		if exitCode := cmd.ProcessState.ExitCode(); exitCode >= 0 && exitCode <= 255 {
+			result.exitCode = &exitCode
+		}
+	}
+	return result
+}
+
+type boundedCapture struct {
+	mu        sync.Mutex
+	buf       []byte
+	limit     int
+	truncated bool
+}
+
+func (c *boundedCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	remaining := c.limit - len(c.buf)
+	if remaining < len(p) {
+		c.truncated = true
+	}
+	if remaining > 0 {
+		c.buf = append(c.buf, p[:min(remaining, len(p))]...)
+	}
+	return len(p), nil
+}
+
+func (c *boundedCapture) safeOutput() (string, bool, bool) {
+	c.mu.Lock()
+	nonempty, truncated := len(c.buf) != 0, c.truncated
+	c.mu.Unlock()
+	if !nonempty {
+		return "", false, truncated
+	}
+	return protocol.EvidenceRedactedMarker, true, truncated
+}
+
+func newEvidence(baseSHA, phase, reason string) protocol.AttemptEvidence {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		panic("crypto/rand failed: " + err.Error())
+	}
+	return protocol.AttemptEvidence{EvidenceID: hex.EncodeToString(id[:]), Phase: phase, Reason: reason, BaseSHA: baseSHA}
+}
+
+func cleanupCallback(repository, worktree, runtimeDir, baseSHA string, candidate func() string) func() *protocol.AttemptEvidence {
+	var once sync.Once
+	var record *protocol.AttemptEvidence
+	return func() *protocol.AttemptEvidence {
+		once.Do(func() {
+			started := time.Now()
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			var err error
+			if worktree != "" {
+				err = gitCommand(cleanupCtx, repository, "worktree", "remove", "--force", worktree)
+				if removeErr := os.RemoveAll(worktree); err == nil {
+					err = removeErr
+				}
+			}
+			if removeErr := os.RemoveAll(runtimeDir); err == nil {
+				err = removeErr
+			}
+			if err != nil {
+				value := newEvidence(baseSHA, protocol.EvidencePhaseCleanup, protocol.EvidenceReasonCleanupFailed)
+				value.CandidateSHA = candidate()
+				value.DurationMS = boundedDurationMS(time.Since(started), 10*time.Second)
+				record = &value
+			}
+		})
+		return record
+	}
 }
 
 func canonicalRepositoryRoots(roots []string) ([]string, error) {
