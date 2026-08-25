@@ -1,10 +1,15 @@
 package gate
 
 import (
+	"crypto/sha256"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"agent-forge/internal/configjson"
 )
 
 const validGateConfig = `{
@@ -30,8 +35,25 @@ func TestParseConfigStrictAndResolvesSecrets(t *testing.T) {
 	if c.Version != 1 || c.RecoveryInterval != time.Second || len(c.Workers) != 1 || len(c.Repositories) != 1 {
 		t.Fatalf("config = %#v", c)
 	}
-	if c.ownerToken != "owner-secret" || len(c.workerTokens) != 1 || c.workerTokens[0].registration.ID != "worker-1" {
+	if c.ownerDigest != sha256.Sum256([]byte("owner-secret")) || len(c.workerTokens) != 1 || c.workerTokens[0].registration.ID != "worker-1" {
 		t.Fatal("environment secrets were not resolved")
+	}
+}
+
+func TestLoadConfigRejectsOversizedFileWithoutLeakingValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "private-config-path")
+	private := "private-config-content"
+	if err := os.WriteFile(path, []byte(strings.Repeat(private, configjson.MaxBytes/len(private)+2)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("accepted oversized config")
+	}
+	for _, secret := range []string{path, private} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("error leaked config data: %q", err)
+		}
 	}
 }
 

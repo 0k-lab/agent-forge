@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"agent-forge/internal/configjson"
 )
 
 func validWorkerConfig(t *testing.T) string {
@@ -25,6 +27,23 @@ func validWorkerConfig(t *testing.T) string {
 		`"repository_roots":[` + quote(repositoryRoot) + `],"worktree_root":` + quote(worktrees) + `,"runtime_root":` + quote(runtime) + `,` +
 		`"repositories":[{"id":"agent-forge","path":` + quote(repository) + `}],"plugins":[{"id":"codex","argv":["/bin/echo","ok"]}],` +
 		`"environment_allowlist":["PATH","CODEX_HOME"],"ceilings":{"plugin_timeout":"20m","check_timeout":"10m","git_timeout":"2m","cleanup_timeout":"20s","plugin_output_bytes":1048576,"check_output_bytes":2048,"git_output_bytes":1048576}}`
+}
+
+func TestLoadConfigRejectsOversizedFileWithoutLeakingValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "private-config-path")
+	private := "private-config-content"
+	if err := os.WriteFile(path, []byte(strings.Repeat(private, configjson.MaxBytes/len(private)+2)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatal("accepted oversized config")
+	}
+	for _, secret := range []string{path, private} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("error leaked config data: %q", err)
+		}
+	}
 }
 
 func quote(value string) string { return `"` + strings.ReplaceAll(value, `\`, `\\`) + `"` }

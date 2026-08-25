@@ -1,6 +1,7 @@
 package gate
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"net/http"
 
@@ -19,8 +20,10 @@ func NewHandlerWithOptions(s *store.Store, tokens map[string]string, ownerToken 
 }
 
 func newHandlerForTest(s *store.Store, tokens map[string]string, ownerToken string, options Options) http.Handler {
+	ownerDigest := sha256.Sum256([]byte(ownerToken))
 	for workerToken := range tokens {
-		if subtle.ConstantTimeCompare([]byte(ownerToken), []byte(workerToken)) == 1 {
+		workerDigest := sha256.Sum256([]byte(workerToken))
+		if subtle.ConstantTimeCompare(ownerDigest[:], workerDigest[:]) == 1 {
 			ownerToken = ""
 		}
 	}

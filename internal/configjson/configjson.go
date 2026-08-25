@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 )
 
 const MaxBytes = 1 << 20
@@ -12,7 +13,28 @@ const MaxBytes = 1 << 20
 var (
 	ErrSyntax    = errors.New("invalid config: syntax")
 	ErrDuplicate = errors.New("invalid config: duplicate field")
+	ErrRead      = errors.New("invalid config: read")
 )
+
+func ReadFile(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, ErrRead
+	}
+	defer file.Close()
+	return read(file)
+}
+
+func read(reader io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(reader, MaxBytes+1))
+	if err != nil {
+		return nil, ErrRead
+	}
+	if len(data) == 0 || len(data) > MaxBytes {
+		return nil, ErrSyntax
+	}
+	return data, nil
+}
 
 func Decode(data []byte, value any) error {
 	if len(data) == 0 || len(data) > MaxBytes {

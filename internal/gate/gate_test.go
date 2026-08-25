@@ -1176,6 +1176,27 @@ func TestOwnerHTTPAPIRequiresDistinctBearerToken(t *testing.T) {
 	}
 }
 
+func TestOwnerAuthHashesEveryPresentedToken(t *testing.T) {
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	x := newServer(s, nil, "owner-secret", DefaultOptions())
+	if x.ownerDigest != sha256.Sum256([]byte("owner-secret")) {
+		t.Fatal("server did not store the owner token as a SHA-256 digest")
+	}
+	for _, token := range []string{"x", strings.Repeat("x", 4096), "wrong-secret"} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewBufferString(`{"input":"hello"}`))
+		req.Header.Set("Authorization", "Bearer "+token)
+		res := httptest.NewRecorder()
+		x.routes().ServeHTTP(res, req)
+		if res.Code != http.StatusUnauthorized {
+			t.Fatalf("token length %d status = %d, want 401", len(token), res.Code)
+		}
+	}
+}
+
 func TestOwnerHTTPRoutesFailClosedWithoutConfiguredToken(t *testing.T) {
 	for _, ownerToken := range []string{"", "worker-secret"} {
 		s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))

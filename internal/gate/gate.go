@@ -29,14 +29,15 @@ import (
 )
 
 type server struct {
-	store    *store.Store
-	tokens   map[string]string
-	owner    string
-	cursor   debugCursorCodec
-	options  Options
-	config   *Config
-	mu       sync.Mutex
-	sessions map[string]workerSession
+	store           *store.Store
+	tokens          map[string]string
+	ownerDigest     [sha256.Size]byte
+	ownerConfigured bool
+	cursor          debugCursorCodec
+	options         Options
+	config          *Config
+	mu              sync.Mutex
+	sessions        map[string]workerSession
 }
 
 type workerSession struct {
@@ -232,13 +233,19 @@ func NewConfiguredHandler(s *store.Store, config Config, options Options) (http.
 	if err := s.MarkWorkersDisconnected(options.Now().UTC()); err != nil {
 		return nil, errors.New("worker startup state failed")
 	}
-	x := newServer(s, nil, config.ownerToken, options)
+	cursorKey := s.DebugCursorKey(config.ownerToken)
+	config.ownerToken = ""
+	x := newServerWithOwner(s, nil, config.ownerDigest, true, cursorKey, options)
 	x.config = &config
 	return x.routes(), nil
 }
 
 func newServer(s *store.Store, tokens map[string]string, ownerToken string, options Options) *server {
-	return &server{store: s, tokens: tokens, owner: ownerToken, cursor: newDebugCursorCodec(s.DebugCursorKey(ownerToken)), options: options, sessions: map[string]workerSession{}}
+	return newServerWithOwner(s, tokens, sha256.Sum256([]byte(ownerToken)), ownerToken != "", s.DebugCursorKey(ownerToken), options)
+}
+
+func newServerWithOwner(s *store.Store, tokens map[string]string, ownerDigest [sha256.Size]byte, ownerConfigured bool, cursorKey [sha256.Size]byte, options Options) *server {
+	return &server{store: s, tokens: tokens, ownerDigest: ownerDigest, ownerConfigured: ownerConfigured, cursor: newDebugCursorCodec(cursorKey), options: options, sessions: map[string]workerSession{}}
 }
 
 func (x *server) routes() http.Handler {
@@ -272,8 +279,8 @@ func getOnly(next http.HandlerFunc) http.HandlerFunc {
 
 func (x *server) ownerAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token := bearerToken(r)
-		if x.owner == "" || token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(x.owner)) != 1 {
+		digest := sha256.Sum256([]byte(bearerToken(r)))
+		if subtle.ConstantTimeCompare(digest[:], x.ownerDigest[:]) != 1 || !x.ownerConfigured {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}

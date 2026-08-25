@@ -84,9 +84,9 @@ type rawWorkerConfig struct {
 }
 
 func LoadConfig(path string) (Config, error) {
-	data, err := os.ReadFile(path)
+	data, err := configjson.ReadFile(path)
 	if err != nil {
-		return Config{}, errors.New("invalid config: read")
+		return Config{}, err
 	}
 	return ParseConfig(data, os.Getenv)
 }

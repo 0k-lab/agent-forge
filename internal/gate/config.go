@@ -66,6 +66,7 @@ type Config struct {
 	Workers           []WorkerRegistration
 	Repositories      []RepositoryRegistration
 	ownerToken        string
+	ownerDigest       [sha256.Size]byte
 	workerTokens      []workerCredential
 }
 
@@ -114,9 +115,9 @@ type rawGateConfig struct {
 }
 
 func LoadConfig(path string) (Config, error) {
-	data, err := os.ReadFile(path)
+	data, err := configjson.ReadFile(path)
 	if err != nil {
-		return Config{}, errors.New("invalid config: read")
+		return Config{}, err
 	}
 	return ParseConfig(data, os.Getenv)
 }
@@ -150,6 +151,7 @@ func ParseConfig(data []byte, getenv func(string) string) (Config, error) {
 	if c.ownerToken == "" {
 		return Config{}, errConfig
 	}
+	c.ownerDigest = sha256.Sum256([]byte(c.ownerToken))
 	pools, workerIDs, tokenSources := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	totalSlots := 0
 	for _, worker := range c.Workers {
@@ -160,8 +162,7 @@ func ParseConfig(data []byte, getenv func(string) string) (Config, error) {
 		totalSlots += worker.Concurrency
 		token := getenv(worker.TokenEnv)
 		digest := sha256.Sum256([]byte(token))
-		ownerDigest := sha256.Sum256([]byte(c.ownerToken))
-		if token == "" || subtle.ConstantTimeCompare(digest[:], ownerDigest[:]) == 1 {
+		if token == "" || subtle.ConstantTimeCompare(digest[:], c.ownerDigest[:]) == 1 {
 			return Config{}, errConfig
 		}
 		for _, credential := range c.workerTokens {
