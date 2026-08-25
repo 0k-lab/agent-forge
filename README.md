@@ -57,6 +57,21 @@ curl -sS -H 'Authorization: Bearer fake-owner-token' "http://127.0.0.1:18080/v1/
 curl -sS -H 'Authorization: Bearer fake-owner-token' "http://127.0.0.1:18080/v1/workers/worker-1"
 ```
 
+## Attempt evidence
+
+Coding Workers bind bounded evidence to the exact current `(job, attempt, authenticated Worker)` before deleting the ephemeral worktree. Gate ACKs each durable evidence batch without clearing the lease; Worker keeps heartbeating, performs idempotent cleanup, binds any cleanup-failure record in a second ACKed batch, then sends the terminal result. A disconnect defers best-effort cleanup but does not claim evidence durability. Older Workers that send only a result remain compatible.
+
+Evidence uses closed preparation, plugin, workspace-validation, scoped-check, candidate-commit, and cleanup phase/reason values. Scoped checks include the authoritative task check index, exit status when valid, duration, and argument count/order represented only by one fixed `[REDACTED]` placeholder per task argument. Any non-empty Worker output becomes exactly `[REDACTED]`; empty output remains empty, while `output_redacted` and bounded-capture `output_truncated` report what happened. Store rejects every other non-empty output, so the API and canonical payload hash contain only the fixed marker and structured safe fields. A batch and an attempt allow at most 34 records, with 96 KiB per batch and 64 KiB total stored output per attempt. Empty batches, unknown fields, mixed-purpose messages, oversized payloads, conflicting replays, expired leases, terminal attempts, and superseded attempts fail closed.
+
+After a successful candidate commit, all scoped-check records name that exact candidate SHA; failed pre-commit checks remain base-bound. Evidence survives Gate restart on the still-leased attempt, while expiry/retry fencing prevents a prior attempt from appending later. Only the owner API exposes it:
+
+```sh
+curl -sS -H 'Authorization: Bearer fake-owner-token' \
+  "http://127.0.0.1:18080/v1/jobs/$JOB_ID/attempts/$ATTEMPT_ID/evidence"
+```
+
+The read-only debug viewer intentionally does not render evidence output.
+
 ## Read-only debug viewer
 
 Open `http://127.0.0.1:18080/debug/`, enter the owner token, and load recent jobs, job timelines, and Worker connection state. The public embedded shell contains no state; the password value is cleared after being copied to JavaScript memory and every JSON request sends it only in the `Authorization: Bearer <token>` header.
@@ -91,4 +106,4 @@ The terminal job contains `candidate_sha`; its deterministic candidate ref keeps
 
 Owner-token holders are authorized to request commands only inside configured repository roots. Production Workers should run as dedicated unprivileged accounts or containers. The plugin receives only `PATH`, `HOME`, `CODEX_HOME`, `CODEX_BIN`, and `TMPDIR` when set; scoped tests receive an isolated home, temp, and cache.
 
-Run `scripts/e2e.sh` for the reference transport proof, `scripts/recovery-e2e.sh` for restart/expiry/retry/late-result recovery, and `CODEX_BIN=/path/to/codex scripts/coding-e2e.sh` for the real coding proof. The scripts use synthetic data; recovery artifacts stay in a temporary directory and all spawned processes are cleaned up.
+Run `scripts/e2e.sh` for the reference transport proof, `scripts/recovery-e2e.sh` for restart/expiry/retry/late-result recovery, `scripts/evidence-e2e.sh` for the self-contained bounded-evidence/privacy proof, and `CODEX_BIN=/path/to/codex scripts/coding-e2e.sh` for the real coding proof. The scripts use synthetic data; recovery artifacts stay in a temporary directory and all spawned processes are cleaned up.

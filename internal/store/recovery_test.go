@@ -755,7 +755,7 @@ func TestExpiryAtMaxAttemptsFailsWithoutRetry(t *testing.T) {
 func TestCandidateCompletionUsesAttemptLedgerAndDeadline(t *testing.T) {
 	s := testStore(t)
 	start := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
-	job, err := s.CreateCodingJob(protocol.CodingTask{Instruction: "work"})
+	job, err := s.CreateCodingJob(protocol.CodingTask{BaseSHA: strings.Repeat("a", 40), Instruction: "work"})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -21,6 +21,7 @@ func main() {
 	mode := flag.String("mode", "abandon", "abandon or late")
 	job := flag.String("job", "", "late job ID")
 	attempt := flag.String("attempt", "", "late attempt ID")
+	base := flag.String("base", "", "late evidence base SHA")
 	flag.Parse()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -40,6 +41,19 @@ func main() {
 			fail(fmt.Errorf("late reply: %#v: %v", reply, err))
 		}
 		fmt.Println("late_rejected")
+		return
+	}
+	if *mode == "late-evidence" {
+		record := protocol.AttemptEvidence{EvidenceID: "11111111111111111111111111111111", Phase: protocol.EvidencePhasePlugin, Reason: protocol.EvidenceReasonPluginFailed, BaseSHA: *base}
+		err = wsjson.Write(ctx, c, protocol.Message{Type: protocol.MessageEvidence, JobID: *job, AttemptID: *attempt, Evidence: []protocol.AttemptEvidence{record}})
+		var reply protocol.Message
+		if err == nil {
+			err = wsjson.Read(ctx, c, &reply)
+		}
+		if err != nil || reply.Type != protocol.MessageError || reply.Error != "request failed" {
+			fail(fmt.Errorf("late evidence reply: %#v: %v", reply, err))
+		}
+		fmt.Println("late_evidence_rejected")
 		return
 	}
 	var lease protocol.Message
