@@ -12,7 +12,8 @@ import (
 
 func TestInvokeLocalUsesConfiguredArgvEnvironmentTimeoutAndOutput(t *testing.T) {
 	request := pluginRequest{Version: "v1", Input: "input"}
-	result, err := invokeLocal(context.Background(), []string{"/bin/sh", "-c", `printf '{"version":"v1","result":"%s"}\n' "$FORGE_ALLOWED"`}, request, time.Second, 1024, []string{"FORGE_ALLOWED=visible"})
+	plugin := `import json,os,sys;i=json.loads(sys.stdin.readline());print(json.dumps({"version":"v1","id":i["id"],"type":"initialized","capabilities":["text"]},separators=(",",":")),flush=True);json.loads(sys.stdin.readline());print(json.dumps({"version":"v1","id":i["id"],"type":"result","output":os.environ["FORGE_ALLOWED"]},separators=(",",":")),flush=True)`
+	result, err := invokeLocal(context.Background(), []string{"python3", "-c", plugin}, request, time.Second, 1024, []string{"PATH=" + os.Getenv("PATH"), "FORGE_ALLOWED=visible"})
 	if err != nil || result != "visible" {
 		t.Fatalf("configured invocation = %q, %v", result, err)
 	}
@@ -60,6 +61,30 @@ func TestResolveConfiguredLeaseUsesOnlyLocalRegistries(t *testing.T) {
 	}
 	if message.Task.Repository != "" {
 		t.Fatal("lease carried a local repository path")
+	}
+}
+
+func TestResolveConfiguredLeaseSeparatesPluginAndCheckEnvironments(t *testing.T) {
+	c, message, _ := configuredWorkerAndLease(t)
+	c.EnvironmentAllowlist = append(c.EnvironmentAllowlist, "UNLISTED")
+	message.Policy.Execution.Environment = []string{"PATH", "CODEX_HOME", "CODEX_BIN", "UNLISTED"}
+	originalLookup := environmentLookup
+	environmentLookup = func(name string) (string, bool) { return "value-" + name, true }
+	t.Cleanup(func() { environmentLookup = originalLookup })
+
+	resolved, err := resolveLease(c, message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPlugin := []string{"PATH=value-PATH", "CODEX_HOME=value-CODEX_HOME", "CODEX_BIN=value-CODEX_BIN", "UNLISTED=value-UNLISTED"}
+	if strings.Join(resolved.pluginEnvironment, "\n") != strings.Join(wantPlugin, "\n") || strings.Join(resolved.checkEnvironment, "\n") != "PATH=value-PATH" {
+		t.Fatalf("plugin=%#v check=%#v", resolved.pluginEnvironment, resolved.checkEnvironment)
+	}
+
+	c.CheckEnvironmentAllowlist = nil
+	resolved, err = resolveLease(c, message)
+	if err != nil || len(resolved.checkEnvironment) != 0 {
+		t.Fatalf("empty check allowlist = %#v, %v", resolved.checkEnvironment, err)
 	}
 }
 

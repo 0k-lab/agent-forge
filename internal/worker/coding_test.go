@@ -3,14 +3,17 @@ package worker
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"agent-forge/internal/pluginprotocol"
 	"agent-forge/internal/protocol"
 )
 
@@ -35,7 +38,7 @@ func TestCodingOutcomeClassifiesPluginStartFailure(t *testing.T) {
 func TestCodingOutcomeClassifiesPluginReportedFailureWithoutRawError(t *testing.T) {
 	repo, base, _ := codingFixture(t, "#!/bin/sh\nexit 0\n")
 	plugin := filepath.Join(t.TempDir(), "plugin")
-	write(t, plugin, "#!/bin/sh\nprintf '%s\\n' '{\"version\":\"v1\",\"error\":\"unknown private plugin detail\"}'\n")
+	write(t, plugin, workspaceFailurePython("execution_failed"))
 	if err := os.Chmod(plugin, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -54,12 +57,12 @@ func TestCodingOutcomeClassifiesPluginReportedFailureWithoutRawError(t *testing.
 func TestCodingOutcomeDetectsNoChangesBeforeScopedChecks(t *testing.T) {
 	repo, base, _ := codingFixture(t, "#!/bin/sh\nexit 99\n")
 	plugin := filepath.Join(t.TempDir(), "plugin")
-	write(t, plugin, "#!/bin/sh\nprintf '%s\\n' '{\"version\":\"v1\",\"result\":\"unchanged\"}'\n")
+	write(t, plugin, workspacePluginPython("pass", ""))
 	if err := os.Chmod(plugin, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	outcome := executeCodingOutcome(context.Background(), plugin, []string{repo}, strings.Repeat("5", 32), strings.Repeat("6", 32), protocol.CodingTask{
-		Repository: repo, BaseSHA: base, Tests: [][]string{{"./check-env"}},
+		Repository: repo, BaseSHA: base, Instruction: "edit", Tests: [][]string{{"./check-env"}},
 	})
 	defer outcome.cleanup()
 	if len(outcome.evidence) != 1 || outcome.evidence[0].Phase != protocol.EvidencePhaseWorkspaceValidation || outcome.evidence[0].Reason != protocol.EvidenceReasonNoChanges {
@@ -71,12 +74,15 @@ func TestCodingOutcomeDetectsPluginMutatedHEAD(t *testing.T) {
 	repo, base, _ := codingFixture(t, "#!/bin/sh\nexit 0\n")
 	plugin := filepath.Join(t.TempDir(), "plugin")
 	// Use a plugin that reads its request once, edits, and commits HEAD itself.
-	write(t, plugin, "#!/bin/sh\npython3 -c 'import json,sys,pathlib,subprocess; r=json.load(sys.stdin); w=r[\"workspace\"]; pathlib.Path(w, \"answer.txt\").write_text(\"plugin commit\\n\"); subprocess.run([\"git\",\"-C\",w,\"add\",\"-A\"],check=True); subprocess.run([\"git\",\"-C\",w,\"-c\",\"user.name=Plugin\",\"-c\",\"user.email=plugin@example.invalid\",\"commit\",\"-qm\",\"bad\"],check=True); print(json.dumps({\"version\":\"v1\",\"result\":\"done\"}))'\n")
+	write(t, plugin, workspacePluginPython(`
+pathlib.Path(request["workspace"], "answer.txt").write_text("plugin commit\n")
+subprocess.run(["git","-C",request["workspace"],"add","-A"])
+subprocess.run(["git","-C",request["workspace"],"-c","user.name=Plugin","-c","user.email=plugin@example.invalid","commit","-qm","bad"])`, ""))
 	if err := os.Chmod(plugin, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	outcome := executeCodingOutcome(context.Background(), plugin, []string{repo}, strings.Repeat("7", 32), strings.Repeat("8", 32), protocol.CodingTask{
-		Repository: repo, BaseSHA: base, Tests: [][]string{{"true"}},
+		Repository: repo, BaseSHA: base, Instruction: "edit", Tests: [][]string{{"true"}},
 	})
 	defer outcome.cleanup()
 	if len(outcome.evidence) != 1 || outcome.evidence[0].Reason != protocol.EvidenceReasonInvalidWorkspaceChange {
@@ -87,7 +93,7 @@ func TestCodingOutcomeDetectsPluginMutatedHEAD(t *testing.T) {
 func TestCodingOutcomeRetainsOrderedChecksThroughLaterFailure(t *testing.T) {
 	repo, base, plugin := codingFixture(t, "#!/bin/sh\nexit 0\n")
 	outcome := executeCodingOutcome(context.Background(), plugin, []string{repo}, strings.Repeat("9", 32), strings.Repeat("a", 32), protocol.CodingTask{
-		Repository: repo, BaseSHA: base, Tests: [][]string{
+		Repository: repo, BaseSHA: base, Instruction: "edit", Tests: [][]string{
 			{"sh", "-c", "printf first-pass"},
 			{"sh", "-c", "printf second-out; printf second-err >&2; exit 7"},
 			{"sh", "-c", "exit 99"},
@@ -114,7 +120,7 @@ func TestCodingOutcomeBoundsAndSanitizesFailedCheckOutputWithoutChangingExit(t *
 	secret := "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
 	command := "import os,sys; print(os.getcwd()); print('Authorization: Bearer " + secret + "'); sys.stderr.write('X'*5000); sys.exit(9)"
 	outcome := executeCodingOutcome(context.Background(), plugin, []string{repo}, strings.Repeat("b", 32), strings.Repeat("c", 32), protocol.CodingTask{
-		Repository: repo, BaseSHA: base, Tests: [][]string{{"python3", "-c", command}},
+		Repository: repo, BaseSHA: base, Instruction: "edit", Tests: [][]string{{"python3", "-c", command}},
 	})
 	defer outcome.cleanup()
 	if len(outcome.evidence) != 1 {
@@ -242,7 +248,7 @@ func TestBoundedCaptureSanitizesClosedPrivacyFormsBeforeEvidenceTransport(t *tes
 func TestCodingOutcomeClassifiesFirstScopedCheckFailure(t *testing.T) {
 	repo, base, plugin := codingFixture(t, "#!/bin/sh\nexit 0\n")
 	outcome := executeCodingOutcome(context.Background(), plugin, []string{repo}, strings.Repeat("d", 32), strings.Repeat("e", 32), protocol.CodingTask{
-		Repository: repo, BaseSHA: base, Tests: [][]string{{"sh", "-c", "exit 4"}, {"true"}},
+		Repository: repo, BaseSHA: base, Instruction: "edit", Tests: [][]string{{"sh", "-c", "exit 4"}, {"true"}},
 	})
 	defer outcome.cleanup()
 	if len(outcome.evidence) != 1 || outcome.evidence[0].CheckIndex == nil || *outcome.evidence[0].CheckIndex != 0 || outcome.evidence[0].Reason != protocol.EvidenceReasonScopedCheckFailed || outcome.evidence[0].BaseSHA != base || outcome.evidence[0].CandidateSHA != "" {
@@ -258,7 +264,7 @@ func TestCodingOutcomeClassifiesTimeoutWithoutSleeping(t *testing.T) {
 		return scopedCheckResult{duration: 11 * time.Minute, timedOut: true, err: context.DeadlineExceeded}
 	}
 	outcome := executeCodingOutcomeWithRunner(context.Background(), plugin, []string{repo}, strings.Repeat("f", 32), strings.Repeat("0", 32), protocol.CodingTask{
-		Repository: repo, BaseSHA: base, Tests: [][]string{{"never-runs"}, {"also-never-runs"}},
+		Repository: repo, BaseSHA: base, Instruction: "edit", Tests: [][]string{{"never-runs"}, {"also-never-runs"}},
 	}, runner)
 	defer outcome.cleanup()
 	if runs != 1 || len(outcome.evidence) != 1 || outcome.evidence[0].Reason != protocol.EvidenceReasonScopedCheckTimeout || outcome.evidence[0].ExitCode != nil || outcome.evidence[0].DurationMS != int64((10*time.Minute)/time.Millisecond) {
@@ -271,7 +277,7 @@ func TestCodingOutcomeClassifiesCandidateCommitFailure(t *testing.T) {
 	jobID, attemptID := strings.Repeat("1", 32), strings.Repeat("2", 32)
 	git(t, repo, "update-ref", "refs/agent-forge/candidates/"+jobID+"/"+attemptID, base)
 	outcome := executeCodingOutcome(context.Background(), plugin, []string{repo}, jobID, attemptID, protocol.CodingTask{
-		Repository: repo, BaseSHA: base, Tests: [][]string{{"true"}},
+		Repository: repo, BaseSHA: base, Instruction: "edit", Tests: [][]string{{"true"}},
 	})
 	defer outcome.cleanup()
 	if len(outcome.evidence) != 2 || outcome.evidence[0].Reason != protocol.EvidenceReasonScopedCheckPassed || outcome.evidence[0].CandidateSHA != "" || outcome.evidence[1].Phase != protocol.EvidencePhaseCandidateCommit || outcome.evidence[1].Reason != protocol.EvidenceReasonCandidateCommitFailed || !fixedLowerHex(outcome.evidence[1].CandidateSHA, 40) {
@@ -282,7 +288,7 @@ func TestCodingOutcomeClassifiesCandidateCommitFailure(t *testing.T) {
 func TestCodingOutcomeBindsSuccessfulCandidateToPriorChecks(t *testing.T) {
 	repo, base, plugin := codingFixture(t, "#!/bin/sh\nexit 0\n")
 	outcome := executeCodingOutcome(context.Background(), plugin, []string{repo}, strings.Repeat("a", 32), strings.Repeat("b", 32), protocol.CodingTask{
-		Repository: repo, BaseSHA: base, Tests: [][]string{{"true"}, {"sh", "-c", "printf checked"}},
+		Repository: repo, BaseSHA: base, Instruction: "edit", Tests: [][]string{{"true"}, {"sh", "-c", "printf checked"}},
 	})
 	defer outcome.cleanup()
 	if !fixedLowerHex(outcome.candidateSHA, 40) || len(outcome.evidence) != 2 {
@@ -298,12 +304,12 @@ func TestCodingOutcomeBindsSuccessfulCandidateToPriorChecks(t *testing.T) {
 func TestCodingOutcomeCleanupIsIdempotentAndLeavesEvidenceInMemory(t *testing.T) {
 	repo, base, plugin := codingFixture(t, "#!/bin/sh\nexit 0\n")
 	marker := filepath.Join(t.TempDir(), "workspace")
-	write(t, plugin, "#!/bin/sh\npython3 -c 'import json,sys,pathlib; r=json.load(sys.stdin); w=r[\"workspace\"]; pathlib.Path(w, \"answer.txt\").write_text(\"candidate\\n\"); pathlib.Path(\""+marker+"\").write_text(w); print(json.dumps({\"version\":\"v1\",\"result\":\"done\"}))'\n")
+	write(t, plugin, workspacePluginPython(`pathlib.Path(request["workspace"], "answer.txt").write_text("candidate\n"); pathlib.Path(`+strconv.Quote(marker)+`).write_text(request["workspace"])`, ""))
 	if err := os.Chmod(plugin, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	outcome := executeCodingOutcome(context.Background(), plugin, []string{repo}, strings.Repeat("3", 32), strings.Repeat("4", 32), protocol.CodingTask{
-		Repository: repo, BaseSHA: base, Tests: [][]string{{"true"}},
+		Repository: repo, BaseSHA: base, Instruction: "edit", Tests: [][]string{{"true"}},
 	})
 	workspaceBytes, err := os.ReadFile(marker)
 	if err != nil {
@@ -363,6 +369,120 @@ func TestCodingOutcomeRejectsInvalidTaskBeforePlugin(t *testing.T) {
 	}
 }
 
+func TestCodingOutcomeRejectsEmptyTestExecutableBeforePlugin(t *testing.T) {
+	repo, base, _ := codingFixture(t, "#!/bin/sh\nexit 0\n")
+	marker := filepath.Join(t.TempDir(), "plugin-ran")
+	plugin := filepath.Join(t.TempDir(), "plugin")
+	write(t, plugin, "#!/bin/sh\n: > \""+marker+"\"\n")
+	if err := os.Chmod(plugin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outcome := executeCodingOutcome(context.Background(), plugin, []string{repo}, strings.Repeat("5", 32), strings.Repeat("7", 32), protocol.CodingTask{
+		Repository: repo, BaseSHA: base, Instruction: "edit", Tests: [][]string{{""}},
+	})
+	defer outcome.cleanup()
+	if len(outcome.evidence) != 1 || outcome.evidence[0].Reason != protocol.EvidenceReasonInvalidTask {
+		t.Fatalf("empty executable evidence = %#v", outcome.evidence)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("empty executable invoked plugin: %v", err)
+	}
+}
+
+func TestCodingTaskBoundsFailBeforePlugin(t *testing.T) {
+	repo, base, _ := codingFixture(t, "#!/bin/sh\nexit 0\n")
+	marker := filepath.Join(t.TempDir(), "plugin-ran")
+	plugin := filepath.Join(t.TempDir(), "plugin")
+	write(t, plugin, "#!/bin/sh\n: > \""+marker+"\"\n")
+	if err := os.Chmod(plugin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tooManyArgs := make([]string, 65)
+	for i := range tooManyArgs {
+		tooManyArgs[i] = "x"
+	}
+	for name, task := range map[string]protocol.CodingTask{
+		"instruction": {BaseSHA: base, Instruction: strings.Repeat("x", pluginprotocol.MaxTextBytes+1), Tests: [][]string{{"true"}}},
+		"argv count":  {BaseSHA: base, Instruction: "edit", Tests: [][]string{tooManyArgs}},
+		"argument":    {BaseSHA: base, Instruction: "edit", Tests: [][]string{{"true", strings.Repeat("x", 4097)}}},
+		"author":      {BaseSHA: base, Instruction: "edit", Tests: [][]string{{"true"}}, CommitAuthorName: strings.Repeat("x", 257), CommitAuthorEmail: "author@example.invalid"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			task.Repository = repo
+			outcome := executeCodingOutcome(context.Background(), plugin, []string{repo}, strings.Repeat("a", 32), strings.Repeat("b", 32), task)
+			defer outcome.cleanup()
+			if outcome.err == nil || len(outcome.evidence) != 1 || outcome.evidence[0].Reason != protocol.EvidenceReasonInvalidTask {
+				t.Fatalf("outcome = %#v", outcome)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("bounded task invoked plugin: %v", err)
+			}
+		})
+	}
+}
+
+func TestSequentialSameLaneFailureDoesNotContaminateNextExecution(t *testing.T) {
+	repo, base, _ := codingFixture(t, "#!/bin/sh\nexit 0\n")
+	root, runtimeRoot, state := t.TempDir(), t.TempDir(), filepath.Join(t.TempDir(), "state")
+	plugin := filepath.Join(t.TempDir(), "plugin")
+	write(t, plugin, `#!/usr/bin/env python3
+import json,os,pathlib,sys
+state=pathlib.Path(os.environ["STATE"])
+assert pathlib.Path(os.environ["TMPDIR"]).parent.parent == pathlib.Path(os.environ["RUNTIME_ROOT"])
+if not state.exists():
+    state.write_text("first")
+    raise SystemExit(7)
+initialize=json.loads(sys.stdin.readline())
+plugin_id=initialize["id"]
+print(json.dumps({"version":"v1","id":plugin_id,"type":"initialized","capabilities":["workspace_edit"]},separators=(",",":")),flush=True)
+request=json.loads(sys.stdin.readline())
+pathlib.Path(request["workspace"],"answer.txt").write_text("second\n")
+print(json.dumps({"version":"v1","id":plugin_id,"type":"result"},separators=(",",":")),flush=True)
+`)
+	if err := os.Chmod(plugin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	settings := codingSettings{
+		pluginArgv: []string{plugin}, repository: repo, worktreeRoot: root, runtimeRoot: runtimeRoot,
+		pluginEnvironment: []string{"PATH=" + environmentValue("PATH", "/usr/local/bin:/usr/bin:/bin"), "STATE=" + state, "RUNTIME_ROOT=" + runtimeRoot, "TMPDIR=/unbounded/private/tmp"},
+		pluginTimeout:     5 * time.Second, checkTimeout: time.Second, gitTimeout: time.Second, cleanupTimeout: time.Second,
+		pluginOutput: 1 << 20, checkOutput: 1024, gitOutput: 1 << 20,
+	}
+	runCheck := func(context.Context, string, []string, []string) scopedCheckResult { return scopedCheckResult{} }
+	firstJob, firstAttempt := strings.Repeat("1", 32), strings.Repeat("2", 32)
+	first := executeCodingOutcomeSettings(context.Background(), settings, firstJob, firstAttempt, protocol.CodingTask{BaseSHA: base, Instruction: "first", Tests: [][]string{{"true"}}}, runCheck)
+	if first.err == nil || first.candidateSHA != "" || first.cleanup() != nil {
+		t.Fatalf("first outcome = %#v", first)
+	}
+	if exec.Command("git", "-C", repo, "show-ref", "--verify", "--quiet", "refs/agent-forge/candidates/"+firstJob+"/"+firstAttempt).Run() == nil {
+		t.Fatal("failed execution retained candidate ref")
+	}
+	assertEmptyDir(t, root)
+	assertEmptyDir(t, runtimeRoot)
+
+	secondJob, secondAttempt := strings.Repeat("3", 32), strings.Repeat("4", 32)
+	second := executeCodingOutcomeSettings(context.Background(), settings, secondJob, secondAttempt, protocol.CodingTask{BaseSHA: base, Instruction: "second", Tests: [][]string{{"true"}}}, runCheck)
+	if second.err != nil || !fixedLowerHex(second.candidateSHA, 40) {
+		t.Fatalf("second outcome = %#v", second)
+	}
+	if got := git(t, repo, "rev-parse", "refs/agent-forge/candidates/"+secondJob+"/"+secondAttempt); got != second.candidateSHA {
+		t.Fatalf("second candidate ref = %q", got)
+	}
+	if second.cleanup() != nil {
+		t.Fatal("second cleanup failed")
+	}
+	assertEmptyDir(t, root)
+	assertEmptyDir(t, runtimeRoot)
+}
+
+func assertEmptyDir(t *testing.T, path string) {
+	t.Helper()
+	entries, err := os.ReadDir(path)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("%s not empty: %v, %v", filepath.Base(path), entries, err)
+	}
+}
+
 func TestCodingOutcomeClassifiesPluginProtocolFailuresWithoutTranscript(t *testing.T) {
 	for name, body := range map[string]string{
 		"nonzero":   "#!/bin/sh\nprintf 'Authorization: Bearer plugin-secret' >&2\nexit 7\n",
@@ -376,7 +496,7 @@ func TestCodingOutcomeClassifiesPluginProtocolFailuresWithoutTranscript(t *testi
 				t.Fatal(err)
 			}
 			outcome := executeCodingOutcome(context.Background(), plugin, []string{repo}, strings.Repeat("7", 32), strings.Repeat("8", 32), protocol.CodingTask{
-				Repository: repo, BaseSHA: base, Tests: [][]string{{"true"}},
+				Repository: repo, BaseSHA: base, Instruction: "edit", Tests: [][]string{{"true"}},
 			})
 			defer outcome.cleanup()
 			if len(outcome.evidence) != 1 || outcome.evidence[0].Reason != protocol.EvidenceReasonPluginProtocolFailed || outcome.evidence[0].Output != "" {
@@ -410,7 +530,7 @@ func TestCodingTaskUsesExactBaseAndCreatesCandidate(t *testing.T) {
 	git(t, repo, "commit", "-qam", "later")
 
 	plugin := filepath.Join(t.TempDir(), "plugin")
-	write(t, plugin, "#!/bin/sh\npython3 -c 'import json,sys,pathlib; r=json.load(sys.stdin); pathlib.Path(r[\"workspace\"], \"answer.txt\").write_text(\"candidate\\n\"); print(json.dumps({\"version\":\"v1\",\"result\":\"Mallory <mallory@example.com>\"}))'\n")
+	write(t, plugin, workspacePluginPython(`pathlib.Path(request["workspace"], "answer.txt").write_text("candidate\n")`, "feat: write candidate"))
 	if err := os.Chmod(plugin, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -434,6 +554,9 @@ func TestCodingTaskUsesExactBaseAndCreatesCandidate(t *testing.T) {
 	}
 	if got := git(t, repo, "show", "-s", "--format=%an <%ae>%n%cn <%ce>", sha); got != "kricha <4619899+kricha@users.noreply.github.com>\nAgent Forge <forge@example.invalid>" {
 		t.Fatalf("candidate identity = %q", got)
+	}
+	if got := git(t, repo, "show", "-s", "--format=%s", sha); got != "feat: write candidate" {
+		t.Fatalf("candidate subject = %q", got)
 	}
 	if got := git(t, repo, "status", "--short"); got != "" {
 		t.Fatalf("source repository changed: %s", got)
@@ -501,21 +624,38 @@ func TestScopedTestFailurePreventsCandidateCreation(t *testing.T) {
 	base := git(t, repo, "rev-parse", "HEAD")
 
 	plugin := filepath.Join(t.TempDir(), "plugin")
-	write(t, plugin, "#!/bin/sh\npython3 -c 'import json,sys,pathlib; r=json.load(sys.stdin); pathlib.Path(r[\"workspace\"], \"answer.txt\").write_text(\"wrong\\n\"); print(json.dumps({\"version\":\"v1\",\"result\":\"edited\"}))'\n")
+	write(t, plugin, workspacePluginPython(`pathlib.Path(request["workspace"], "answer.txt").write_text("wrong\n")`, ""))
 	if err := os.Chmod(plugin, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
 	sha, err := executeCodingTask(context.Background(), plugin, []string{repo}, "33333333333333333333333333333333", "44444444444444444444444444444444", protocol.CodingTask{
-		Repository: repo,
-		BaseSHA:    base,
-		Tests:      [][]string{{"grep", "-qx", "expected", "answer.txt"}},
+		Repository:  repo,
+		BaseSHA:     base,
+		Instruction: "edit",
+		Tests:       [][]string{{"grep", "-qx", "expected", "answer.txt"}},
 	})
 	if err == nil || sha != "" {
 		t.Fatalf("failed test produced candidate %q, err=%v", sha, err)
 	}
 	if got := git(t, repo, "rev-list", "--all", "--count"); got != "1" {
 		t.Fatalf("failed test created a commit: count=%s", got)
+	}
+}
+
+func TestScopedCheckMutationCannotProduceCandidate(t *testing.T) {
+	repo, base, plugin := codingFixture(t, "#!/bin/sh\nprintf 'mutated by check\\n' > answer.txt\n")
+	jobID, attemptID := strings.Repeat("1", 32), strings.Repeat("f", 32)
+	outcome := executeCodingOutcome(context.Background(), plugin, []string{repo}, jobID, attemptID, protocol.CodingTask{
+		Repository: repo, BaseSHA: base, Instruction: "edit", Tests: [][]string{{"./check-env"}},
+	})
+	defer outcome.cleanup()
+	if outcome.candidateSHA != "" || outcome.err == nil {
+		t.Fatalf("mutating check produced candidate: %#v", outcome)
+	}
+	ref := "refs/agent-forge/candidates/" + jobID + "/" + attemptID
+	if err := exec.Command("git", "-C", repo, "show-ref", "--verify", "--quiet", ref).Run(); err == nil {
+		t.Fatal("mutating check retained candidate ref")
 	}
 }
 
@@ -583,9 +723,52 @@ func TestScopedTestEnvironmentDoesNotInheritWorkerSecret(t *testing.T) {
 	}
 }
 
+func TestCodingSeparatesPluginAndCheckEnvironments(t *testing.T) {
+	repo, base, plugin := codingFixture(t, "#!/bin/sh\nexit 0\n")
+	write(t, plugin, workspacePluginPython(`
+env=__import__("os").environ
+assert env["CODEX_HOME"] == "/plugin/home" and env["CODEX_BIN"] == "/plugin/bin" and env["UNLISTED"] == "plugin-only"
+pathlib.Path(request["workspace"], "answer.txt").write_text("candidate\n")`, ""))
+	if err := os.Chmod(plugin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	worktrees, runtimeRoot := t.TempDir(), t.TempDir()
+	safePath := environmentValue("PATH", "/usr/local/bin:/usr/bin:/bin")
+	settings := codingSettings{
+		pluginArgv: []string{plugin}, repository: repo, worktreeRoot: worktrees, runtimeRoot: runtimeRoot,
+		pluginEnvironment: []string{"PATH=" + safePath, "CODEX_HOME=/plugin/home", "CODEX_BIN=/plugin/bin", "UNLISTED=plugin-only"},
+		checkEnvironment:  []string{"PATH=" + safePath},
+		pluginTimeout:     time.Second, checkTimeout: time.Second, gitTimeout: time.Second, cleanupTimeout: time.Second,
+		pluginOutput: 1 << 20, checkOutput: 1024, gitOutput: 1 << 20,
+	}
+	runner := func(_ context.Context, _ string, env, _ []string) scopedCheckResult {
+		values := map[string]string{}
+		for _, entry := range env {
+			name, value, _ := strings.Cut(entry, "=")
+			values[name] = value
+		}
+		if values["PATH"] != safePath || values["HOME"] == "" || values["TMPDIR"] == "" || values["XDG_CACHE_HOME"] == "" || values["CODEX_HOME"] != "" || values["CODEX_BIN"] != "" || values["UNLISTED"] != "" {
+			return scopedCheckResult{err: errors.New("unsafe check environment")}
+		}
+		return scopedCheckResult{}
+	}
+	outcome := executeCodingOutcomeSettings(context.Background(), settings, strings.Repeat("c", 32), strings.Repeat("d", 32), protocol.CodingTask{BaseSHA: base, Instruction: "edit", Tests: [][]string{{"true"}}}, runner)
+	defer outcome.cleanup()
+	if outcome.err != nil || outcome.candidateSHA == "" {
+		t.Fatalf("outcome = %#v", outcome)
+	}
+}
+
 func TestPluginEnvironmentDoesNotInheritWorkerSecret(t *testing.T) {
 	plugin := filepath.Join(t.TempDir(), "plugin")
-	write(t, plugin, "#!/bin/sh\n[ -z \"${FORGE_FAKE_SECRET+x}\" ] || exit 9\nprintf '%s\\n' '{\"version\":\"v1\",\"result\":\"ok\"}'\n")
+	write(t, plugin, `#!/usr/bin/env python3
+import json,os,sys
+assert "FORGE_FAKE_SECRET" not in os.environ
+initialize=json.loads(sys.stdin.readline())
+print(json.dumps({"version":"v1","id":initialize["id"],"type":"initialized","capabilities":["text"]},separators=(",",":")),flush=True)
+json.loads(sys.stdin.readline())
+print(json.dumps({"version":"v1","id":initialize["id"],"type":"result","output":"ok"},separators=(",",":")),flush=True)
+`)
 	if err := os.Chmod(plugin, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -610,11 +793,39 @@ func codingFixture(t *testing.T, check string) (repo, base, plugin string) {
 	git(t, repo, "commit", "-qm", "base")
 	base = git(t, repo, "rev-parse", "HEAD")
 	plugin = filepath.Join(t.TempDir(), "plugin")
-	write(t, plugin, "#!/bin/sh\npython3 -c 'import json,sys,pathlib; r=json.load(sys.stdin); pathlib.Path(r[\"workspace\"], \"answer.txt\").write_text(\"candidate\\n\"); print(json.dumps({\"version\":\"v1\",\"result\":\"edited\"}))'\n")
+	write(t, plugin, workspacePluginPython(`pathlib.Path(request["workspace"], "answer.txt").write_text("candidate\n")`, ""))
 	if err := os.Chmod(plugin, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return repo, base, plugin
+}
+
+func workspacePluginPython(action, subject string) string {
+	result := `{"version":"v1","id":plugin_id,"type":"result"}`
+	if subject != "" {
+		result = `{"version":"v1","id":plugin_id,"type":"result","commit_subject":` + strconv.Quote(subject) + `}`
+	}
+	return "#!/usr/bin/env python3\n" + `import json,pathlib,subprocess,sys
+initialize=json.loads(sys.stdin.readline())
+plugin_id=initialize["id"]
+capabilities=["workspace_edit"]
+if "commit_subject" in initialize["capabilities"]:
+    capabilities.append("commit_subject")
+print(json.dumps({"version":"v1","id":plugin_id,"type":"initialized","capabilities":capabilities},separators=(",",":")),flush=True)
+request=json.loads(sys.stdin.readline())
+` + action + `
+print(json.dumps(` + result + `,separators=(",",":")),flush=True)
+`
+}
+
+func workspaceFailurePython(category string) string {
+	return "#!/usr/bin/env python3\n" + `import json,sys
+initialize=json.loads(sys.stdin.readline())
+plugin_id=initialize["id"]
+print(json.dumps({"version":"v1","id":plugin_id,"type":"initialized","capabilities":["workspace_edit"]},separators=(",",":")),flush=True)
+json.loads(sys.stdin.readline())
+print(json.dumps({"version":"v1","id":plugin_id,"type":"failure","category":` + strconv.Quote(category) + `},separators=(",",":")),flush=True)
+`
 }
 
 func git(t *testing.T, dir string, args ...string) string {

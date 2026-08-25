@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"agent-forge/internal/configjson"
 )
@@ -41,20 +42,21 @@ type LocalCeilings struct {
 }
 
 type Config struct {
-	Version              int
-	GateURL              string
-	ID                   string
-	TokenEnv             string
-	HeartbeatInterval    time.Duration
-	Concurrency          int
-	RepositoryRoots      []string
-	WorktreeRoot         string
-	RuntimeRoot          string
-	Repositories         []RepositoryRegistration
-	Plugins              []PluginRegistration
-	EnvironmentAllowlist []string
-	Ceilings             LocalCeilings
-	token                string
+	Version                   int
+	GateURL                   string
+	ID                        string
+	TokenEnv                  string
+	HeartbeatInterval         time.Duration
+	Concurrency               int
+	RepositoryRoots           []string
+	WorktreeRoot              string
+	RuntimeRoot               string
+	Repositories              []RepositoryRegistration
+	Plugins                   []PluginRegistration
+	EnvironmentAllowlist      []string
+	CheckEnvironmentAllowlist []string
+	Ceilings                  LocalCeilings
+	token                     string
 }
 
 type rawCeilings struct {
@@ -68,19 +70,20 @@ type rawCeilings struct {
 }
 
 type rawWorkerConfig struct {
-	Version              int                      `json:"version"`
-	GateURL              string                   `json:"gate_url"`
-	ID                   string                   `json:"id"`
-	TokenEnv             string                   `json:"token_env"`
-	HeartbeatInterval    string                   `json:"heartbeat_interval"`
-	Concurrency          int                      `json:"concurrency"`
-	RepositoryRoots      []string                 `json:"repository_roots"`
-	WorktreeRoot         string                   `json:"worktree_root"`
-	RuntimeRoot          string                   `json:"runtime_root"`
-	Repositories         []RepositoryRegistration `json:"repositories"`
-	Plugins              []PluginRegistration     `json:"plugins"`
-	EnvironmentAllowlist []string                 `json:"environment_allowlist"`
-	Ceilings             rawCeilings              `json:"ceilings"`
+	Version                   int                      `json:"version"`
+	GateURL                   string                   `json:"gate_url"`
+	ID                        string                   `json:"id"`
+	TokenEnv                  string                   `json:"token_env"`
+	HeartbeatInterval         string                   `json:"heartbeat_interval"`
+	Concurrency               int                      `json:"concurrency"`
+	RepositoryRoots           []string                 `json:"repository_roots"`
+	WorktreeRoot              string                   `json:"worktree_root"`
+	RuntimeRoot               string                   `json:"runtime_root"`
+	Repositories              []RepositoryRegistration `json:"repositories"`
+	Plugins                   []PluginRegistration     `json:"plugins"`
+	EnvironmentAllowlist      []string                 `json:"environment_allowlist"`
+	CheckEnvironmentAllowlist []string                 `json:"check_environment_allowlist"`
+	Ceilings                  rawCeilings              `json:"ceilings"`
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -92,16 +95,19 @@ func LoadConfig(path string) (Config, error) {
 }
 
 func ParseConfig(data []byte, getenv func(string) string) (Config, error) {
+	if !utf8.Valid(data) {
+		return Config{}, errWorkerConfig
+	}
 	var raw rawWorkerConfig
 	if err := configjson.Decode(data, &raw); err != nil {
 		return Config{}, err
 	}
 	heartbeat, err := time.ParseDuration(raw.HeartbeatInterval)
 	gateURL, urlErr := url.Parse(raw.GateURL)
-	if err != nil || heartbeat <= 0 || heartbeat > time.Hour || raw.Version != 1 || raw.GateURL == "" || len(raw.GateURL) > 2048 || urlErr != nil || gateURL.Host == "" || gateURL.User != nil || gateURL.RawQuery != "" || gateURL.ForceQuery || gateURL.Fragment != "" || gateURL.Scheme != "ws" && gateURL.Scheme != "wss" || !workerConfigID.MatchString(raw.ID) || !workerEnvName.MatchString(raw.TokenEnv) || raw.Concurrency < 1 || raw.Concurrency > 64 || len(raw.RepositoryRoots) == 0 || len(raw.RepositoryRoots) > 64 || len(raw.Repositories) > 1024 || len(raw.Plugins) == 0 || len(raw.Plugins) > 128 || len(raw.EnvironmentAllowlist) > 64 || getenv == nil {
+	if err != nil || heartbeat <= 0 || heartbeat > time.Hour || raw.Version != 1 || raw.GateURL == "" || len(raw.GateURL) > 2048 || urlErr != nil || gateURL.Host == "" || gateURL.User != nil || gateURL.RawQuery != "" || gateURL.ForceQuery || gateURL.Fragment != "" || gateURL.Scheme != "ws" && gateURL.Scheme != "wss" || !workerConfigID.MatchString(raw.ID) || !workerEnvName.MatchString(raw.TokenEnv) || raw.Concurrency < 1 || raw.Concurrency > 64 || len(raw.RepositoryRoots) == 0 || len(raw.RepositoryRoots) > 64 || len(raw.Repositories) > 1024 || len(raw.Plugins) == 0 || len(raw.Plugins) > 128 || len(raw.EnvironmentAllowlist) > 64 || len(raw.CheckEnvironmentAllowlist) > 64 || getenv == nil {
 		return Config{}, errWorkerConfig
 	}
-	c := Config{Version: raw.Version, GateURL: raw.GateURL, ID: raw.ID, TokenEnv: raw.TokenEnv, HeartbeatInterval: heartbeat, Concurrency: raw.Concurrency, WorktreeRoot: raw.WorktreeRoot, RuntimeRoot: raw.RuntimeRoot, Repositories: raw.Repositories, Plugins: raw.Plugins, EnvironmentAllowlist: raw.EnvironmentAllowlist}
+	c := Config{Version: raw.Version, GateURL: raw.GateURL, ID: raw.ID, TokenEnv: raw.TokenEnv, HeartbeatInterval: heartbeat, Concurrency: raw.Concurrency, WorktreeRoot: raw.WorktreeRoot, RuntimeRoot: raw.RuntimeRoot, Repositories: raw.Repositories, Plugins: raw.Plugins, EnvironmentAllowlist: raw.EnvironmentAllowlist, CheckEnvironmentAllowlist: raw.CheckEnvironmentAllowlist}
 	c.token = getenv(c.TokenEnv)
 	if c.token == "" {
 		return Config{}, errWorkerConfig
@@ -152,7 +158,7 @@ func ParseConfig(data []byte, getenv func(string) string) (Config, error) {
 			return Config{}, errWorkerConfig
 		}
 		for _, arg := range plugin.Argv {
-			if arg == "" || len(arg) > 4096 {
+			if arg == "" || len(arg) > 4096 || !utf8.ValidString(arg) || strings.IndexByte(arg, 0) >= 0 {
 				return Config{}, errWorkerConfig
 			}
 		}
@@ -163,6 +169,13 @@ func ParseConfig(data []byte, getenv func(string) string) (Config, error) {
 			return Config{}, errWorkerConfig
 		}
 		environment[name] = true
+	}
+	checks := map[string]bool{}
+	for _, name := range c.CheckEnvironmentAllowlist {
+		if !workerEnvName.MatchString(name) || !environment[name] || checks[name] {
+			return Config{}, errWorkerConfig
+		}
+		checks[name] = true
 	}
 	if c.Ceilings, err = parseCeilings(raw.Ceilings); err != nil {
 		return Config{}, errWorkerConfig

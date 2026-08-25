@@ -29,6 +29,7 @@ worker = {
     "repositories": [] if repository_path == "-" else [{"id": repository_id, "path": repository_path}],
     "plugins": [{"id": plugin_id, "argv": [plugin_path]}],
     "environment_allowlist": ["PATH", "CODEX_HOME", "CODEX_BIN"],
+    "check_environment_allowlist": ["PATH"],
     "ceilings": {"plugin_timeout": "15m", "check_timeout": "10m", "git_timeout": "1m", "cleanup_timeout": "10s", "plugin_output_bytes": 1048576, "check_output_bytes": 2048, "git_output_bytes": 1048576},
 }
 for path, value in ((gate_path, gate), (worker_path, worker)):

@@ -1,0 +1,4 @@
+{"version":"v1","id":"0123456789abcdef0123456789abcdef","type":"initialize","capabilities":["text"],"limits":{"frame_bytes":1048576,"progress_frames":128,"text_bytes":65536,"progress_text_bytes":1024,"commit_subject_bytes":256}}
+{"version":"v1","id":"0123456789abcdef0123456789abcdef","type":"initialized","capabilities":["text"]}
+{"version":"v1","id":"0123456789abcdef0123456789abcdef","type":"execute","operation":"text","input":"hello"}
+{"version":"v1","id":"0123456789abcdef0123456789abcdef","type":"result","output":"HELLO"}

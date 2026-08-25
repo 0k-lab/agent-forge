@@ -65,8 +65,14 @@ git -C "$REPO" add .
 git -C "$REPO" commit -qm "test: synthetic evidence failure"
 BASE=$(git -C "$REPO" rev-parse HEAD)
 cat >"$RUN/plugin" <<'EOF'
-#!/bin/sh
-python3 -c 'import json,pathlib,sys; request=json.load(sys.stdin); pathlib.Path(request["workspace"], "answer.txt").write_text("after\n"); print(json.dumps({"version":"v1","result":"edited"}))'
+#!/usr/bin/env python3
+import json,pathlib,sys
+initialize=json.loads(sys.stdin.readline())
+plugin_id=initialize["id"]
+print(json.dumps({"version":"v1","id":plugin_id,"type":"initialized","capabilities":["workspace_edit"]},separators=(",",":")),flush=True)
+request=json.loads(sys.stdin.readline())
+pathlib.Path(request["workspace"],"answer.txt").write_text("after\n")
+print(json.dumps({"version":"v1","id":plugin_id,"type":"result"},separators=(",",":")),flush=True)
 EOF
 chmod +x "$RUN/plugin"
 

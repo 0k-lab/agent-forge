@@ -1,35 +1,24 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+
+	"agent-forge/internal/pluginprotocol"
 )
 
-type request struct {
-	Version string `json:"version"`
-	Input   string `json:"input"`
-}
-type response struct {
-	Version string `json:"version"`
-	Result  string `json:"result"`
-}
-
 func main() {
-	var r request
-	if err := json.NewDecoder(bufio.NewReader(os.Stdin)).Decode(&r); err != nil {
+	if err := run(os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	if r.Version != "v1" {
-		fmt.Fprintln(os.Stderr, "unsupported version")
-		os.Exit(2)
-	}
-	if len(r.Input) > 65536 {
-		fmt.Fprintln(os.Stderr, "input too large")
-		os.Exit(2)
-	}
-	_ = json.NewEncoder(os.Stdout).Encode(response{Version: "v1", Result: "FORGE: " + strings.ToUpper(r.Input)})
+}
+
+func run(in io.Reader, out io.Writer) error {
+	return pluginprotocol.Serve(in, out, []pluginprotocol.Capability{pluginprotocol.Text}, func(_ context.Context, request pluginprotocol.Request) (pluginprotocol.Result, error) {
+		return pluginprotocol.Result{Output: "FORGE: " + strings.ToUpper(request.Input)}, nil
+	})
 }

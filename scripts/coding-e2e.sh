@@ -16,6 +16,10 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+go build -o "$RUN/forge-gate" "$ROOT/cmd/forge-gate"
+go build -o "$RUN/forge-worker" "$ROOT/cmd/forge-worker"
+go build -o "$RUN/forge-codex-plugin" "$ROOT/cmd/forge-codex-plugin"
+
 mkdir -p "$REPO" "$ROOT/evidence"
 git -C "$REPO" init -q -b main
 git -C "$REPO" config user.name "Forge E2E"
@@ -45,14 +49,14 @@ git -C "$REPO" add .
 git -C "$REPO" commit -qm "test: add failing synthetic task"
 BASE=$(git -C "$REPO" rev-parse HEAD)
 
-python3 "$ROOT/scripts/write-configs.py" "$RUN/gate.json" "$RUN/worker.json" 127.0.0.1:18081 "$RUN/forge.db" ws://127.0.0.1:18081 coding-worker synthetic "$REPO" codex "$ROOT/bin/forge-codex-plugin" 30s 1s 3 10s
-FORGE_OWNER_TOKEN=$OWNER_TOKEN FORGE_WORKER_TOKEN=$WORKER_TOKEN "$ROOT/bin/forge-gate" -config "$RUN/gate.json" >"$RUN/gate.log" 2>&1 &
+python3 "$ROOT/scripts/write-configs.py" "$RUN/gate.json" "$RUN/worker.json" 127.0.0.1:18081 "$RUN/forge.db" ws://127.0.0.1:18081 coding-worker synthetic "$REPO" codex "$RUN/forge-codex-plugin" 30s 1s 3 10s
+FORGE_OWNER_TOKEN=$OWNER_TOKEN FORGE_WORKER_TOKEN=$WORKER_TOKEN "$RUN/forge-gate" -config "$RUN/gate.json" >"$RUN/gate.log" 2>&1 &
 GATE_PID=$!
 i=0
 until curl -sS -o /dev/null -H "Authorization: Bearer $OWNER_TOKEN" http://127.0.0.1:18081/v1/workers/coding-worker 2>/dev/null; do
   i=$((i+1)); [ "$i" -lt 50 ] || { echo "gate failed to become ready"; exit 1; }; sleep 0.1
 done
-CODEX_BIN=${CODEX_BIN:-codex} FORGE_WORKER_TOKEN=$WORKER_TOKEN "$ROOT/bin/forge-worker" -config "$RUN/worker.json" >"$RUN/worker.log" 2>&1 &
+CODEX_BIN=${CODEX_BIN:-codex} FORGE_WORKER_TOKEN=$WORKER_TOKEN "$RUN/forge-worker" -config "$RUN/worker.json" >"$RUN/worker.log" 2>&1 &
 WORKER_PID=$!
 i=0
 until curl -fsS -H "Authorization: Bearer $OWNER_TOKEN" http://127.0.0.1:18081/v1/workers/coding-worker 2>/dev/null | python3 -c 'import json,sys; assert json.load(sys.stdin)["connected"]' 2>/dev/null; do
@@ -84,8 +88,11 @@ PARENT=$(git -C "$REPO" rev-parse "$CANDIDATE^")
 [ "$PARENT" = "$BASE" ]
 AUTHOR=$(git -C "$REPO" show -s --format='%an <%ae>' "$CANDIDATE")
 COMMITTER=$(git -C "$REPO" show -s --format='%cn <%ce>' "$CANDIDATE")
+SUBJECT=$(git -C "$REPO" show -s --format='%s' "$CANDIDATE")
 [ "$AUTHOR" = "kricha <4619899+kricha@users.noreply.github.com>" ]
 [ "$COMMITTER" = "Agent Forge <forge@example.invalid>" ]
+[ "$SUBJECT" != "chore: apply coding task" ]
+[ -n "$SUBJECT" ]
 VERIFY="$RUN/verify"
 git -C "$REPO" worktree add -q --detach "$VERIFY" "$CANDIDATE"
 (cd "$VERIFY" && go test ./...)
@@ -105,6 +112,7 @@ TERMINAL=$(printf '%s' "$JOB" | python3 -c 'import json,sys; j=json.load(sys.std
   echo "candidate_parent=$PARENT"
   echo "candidate_author=$AUTHOR"
   echo "candidate_committer=$COMMITTER"
+  echo "candidate_subject=$SUBJECT"
   echo "candidate_ref=$CANDIDATE_REF"
   echo "candidate_object=verified"
   echo "event_candidate_sha=verified"

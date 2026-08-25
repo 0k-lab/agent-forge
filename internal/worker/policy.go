@@ -11,12 +11,13 @@ import (
 )
 
 type localLease struct {
-	repository   string
-	pluginArgv   []string
-	worktreeRoot string
-	runtimeRoot  string
-	environment  []string
-	policy       protocol.ResolvedPolicy
+	repository        string
+	pluginArgv        []string
+	worktreeRoot      string
+	runtimeRoot       string
+	pluginEnvironment []string
+	checkEnvironment  []string
+	policy            protocol.ResolvedPolicy
 }
 
 func resolveLease(config Config, message protocol.Message) (localLease, error) {
@@ -37,13 +38,22 @@ func resolveLease(config Config, message protocol.Message) (localLease, error) {
 	for _, name := range config.EnvironmentAllowlist {
 		allowedEnvironment[name] = true
 	}
-	environment := make([]string, 0, len(e.Environment))
+	allowedChecks := map[string]bool{}
+	for _, name := range config.CheckEnvironmentAllowlist {
+		allowedChecks[name] = true
+	}
+	pluginEnvironment := make([]string, 0, len(e.Environment))
+	checkEnvironment := make([]string, 0, len(e.Environment))
 	for _, name := range e.Environment {
 		if !allowedEnvironment[name] {
 			return fail()
 		}
 		if value, ok := environmentLookup(name); ok {
-			environment = append(environment, name+"="+value)
+			entry := name + "=" + value
+			pluginEnvironment = append(pluginEnvironment, entry)
+			if allowedChecks[name] {
+				checkEnvironment = append(checkEnvironment, entry)
+			}
 		}
 	}
 	var pluginArgv []string
@@ -56,7 +66,7 @@ func resolveLease(config Config, message protocol.Message) (localLease, error) {
 	if len(pluginArgv) == 0 {
 		return fail()
 	}
-	resolved := localLease{pluginArgv: pluginArgv, worktreeRoot: config.WorktreeRoot, runtimeRoot: config.RuntimeRoot, environment: environment, policy: policy}
+	resolved := localLease{pluginArgv: pluginArgv, worktreeRoot: config.WorktreeRoot, runtimeRoot: config.RuntimeRoot, pluginEnvironment: pluginEnvironment, checkEnvironment: checkEnvironment, policy: policy}
 	for _, root := range []*string{&resolved.worktreeRoot, &resolved.runtimeRoot} {
 		canonical, err := canonicalDirectory(*root)
 		if err != nil || canonical != *root {
@@ -102,13 +112,13 @@ func executeConfiguredOutcome(ctx context.Context, config Config, message protoc
 		return leaseOutcome{err: invalidTask(err)}
 	}
 	if message.Task == nil {
-		result, err := invokeLocal(ctx, resolved.pluginArgv, pluginRequest{Version: "v1", Input: message.Input}, time.Duration(resolved.policy.Execution.PluginTimeoutNanos), resolved.policy.Execution.PluginOutputBytes, resolved.environment)
+		result, err := invokeLocal(ctx, resolved.pluginArgv, pluginRequest{Version: "v1", Input: message.Input}, time.Duration(resolved.policy.Execution.PluginTimeoutNanos), resolved.policy.Execution.PluginOutputBytes, resolved.pluginEnvironment)
 		return leaseOutcome{result: result, err: err}
 	}
 	task := *message.Task
 	e := resolved.policy.Execution
 	settings := codingSettings{
-		pluginArgv: resolved.pluginArgv, repository: resolved.repository, worktreeRoot: resolved.worktreeRoot, runtimeRoot: resolved.runtimeRoot, environment: resolved.environment,
+		pluginArgv: resolved.pluginArgv, repository: resolved.repository, worktreeRoot: resolved.worktreeRoot, runtimeRoot: resolved.runtimeRoot, pluginEnvironment: resolved.pluginEnvironment, checkEnvironment: resolved.checkEnvironment,
 		pluginTimeout: time.Duration(e.PluginTimeoutNanos), checkTimeout: time.Duration(e.CheckTimeoutNanos), gitTimeout: time.Duration(e.GitTimeoutNanos), cleanupTimeout: time.Duration(e.CleanupTimeoutNanos),
 		pluginOutput: e.PluginOutputBytes, checkOutput: e.CheckOutputBytes, gitOutput: e.GitOutputBytes,
 	}
