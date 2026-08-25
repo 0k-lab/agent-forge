@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"time"
+
+	"agent-forge/internal/protocol"
 )
 
 type DebugJob struct {
@@ -26,8 +29,14 @@ type DebugWorker struct {
 }
 
 type DebugEvent struct {
-	Type string    `json:"type"`
-	At   time.Time `json:"at"`
+	Type           string     `json:"type"`
+	At             time.Time  `json:"at"`
+	AttemptID      string     `json:"attempt_id,omitempty"`
+	AttemptOrdinal int        `json:"attempt_ordinal,omitempty"`
+	LeaseExpiresAt *time.Time `json:"lease_expires_at,omitempty"`
+	RetryAt        *time.Time `json:"retry_at,omitempty"`
+	Disposition    string     `json:"disposition,omitempty"`
+	FailureCode    string     `json:"failure_code,omitempty"`
 }
 
 type DebugPosition struct {
@@ -171,7 +180,7 @@ func (s *Store) DebugJobTimeline(ctx context.Context, id string, limit int, posi
 			return DebugTimeline{}, ErrInvalidDebugCursor
 		}
 	}
-	query := `SELECT id,kind,at FROM events WHERE job_id=?`
+	query := `SELECT id,kind,detail,at FROM events WHERE job_id=?`
 	args := []any{id}
 	if position != nil {
 		query += ` AND (at > ? OR (at = ? AND id > ?))`
@@ -190,12 +199,45 @@ func (s *Store) DebugJobTimeline(ctx context.Context, id string, limit int, posi
 	for rows.Next() {
 		var event DebugEvent
 		var eventID int64
-		var at string
-		if err := rows.Scan(&eventID, &event.Type, &at); err != nil {
+		var detail, at string
+		if err := rows.Scan(&eventID, &event.Type, &detail, &at); err != nil {
 			return DebugTimeline{}, err
 		}
 		if event.At, err = time.Parse(time.RFC3339Nano, at); err != nil {
 			return DebugTimeline{}, err
+		}
+		dispositionSeen := false
+		for _, field := range strings.Fields(detail) {
+			key, value, ok := strings.Cut(field, "=")
+			if !ok {
+				continue
+			}
+			switch key {
+			case "attempt":
+				event.AttemptID = value
+			case "ordinal":
+				event.AttemptOrdinal, _ = strconv.Atoi(value)
+			case "lease_expires":
+				if parsed, parseErr := time.Parse(time.RFC3339Nano, value); parseErr == nil {
+					event.LeaseExpiresAt = &parsed
+				}
+			case "retry_at":
+				if parsed, parseErr := time.Parse(time.RFC3339Nano, value); parseErr == nil {
+					event.RetryAt = &parsed
+				}
+			case "disposition":
+				dispositionSeen = true
+				if value == string(TerminalFailure) || value == string(RetryableFailure) {
+					event.Disposition = value
+				}
+			case "failure_code":
+				if value == protocol.FailureInvalidTask || value == protocol.FailureScopedTest || value == protocol.FailureExecution || value == "max_attempts_exceeded" {
+					event.FailureCode = value
+				}
+			}
+		}
+		if event.Type == "failed" && !dispositionSeen {
+			event.Disposition = "terminal"
 		}
 		timeline.Events = append(timeline.Events, event)
 		ids = append(ids, eventID)

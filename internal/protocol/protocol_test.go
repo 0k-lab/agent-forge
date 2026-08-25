@@ -1,6 +1,8 @@
 package protocol
 
 import (
+	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -31,5 +33,22 @@ func TestValidateCommitAuthorEmailDomain(t *testing.T) {
 		if err := ValidateCommitAuthor("author", email); err != nil {
 			t.Errorf("ValidateCommitAuthor(%q) = %v", email, err)
 		}
+	}
+}
+
+func TestFailureAndHeartbeatMessageContract(t *testing.T) {
+	body, err := json.Marshal(Message{Type: MessageHeartbeat, JobID: "job", AttemptID: "attempt", WorkerID: "worker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != `{"type":"heartbeat","job_id":"job","attempt_id":"attempt","worker_id":"worker"}` {
+		t.Fatalf("heartbeat JSON = %s", body)
+	}
+	if FailureInvalidTask != "invalid_task" || FailureScopedTest != "scoped_test_failed" || FailureExecution != "execution_failed" || DispositionTerminal != "terminal" || DispositionRetryable != "retryable" {
+		t.Fatal("failure constants changed")
+	}
+	body, err = json.Marshal(Message{Type: MessageResult, Error: FailureExecution, Disposition: DispositionRetryable})
+	if err != nil || !bytes.Contains(body, []byte(`"disposition":"retryable"`)) {
+		t.Fatalf("failure JSON = %s, %v", body, err)
 	}
 }

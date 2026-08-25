@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"agent-forge/internal/protocol"
@@ -32,11 +33,56 @@ type pluginResponse struct {
 	Error   string `json:"error,omitempty"`
 }
 
-var errScopedTest = errors.New("scoped test failed")
+var (
+	errInvalidTask = errors.New("invalid task")
+	errScopedTest  = errors.New("scoped test failed")
+)
+
+type WorkerOptions struct {
+	HeartbeatInterval time.Duration
+}
+
+func DefaultWorkerOptions() WorkerOptions { return WorkerOptions{HeartbeatInterval: 10 * time.Second} }
+
+func (o WorkerOptions) Validate() error {
+	if o.HeartbeatInterval <= 0 || o.HeartbeatInterval > time.Hour {
+		return errors.New("heartbeat interval must be positive and at most 1h")
+	}
+	return nil
+}
+
+type invalidTaskError struct{ error }
+
+func (invalidTaskError) Is(target error) bool { return target == errInvalidTask }
+
+func invalidTask(err error) error { return invalidTaskError{err} }
+
+type leaseExecutor func(context.Context, protocol.Message) (string, string, error)
 
 func Run(ctx context.Context, gateURL, workerID, token, pluginPath string, repositoryRoots []string) error {
+	return RunWithOptions(ctx, gateURL, workerID, token, pluginPath, repositoryRoots, DefaultWorkerOptions())
+}
+
+func RunWithOptions(ctx context.Context, gateURL, workerID, token, pluginPath string, repositoryRoots []string, options WorkerOptions) error {
+	if err := options.Validate(); err != nil {
+		return err
+	}
 	roots, err := canonicalRepositoryRoots(repositoryRoots)
 	if err != nil {
+		return err
+	}
+	return runWithExecutor(ctx, gateURL, workerID, token, options, func(ctx context.Context, m protocol.Message) (string, string, error) {
+		if m.Task == nil {
+			result, err := invoke(ctx, pluginPath, pluginRequest{Version: "v1", Input: m.Input})
+			return result, "", err
+		}
+		candidate, err := executeCodingTask(ctx, pluginPath, roots, m.JobID, m.AttemptID, *m.Task)
+		return "", candidate, err
+	})
+}
+
+func runWithExecutor(ctx context.Context, gateURL, workerID, token string, options WorkerOptions, execute leaseExecutor) error {
+	if err := options.Validate(); err != nil {
 		return err
 	}
 	h := http.Header{"Authorization": []string{"Bearer " + token}}
@@ -45,36 +91,76 @@ func Run(ctx context.Context, gateURL, workerID, token, pluginPath string, repos
 		return err
 	}
 	defer c.Close(websocket.StatusNormalClosure, "worker stopping")
+	var writeMu sync.Mutex
 	for {
 		var m protocol.Message
 		if err := wsjson.Read(ctx, c, &m); err != nil {
 			return err
 		}
-		if m.Type != "lease" {
+		if m.Type != protocol.MessageLease {
 			continue
 		}
-		var result, candidateSHA string
-		if m.Task == nil {
-			result, err = invoke(ctx, pluginPath, pluginRequest{Version: "v1", Input: m.Input})
-		} else {
-			candidateSHA, err = executeCodingTask(ctx, pluginPath, roots, m.JobID, m.AttemptID, *m.Task)
+		taskCtx, cancelTask := context.WithCancel(ctx)
+		stopHeartbeat := make(chan struct{})
+		heartbeatDone := make(chan struct{})
+		heartbeatErr := make(chan error, 1)
+		go func() {
+			defer close(heartbeatDone)
+			ticker := time.NewTicker(options.HeartbeatInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopHeartbeat:
+					return
+				case <-ticker.C:
+					writeMu.Lock()
+					err := wsjson.Write(taskCtx, c, protocol.Message{Type: protocol.MessageHeartbeat, JobID: m.JobID, AttemptID: m.AttemptID, WorkerID: workerID})
+					writeMu.Unlock()
+					if err != nil {
+						heartbeatErr <- err
+						cancelTask()
+						return
+					}
+				}
+			}
+		}()
+		result, candidateSHA, executeErr := execute(taskCtx, m)
+		close(stopHeartbeat)
+		<-heartbeatDone
+		select {
+		case err := <-heartbeatErr:
+			cancelTask()
+			return err
+		default:
 		}
-		failure := ""
-		if errors.Is(err, errScopedTest) {
-			failure = "scoped_test_failed"
-		} else if err != nil {
-			failure = "execution_failed"
-		}
-		if err := wsjson.Write(ctx, c, protocol.Message{Type: "result", JobID: m.JobID, AttemptID: m.AttemptID, Result: result, CandidateSHA: candidateSHA, Error: failure}); err != nil {
+		cancelTask()
+		failure, disposition := classifyFailure(executeErr)
+		writeMu.Lock()
+		err = wsjson.Write(ctx, c, protocol.Message{Type: protocol.MessageResult, JobID: m.JobID, AttemptID: m.AttemptID, Result: result, CandidateSHA: candidateSHA, Error: failure, Disposition: disposition})
+		writeMu.Unlock()
+		if err != nil {
 			return err
 		}
 		var ack protocol.Message
 		if err := wsjson.Read(ctx, c, &ack); err != nil {
 			return err
 		}
-		if ack.Type != "ack" {
+		if ack.Type != protocol.MessageAck {
 			return fmt.Errorf("gate rejected result: %s", ack.Error)
 		}
+	}
+}
+
+func classifyFailure(err error) (code, disposition string) {
+	switch {
+	case err == nil:
+		return "", ""
+	case errors.Is(err, errInvalidTask):
+		return protocol.FailureInvalidTask, protocol.DispositionTerminal
+	case errors.Is(err, errScopedTest):
+		return protocol.FailureScopedTest, protocol.DispositionTerminal
+	default:
+		return protocol.FailureExecution, protocol.DispositionRetryable
 	}
 }
 func invoke(parent context.Context, path string, request pluginRequest) (string, error) {
@@ -108,18 +194,18 @@ func invoke(parent context.Context, path string, request pluginRequest) (string,
 
 func executeCodingTask(ctx context.Context, pluginPath string, roots []string, jobID, attemptID string, task protocol.CodingTask) (sha string, err error) {
 	if err := protocol.ValidateCommitAuthor(task.CommitAuthorName, task.CommitAuthorEmail); err != nil {
-		return "", err
+		return "", invalidTask(err)
 	}
 	repository, err := allowedRepository(task.Repository, roots)
 	if err != nil {
-		return "", err
+		return "", invalidTask(err)
 	}
 	ref, err := candidateRef(jobID, attemptID)
 	if err != nil {
-		return "", err
+		return "", invalidTask(err)
 	}
 	if len(task.Tests) == 0 {
-		return "", fmt.Errorf("scoped tests required")
+		return "", invalidTask(errors.New("scoped tests required"))
 	}
 	runtimeDir, err := os.MkdirTemp("", "forge-runtime-")
 	if err != nil {
@@ -162,7 +248,7 @@ func executeCodingTask(ctx context.Context, pluginPath string, roots []string, j
 	}
 	for _, argv := range task.Tests {
 		if len(argv) == 0 {
-			return "", fmt.Errorf("empty test command")
+			return "", invalidTask(errors.New("empty test command"))
 		}
 		commandCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 		cmd := exec.CommandContext(commandCtx, argv[0], argv[1:]...)

@@ -26,10 +26,93 @@ import (
 )
 
 type server struct {
-	store  *store.Store
-	tokens map[string]string
-	owner  string
-	cursor debugCursorCodec
+	store   *store.Store
+	tokens  map[string]string
+	owner   string
+	cursor  debugCursorCodec
+	options Options
+}
+
+type Options struct {
+	Policy            store.RecoveryPolicy
+	RecoveryInterval  time.Duration
+	LeasePollInterval time.Duration
+	Now               func() time.Time
+}
+
+func DefaultOptions() Options {
+	return Options{Policy: store.DefaultRecoveryPolicy(), RecoveryInterval: time.Second, LeasePollInterval: 100 * time.Millisecond, Now: time.Now}
+}
+
+func (o Options) Validate() error {
+	if err := o.Policy.Validate(); err != nil {
+		return err
+	}
+	if o.RecoveryInterval <= 0 || o.RecoveryInterval > o.Policy.LeaseTTL {
+		return errors.New("recovery interval must be positive and not exceed lease TTL")
+	}
+	if o.LeasePollInterval <= 0 || o.LeasePollInterval > time.Minute {
+		return errors.New("lease poll interval must be positive and at most 1m")
+	}
+	if o.Now == nil {
+		return errors.New("clock is required")
+	}
+	return nil
+}
+
+type recoverySweeper interface {
+	SweepExpired(time.Time, store.RecoveryPolicy) error
+}
+
+var errRecoveryTickerStopped = errors.New("recovery ticker stopped")
+
+func RunRecovery(ctx context.Context, s *store.Store, options Options) error {
+	if err := options.Validate(); err != nil {
+		return err
+	}
+	ticker := time.NewTicker(options.RecoveryInterval)
+	defer ticker.Stop()
+	return runRecovery(ctx, s, options.Policy, options.Now, ticker.C)
+}
+
+func StartRecovery(ctx context.Context, s *store.Store, options Options) (<-chan error, error) {
+	if err := options.Validate(); err != nil {
+		return nil, err
+	}
+	if err := s.SweepExpired(options.Now().UTC(), options.Policy); err != nil {
+		return nil, err
+	}
+	ticker := time.NewTicker(options.RecoveryInterval)
+	errs := make(chan error, 1)
+	go func() {
+		defer ticker.Stop()
+		errs <- recoveryLoop(ctx, s, options.Policy, ticker.C)
+		close(errs)
+	}()
+	return errs, nil
+}
+
+func runRecovery(ctx context.Context, s recoverySweeper, policy store.RecoveryPolicy, now func() time.Time, ticks <-chan time.Time) error {
+	if err := s.SweepExpired(now().UTC(), policy); err != nil {
+		return err
+	}
+	return recoveryLoop(ctx, s, policy, ticks)
+}
+
+func recoveryLoop(ctx context.Context, s recoverySweeper, policy store.RecoveryPolicy, ticks <-chan time.Time) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case at, ok := <-ticks:
+			if !ok {
+				return errRecoveryTickerStopped
+			}
+			if err := s.SweepExpired(at.UTC(), policy); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 const (
@@ -101,12 +184,23 @@ func (c debugCursorCodec) decode(cursor, purpose string) (*store.DebugPosition, 
 var debugFiles embed.FS
 
 func NewHandler(s *store.Store, tokens map[string]string, ownerToken string) http.Handler {
+	return newHandler(s, tokens, ownerToken, DefaultOptions())
+}
+
+func NewHandlerWithOptions(s *store.Store, tokens map[string]string, ownerToken string, options Options) (http.Handler, error) {
+	if err := options.Validate(); err != nil {
+		return nil, err
+	}
+	return newHandler(s, tokens, ownerToken, options), nil
+}
+
+func newHandler(s *store.Store, tokens map[string]string, ownerToken string, options Options) http.Handler {
 	for workerToken := range tokens {
 		if subtle.ConstantTimeCompare([]byte(ownerToken), []byte(workerToken)) == 1 {
 			ownerToken = ""
 		}
 	}
-	x := &server{store: s, tokens: tokens, owner: ownerToken, cursor: newDebugCursorCodec(s.DebugCursorKey(ownerToken))}
+	x := &server{store: s, tokens: tokens, owner: ownerToken, cursor: newDebugCursorCodec(s.DebugCursorKey(ownerToken)), options: options}
 	m := http.NewServeMux()
 	m.HandleFunc("POST /v1/jobs", x.ownerAuth(x.submit))
 	m.HandleFunc("GET /v1/jobs/{id}", x.ownerAuth(x.getJob))
@@ -381,20 +475,31 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 	defer x.store.SetWorkerConnected(workerID, false)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	incoming := make(chan protocol.Message)
+	incoming := make(chan protocol.Message, 1)
 	readErr := make(chan error, 1)
 	go func() {
 		for {
 			var m protocol.Message
 			if err := wsjson.Read(ctx, c, &m); err != nil {
-				readErr <- err
+				select {
+				case readErr <- err:
+				case <-ctx.Done():
+				}
 				return
 			}
-			incoming <- m
+			select {
+			case incoming <- m:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(x.options.LeasePollInterval)
 	defer ticker.Stop()
+	var active *store.Lease
+	reject := func() {
+		_ = wsjson.Write(ctx, c, protocol.Message{Type: protocol.MessageError, Error: "request failed"})
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -402,37 +507,73 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 		case <-readErr:
 			return
 		case m := <-incoming:
-			if m.Type != "result" {
-				continue
-			}
-			var err error
-			if m.Error != "" {
-				_, err = x.store.Fail(m.JobID, m.AttemptID, m.Error)
-			} else if m.CandidateSHA != "" {
-				_, err = x.store.CompleteCandidate(m.JobID, m.AttemptID, m.CandidateSHA)
-			} else {
-				_, err = x.store.Complete(m.JobID, m.AttemptID, m.Result)
-			}
-			ack := protocol.Message{Type: "ack", JobID: m.JobID, AttemptID: m.AttemptID}
-			if err != nil {
-				ack.Type = "error"
-				ack.Error = err.Error()
-			}
-			if wsjson.Write(ctx, c, ack) != nil {
+			if active == nil || m.JobID != active.JobID || m.AttemptID != active.AttemptID {
+				reject()
 				return
 			}
+			if m.Type == protocol.MessageHeartbeat {
+				if m.WorkerID != workerID || m.Disposition != "" || m.Error != "" || x.store.Heartbeat(m.JobID, m.AttemptID, workerID, x.options.Now().UTC(), x.options.Policy) != nil {
+					reject()
+					return
+				}
+				continue
+			}
+			if m.Type != protocol.MessageResult || m.WorkerID != "" {
+				reject()
+				return
+			}
+			at := x.options.Now().UTC()
+			var resultErr error
+			if m.Error != "" {
+				disposition, ok := failureDisposition(m.Error)
+				if !ok || m.Disposition != "" && m.Disposition != string(disposition) {
+					reject()
+					return
+				}
+				_, resultErr = x.store.FailAt(m.JobID, m.AttemptID, m.Error, disposition, at, x.options.Policy)
+			} else if m.Disposition != "" {
+				reject()
+				return
+			} else if m.CandidateSHA != "" {
+				_, resultErr = x.store.CompleteCandidateAt(m.JobID, m.AttemptID, m.CandidateSHA, at)
+			} else {
+				_, resultErr = x.store.CompleteAt(m.JobID, m.AttemptID, m.Result, at)
+			}
+			if resultErr != nil {
+				reject()
+				return
+			}
+			if wsjson.Write(ctx, c, protocol.Message{Type: protocol.MessageAck, JobID: m.JobID, AttemptID: m.AttemptID}) != nil {
+				return
+			}
+			active = nil
 		case <-ticker.C:
-			lease, ok, err := x.store.LeaseNext(workerID)
+			if active != nil {
+				continue
+			}
+			lease, ok, err := x.store.LeaseNextAt(workerID, x.options.Now().UTC(), x.options.Policy)
 			if err != nil {
 				return
 			}
 			if !ok {
 				continue
 			}
-			m := protocol.Message{Type: "lease", JobID: lease.JobID, AttemptID: lease.AttemptID, Input: lease.Input, Task: lease.Task}
+			m := protocol.Message{Type: protocol.MessageLease, JobID: lease.JobID, AttemptID: lease.AttemptID, Input: lease.Input, Task: lease.Task}
 			if err := wsjson.Write(ctx, c, m); err != nil {
 				return
 			}
+			active = &lease
 		}
+	}
+}
+
+func failureDisposition(code string) (store.FailureDisposition, bool) {
+	switch code {
+	case protocol.FailureInvalidTask, protocol.FailureScopedTest:
+		return store.TerminalFailure, true
+	case protocol.FailureExecution:
+		return store.RetryableFailure, true
+	default:
+		return "", false
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -208,6 +209,43 @@ func TestDebugTimelineSanitizesSyntheticCompletedJob(t *testing.T) {
 	}
 }
 
+func TestDebugTimelineOmitsUnknownRawEventDetail(t *testing.T) {
+	s := testStore(t)
+	stamp := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
+	if _, err := s.db.Exec(`INSERT INTO jobs(id,input,status,created_at,updated_at) VALUES('job','secret','failed',?,?)`, stamp.Format(time.RFC3339Nano), stamp.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	const detail = "attempt=attempt-1 ordinal=7 lease_expires=2026-02-03T04:06:06Z retry_at=2026-02-03T04:07:06Z failure_code=secret_failure_token disposition=secret-disposition repository=/private/alice/project api_key=unrelated-secret"
+	if _, err := s.db.Exec(`INSERT INTO events(job_id,kind,detail,at) VALUES('job','failed',?,?)`, detail, stamp.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+
+	timeline, err := s.DebugJobTimeline(context.Background(), "job", 100, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(timeline.Events) != 1 {
+		t.Fatalf("events = %#v", timeline.Events)
+	}
+	event := timeline.Events[0]
+	if event.AttemptID != "attempt-1" || event.AttemptOrdinal != 7 || event.LeaseExpiresAt == nil || event.RetryAt == nil {
+		t.Fatalf("known metadata lost: %#v", event)
+	}
+	if event.FailureCode != "" || event.Disposition != "" {
+		t.Fatalf("unknown failure metadata exposed: %#v", event)
+	}
+	body, err := json.Marshal(timeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := fmt.Sprintf("%#v\n%s", timeline, body)
+	for _, private := range []string{"secret_failure_token", "secret-disposition", "/private/alice/project", "unrelated-secret"} {
+		if strings.Contains(got, private) {
+			t.Fatalf("timeline exposed %q: %s", private, got)
+		}
+	}
+}
+
 func testStore(t *testing.T) *Store {
 	t.Helper()
 	s, err := Open(filepath.Join(t.TempDir(), "forge.db"))
@@ -248,6 +286,12 @@ func TestResultIsBoundToLeaseAttemptAndIdempotent(t *testing.T) {
 	}
 	if _, err := s.Complete(job.ID, lease.AttemptID, "DIFFERENT"); err == nil {
 		t.Fatal("mutable duplicate accepted")
+	}
+	if _, err := s.db.Exec(`UPDATE attempts SET failure_code='corrupt' WHERE id=?`, lease.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Complete(job.ID, lease.AttemptID, "HELLO"); err == nil {
+		t.Fatal("duplicate accepted mismatched attempt row")
 	}
 }
 

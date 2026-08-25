@@ -7,15 +7,32 @@ import (
 	"unicode"
 )
 
+const (
+	MessageLease     = "lease"
+	MessageHeartbeat = "heartbeat"
+	MessageResult    = "result"
+	MessageAck       = "ack"
+	MessageError     = "error"
+
+	FailureInvalidTask = "invalid_task"
+	FailureScopedTest  = "scoped_test_failed"
+	FailureExecution   = "execution_failed"
+
+	DispositionTerminal  = "terminal"
+	DispositionRetryable = "retryable"
+)
+
 type Message struct {
 	Type         string      `json:"type"`
 	JobID        string      `json:"job_id,omitempty"`
 	AttemptID    string      `json:"attempt_id,omitempty"`
+	WorkerID     string      `json:"worker_id,omitempty"`
 	Input        string      `json:"input,omitempty"`
 	Task         *CodingTask `json:"task,omitempty"`
 	Result       string      `json:"result,omitempty"`
 	CandidateSHA string      `json:"candidate_sha,omitempty"`
 	Error        string      `json:"error,omitempty"`
+	Disposition  string      `json:"disposition,omitempty"`
 }
 
 type CodingTask struct {

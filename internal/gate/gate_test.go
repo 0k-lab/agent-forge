@@ -12,13 +12,322 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"agent-forge/internal/protocol"
 	"agent-forge/internal/store"
 	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 )
+
+func TestWorkerConnectionHeartbeatFailureAndLaterLease(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	first, _ := s.CreateJob("first")
+	second, _ := s.CreateJob("second")
+	start := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	var clock atomic.Int64
+	clock.Store(start.UnixNano())
+	options := DefaultOptions()
+	options.Policy = store.RecoveryPolicy{LeaseTTL: 10 * time.Second, BaseRetryBackoff: time.Second, MaxAttempts: 3}
+	options.LeasePollInterval = time.Millisecond
+	options.Now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
+	h, err := NewHandlerWithOptions(s, map[string]string{"worker-secret": "worker-1"}, "owner-secret", options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+	c := dialWorker(t, ts.URL, "worker-1", "worker-secret")
+	lease := readMessage(t, c)
+	if lease.Type != protocol.MessageLease || lease.JobID != first.ID {
+		t.Fatalf("first lease = %#v", lease)
+	}
+	clock.Store(start.Add(5 * time.Second).UnixNano())
+	writeMessage(t, c, protocol.Message{Type: protocol.MessageHeartbeat, JobID: lease.JobID, AttemptID: lease.AttemptID, WorkerID: "worker-1"})
+	deadline := time.Now().Add(time.Second)
+	for {
+		attempts, err := s.Attempts(first.ID)
+		if err == nil && len(attempts) == 1 && attempts[0].DeadlineAt.Equal(start.Add(15*time.Second)) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("heartbeat did not extend lease: %#v, %v", attempts, err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	writeMessage(t, c, protocol.Message{Type: protocol.MessageResult, JobID: lease.JobID, AttemptID: lease.AttemptID, Error: protocol.FailureExecution, Disposition: protocol.DispositionRetryable})
+	if ack := readMessage(t, c); ack.Type != protocol.MessageAck {
+		t.Fatalf("failure ack = %#v", ack)
+	}
+	later := readMessage(t, c)
+	if later.Type != protocol.MessageLease || later.JobID != second.ID || later.AttemptID == lease.AttemptID {
+		t.Fatalf("later lease = %#v", later)
+	}
+	writeMessage(t, c, protocol.Message{Type: protocol.MessageResult, JobID: later.JobID, AttemptID: later.AttemptID, Result: "done"})
+	if ack := readMessage(t, c); ack.Type != protocol.MessageAck {
+		t.Fatalf("success ack = %#v", ack)
+	}
+	if job, err := s.Job(first.ID); err != nil || job.Status != "retry_wait" {
+		t.Fatalf("retry job = %#v, %v", job, err)
+	}
+	if job, err := s.Job(second.ID); err != nil || job.Status != "succeeded" {
+		t.Fatalf("later job = %#v, %v", job, err)
+	}
+	c.CloseNow()
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if worker, err := s.Worker("worker-1"); err == nil && !worker.Connected {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("worker connection did not close")
+}
+
+func TestWorkerConnectionRejectsMismatchedLeaseMessagesGenerically(t *testing.T) {
+	for name, bad := range map[string]func(protocol.Message) protocol.Message{
+		"job":     func(m protocol.Message) protocol.Message { m.JobID = "wrong"; return m },
+		"attempt": func(m protocol.Message) protocol.Message { m.AttemptID = "wrong"; return m },
+		"worker":  func(m protocol.Message) protocol.Message { m.WorkerID = "worker-2"; return m },
+		"disposition": func(m protocol.Message) protocol.Message {
+			m.Type, m.Error, m.Disposition = protocol.MessageResult, protocol.FailureExecution, protocol.DispositionTerminal
+			return m
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			if _, err := s.CreateJob("work"); err != nil {
+				t.Fatal(err)
+			}
+			options := DefaultOptions()
+			options.LeasePollInterval = time.Millisecond
+			h, err := NewHandlerWithOptions(s, map[string]string{"worker-secret": "worker-1"}, "owner-secret", options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ts := httptest.NewServer(h)
+			defer ts.Close()
+			c := dialWorker(t, ts.URL, "worker-1", "worker-secret")
+			lease := readMessage(t, c)
+			message := protocol.Message{Type: protocol.MessageHeartbeat, JobID: lease.JobID, AttemptID: lease.AttemptID, WorkerID: "worker-1"}
+			writeMessage(t, c, bad(message))
+			got := readMessage(t, c)
+			if got.Type != protocol.MessageError || got.Error != "request failed" || got.JobID != "" || got.AttemptID != "" {
+				t.Fatalf("error = %#v", got)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := wsjson.Read(ctx, c, &got); err == nil {
+				t.Fatal("stale connection remained open")
+			}
+			waitWorkerDisconnected(t, s, "worker-1")
+		})
+	}
+}
+
+func TestGateOwnsBoundedFailurePolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name, code, disposition, status, attemptStatus string
+		maxAttempts                                    int
+	}{
+		{"invalid", protocol.FailureInvalidTask, protocol.DispositionTerminal, "failed", "terminal_failed", 3},
+		{"scoped legacy", protocol.FailureScopedTest, "", "failed", "terminal_failed", 3},
+		{"execution", protocol.FailureExecution, protocol.DispositionRetryable, "retry_wait", "retryable_failed", 3},
+		{"max attempts", protocol.FailureExecution, protocol.DispositionRetryable, "failed", "retryable_failed", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			job, err := s.CreateJob("work")
+			if err != nil {
+				t.Fatal(err)
+			}
+			options := DefaultOptions()
+			options.Policy.MaxAttempts = tc.maxAttempts
+			options.LeasePollInterval = time.Millisecond
+			h, err := NewHandlerWithOptions(s, map[string]string{"token": "worker"}, "owner", options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ts := httptest.NewServer(h)
+			defer ts.Close()
+			c := dialWorker(t, ts.URL, "worker", "token")
+			lease := readMessage(t, c)
+			writeMessage(t, c, protocol.Message{Type: protocol.MessageResult, JobID: lease.JobID, AttemptID: lease.AttemptID, Error: tc.code, Disposition: tc.disposition})
+			if ack := readMessage(t, c); ack.Type != protocol.MessageAck {
+				t.Fatalf("ack = %#v", ack)
+			}
+			c.CloseNow()
+			stored, err := s.Job(job.ID)
+			if err != nil || stored.Status != tc.status {
+				t.Fatalf("job = %#v, %v", stored, err)
+			}
+			attempts, err := s.Attempts(job.ID)
+			if err != nil || len(attempts) != 1 || attempts[0].Status != tc.attemptStatus {
+				t.Fatalf("attempts = %#v, %v", attempts, err)
+			}
+		})
+	}
+
+	t.Run("unknown code", func(t *testing.T) {
+		s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		job, _ := s.CreateJob("work")
+		options := DefaultOptions()
+		options.LeasePollInterval = time.Millisecond
+		h, _ := NewHandlerWithOptions(s, map[string]string{"token": "worker"}, "owner", options)
+		ts := httptest.NewServer(h)
+		defer ts.Close()
+		c := dialWorker(t, ts.URL, "worker", "token")
+		lease := readMessage(t, c)
+		writeMessage(t, c, protocol.Message{Type: protocol.MessageResult, JobID: lease.JobID, AttemptID: lease.AttemptID, Error: "invented", Disposition: protocol.DispositionRetryable})
+		if got := readMessage(t, c); got.Type != protocol.MessageError || got.Error != "request failed" {
+			t.Fatalf("error = %#v", got)
+		}
+		stored, _ := s.Job(job.ID)
+		attempts, _ := s.Attempts(job.ID)
+		if stored.Status != "leased" || len(attempts) != 1 || attempts[0].Status != "leased" {
+			t.Fatalf("unknown consumed attempt: %#v %#v", stored, attempts)
+		}
+	})
+}
+
+func TestGateRestartRecoversLeaseAndRejectsLateOldResult(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "forge.db")
+	start := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	var clock atomic.Int64
+	clock.Store(start.UnixNano())
+	options := DefaultOptions()
+	options.Policy = store.RecoveryPolicy{LeaseTTL: 20 * time.Millisecond, BaseRetryBackoff: 10 * time.Millisecond, MaxAttempts: 3}
+	options.RecoveryInterval = 10 * time.Millisecond
+	options.LeasePollInterval = time.Millisecond
+	options.Now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
+
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _ := s.CreateJob("work")
+	h, _ := NewHandlerWithOptions(s, map[string]string{"token": "worker"}, "owner", options)
+	ts := httptest.NewServer(h)
+	c := dialWorker(t, ts.URL, "worker", "token")
+	old := readMessage(t, c)
+	c.CloseNow()
+	ts.Close()
+	waitWorkerDisconnected(t, s, "worker")
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	clock.Store(start.Add(options.Policy.LeaseTTL).UnixNano())
+	s, err = store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	recoveryErr, err := StartRecovery(ctx, s, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); <-recoveryErr }()
+	if attempts, err := s.Attempts(job.ID); err != nil || len(attempts) != 1 || attempts[0].ID != old.AttemptID || attempts[0].Status != "expired" {
+		t.Fatalf("recovered attempts = %#v, %v", attempts, err)
+	}
+
+	h, _ = NewHandlerWithOptions(s, map[string]string{"token": "worker"}, "owner", options)
+	ts = httptest.NewServer(h)
+	defer ts.Close()
+	early := dialWorker(t, ts.URL, "worker", "token")
+	readCtx, readCancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
+	var message protocol.Message
+	if err := wsjson.Read(readCtx, early, &message); err == nil {
+		t.Fatalf("retry leased early: %#v", message)
+	}
+	readCancel()
+	early.CloseNow()
+	waitWorkerDisconnected(t, s, "worker")
+	clock.Store(start.Add(options.Policy.LeaseTTL + options.Policy.BaseRetryBackoff).UnixNano())
+	c = dialWorker(t, ts.URL, "worker", "token")
+	defer c.CloseNow()
+	current := readMessage(t, c)
+	if current.AttemptID == old.AttemptID {
+		t.Fatalf("attempt reused: %#v", current)
+	}
+	writeMessage(t, c, protocol.Message{Type: protocol.MessageResult, JobID: current.JobID, AttemptID: current.AttemptID, Result: "done"})
+	if ack := readMessage(t, c); ack.Type != protocol.MessageAck {
+		t.Fatalf("new result ack = %#v", ack)
+	}
+	writeMessage(t, c, protocol.Message{Type: protocol.MessageResult, JobID: old.JobID, AttemptID: old.AttemptID, Result: "late"})
+	if rejected := readMessage(t, c); rejected.Type != protocol.MessageError || rejected.Error != "request failed" {
+		t.Fatalf("late result = %#v", rejected)
+	}
+	waitWorkerDisconnected(t, s, "worker")
+	attempts, err := s.Attempts(job.ID)
+	if err != nil || len(attempts) != 2 || attempts[0].Ordinal != 1 || attempts[0].Status != "expired" || attempts[1].Ordinal != 2 || attempts[1].Status != "succeeded" {
+		t.Fatalf("attempt history = %#v, %v", attempts, err)
+	}
+}
+
+func dialWorker(t *testing.T, serverURL, workerID, token string) *websocket.Conn {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	h := http.Header{"Authorization": []string{"Bearer " + token}}
+	c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(serverURL, "http")+"/v1/workers/connect?worker_id="+workerID, &websocket.DialOptions{HTTPHeader: h})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func readMessage(t *testing.T, c *websocket.Conn) protocol.Message {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var m protocol.Message
+	if err := wsjson.Read(ctx, c, &m); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func writeMessage(t *testing.T, c *websocket.Conn, m protocol.Message) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := wsjson.Write(ctx, c, m); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitWorkerDisconnected(t *testing.T, s *store.Store, workerID string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if worker, err := s.Worker(workerID); err == nil && !worker.Connected {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("worker connection did not close")
+}
 
 func TestDebugCursorsAreAuthenticatedScopedAndStableAcrossRestart(t *testing.T) {
 	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
