@@ -16,13 +16,14 @@ cleanup() {
   [ -z "$GATE_PID" ] || wait "$GATE_PID" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
-FORGE_OWNER_TOKEN=$OWNER_TOKEN FORGE_WORKER_TOKEN=$WORKER_TOKEN "$ROOT/bin/forge-gate" -addr 127.0.0.1:18080 -db "$RUN/forge.db" -worker-id worker-1 >"$RUN/gate.log" 2>&1 &
+python3 "$ROOT/scripts/write-configs.py" "$RUN/gate.json" "$RUN/worker.json" 127.0.0.1:18080 "$RUN/forge.db" ws://127.0.0.1:18080 worker-1 unused - reference "$ROOT/bin/forge-ref-plugin" 30s 1s 3 10s
+FORGE_OWNER_TOKEN=$OWNER_TOKEN FORGE_WORKER_TOKEN=$WORKER_TOKEN "$ROOT/bin/forge-gate" -config "$RUN/gate.json" >"$RUN/gate.log" 2>&1 &
 GATE_PID=$!
 i=0
 until curl -sS -o /dev/null -H "Authorization: Bearer $OWNER_TOKEN" http://127.0.0.1:18080/v1/workers/worker-1 2>/dev/null; do
   i=$((i+1)); [ "$i" -lt 50 ] || { echo "gate failed to become ready"; exit 1; }; sleep 0.1
 done
-FORGE_WORKER_TOKEN=$WORKER_TOKEN "$ROOT/bin/forge-worker" -gate ws://127.0.0.1:18080 -id worker-1 -plugin "$ROOT/bin/forge-ref-plugin" >"$RUN/worker.log" 2>&1 &
+FORGE_WORKER_TOKEN=$WORKER_TOKEN "$ROOT/bin/forge-worker" -config "$RUN/worker.json" >"$RUN/worker.log" 2>&1 &
 WORKER_PID=$!
 i=0
 until curl -fsS -H "Authorization: Bearer $OWNER_TOKEN" http://127.0.0.1:18080/v1/workers/worker-1 2>/dev/null | python3 -c 'import json,sys; assert json.load(sys.stdin)["connected"]' 2>/dev/null; do

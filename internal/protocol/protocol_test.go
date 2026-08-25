@@ -291,3 +291,21 @@ func TestEvidenceOutputRedactionMarkerRecognizesReservedMarkers(t *testing.T) {
 		t.Fatalf("safe output marker = %q, %v", marker, ok)
 	}
 }
+
+func TestValidateBranchNameMatchesGitCheckRefFormat(t *testing.T) {
+	for _, branch := range []string{"main", "feature/nested-topic", "release/v1.2.3"} {
+		if err := ValidateBranchName(branch); err != nil {
+			t.Errorf("valid branch %q: %v", branch, err)
+		}
+	}
+	for _, branch := range []string{
+		"", "@", ".hidden", "topic.lock", "topic/.hidden", "-leading", "topic\x00control", "topic\x7fdel",
+		"topic/./leaf", "topic/.lock/leaf", "topic//leaf", "topic..leaf", "topic@{leaf", "topic\\leaf",
+		"topic leaf", "topic~leaf", "topic^leaf", "topic:leaf", "topic?leaf", "topic*leaf", "topic[leaf",
+		"/topic", "topic/", "topic.",
+	} {
+		if err := ValidateBranchName(branch); err == nil {
+			t.Errorf("accepted invalid branch %q", branch)
+		}
+	}
+}

@@ -134,10 +134,12 @@ type Message struct {
 	Error        string            `json:"error,omitempty"`
 	Disposition  string            `json:"disposition,omitempty"`
 	Evidence     []AttemptEvidence `json:"evidence,omitempty"`
+	Policy       *ResolvedPolicy   `json:"policy,omitempty"`
 }
 
 type CodingTask struct {
-	Repository        string     `json:"repository"`
+	RepositoryID      string     `json:"repository_id,omitempty"`
+	Repository        string     `json:"repository,omitempty"`
 	BaseSHA           string     `json:"base_sha"`
 	Instruction       string     `json:"instruction"`
 	Tests             [][]string `json:"tests"`

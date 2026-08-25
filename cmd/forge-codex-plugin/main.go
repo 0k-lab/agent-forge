@@ -8,7 +8,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sync"
 	"time"
+
+	"agent-forge/internal/processtree"
 )
 
 type request struct {
@@ -52,11 +55,12 @@ func run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	prompt := "Edit files in the provided workspace to complete the task. Do not run tests, use git, commit, or access paths outside the workspace.\n\nTask:\n" + r.Instruction
-	cmd := exec.CommandContext(ctx, bin, "exec", "--ephemeral", "--sandbox", "workspace-write", "--color", "never", "-C", r.Workspace, "-")
+	cmd := exec.Command(bin, "exec", "--ephemeral", "--sandbox", "workspace-write", "--color", "never", "-C", r.Workspace, "-")
 	cmd.Stdin = bytes.NewBufferString(prompt)
-	cmd.Stdout = &limitedWriter{n: 1 << 20}
-	cmd.Stderr = &limitedWriter{n: 1 << 20}
-	if err := cmd.Run(); err != nil {
+	budget := &outputBudget{n: 1 << 20}
+	cmd.Stdout = &limitedWriter{budget: budget}
+	cmd.Stderr = &limitedWriter{budget: budget}
+	if err := processtree.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("codex_failed")
 	}
 	after, err := gitHead(r.Workspace)
@@ -67,16 +71,36 @@ func run() error {
 }
 
 func gitHead(workspace string) (string, error) {
-	returnOutput, err := exec.Command("git", "-C", workspace, "rev-parse", "HEAD").Output()
-	return string(bytes.TrimSpace(returnOutput)), err
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	cmd := exec.Command("git", "-C", workspace, "rev-parse", "HEAD")
+	var returnOutput bytes.Buffer
+	budget := &outputBudget{n: 1 << 20}
+	cmd.Stdout = &limitedWriter{w: &returnOutput, budget: budget}
+	cmd.Stderr = &limitedWriter{budget: budget}
+	err := processtree.Run(ctx, cmd)
+	return string(bytes.TrimSpace(returnOutput.Bytes())), err
 }
 
-type limitedWriter struct{ n int64 }
+type outputBudget struct {
+	mu sync.Mutex
+	n  int64
+}
+
+type limitedWriter struct {
+	w      io.Writer
+	budget *outputBudget
+}
 
 func (l *limitedWriter) Write(p []byte) (int, error) {
-	if int64(len(p)) > l.n {
+	l.budget.mu.Lock()
+	defer l.budget.mu.Unlock()
+	if int64(len(p)) > l.budget.n {
 		return 0, fmt.Errorf("output_limit")
 	}
-	l.n -= int64(len(p))
-	return len(p), nil
+	l.budget.n -= int64(len(p))
+	if l.w == nil {
+		return len(p), nil
+	}
+	return l.w.Write(p)
 }
