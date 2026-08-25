@@ -5,6 +5,7 @@ package pluginprotocol
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -12,6 +13,22 @@ import (
 	"testing"
 	"time"
 )
+
+func TestRunCancellationWinsTargetStartupRace(t *testing.T) {
+	plugin := filepath.Join(t.TempDir(), "plugin")
+	if err := os.WriteFile(plugin, []byte("#!/definitely/missing/interpreter\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env := make([]string, 1024)
+	for i := range env {
+		env[i] = fmt.Sprintf("PADDING_%d=%s", i, strings.Repeat("x", 1024))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	if _, err := Run(ctx, []string{plugin}, Request{Operation: Text, Input: "x"}, Options{Timeout: time.Second, OutputBytes: 1 << 20, Environment: env}); !errors.Is(err, ErrCancelled) {
+		t.Fatalf("Run = %v, want cancellation", err)
+	}
+}
 
 func TestRunCleansDetachedDescendantAfterSuccess(t *testing.T) {
 	for _, setsid := range []string{"False", "True"} {

@@ -18,6 +18,34 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func TestRunInvocationConcurrentStartFailures(t *testing.T) {
+	plugin := filepath.Join(t.TempDir(), "plugin")
+	if err := os.WriteFile(plugin, []byte("#!/definitely/missing/interpreter\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	errs := make(chan error, 20)
+	for i := range 20 {
+		go func() {
+			cmd := exec.Command("/bin/sh", "-c", "exit 127")
+			wantStart := i%2 == 0
+			if wantStart {
+				cmd = exec.Command(plugin)
+			}
+			err := RunInvocation(context.Background(), cmd)
+			if errors.Is(err, ErrStart) != wantStart {
+				errs <- fmt.Errorf("RunInvocation = %T %v, want start failure %t", err, err, wantStart)
+				return
+			}
+			errs <- nil
+		}()
+	}
+	for range 20 {
+		if err := <-errs; err != nil {
+			t.Error(err)
+		}
+	}
+}
+
 func TestRunTimeoutKillsSetsidDescendant(t *testing.T) {
 	for range 10 {
 		if err := runSetsidTimeout(t.TempDir()); err != nil {

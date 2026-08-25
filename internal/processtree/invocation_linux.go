@@ -2,6 +2,8 @@ package processtree
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
@@ -12,19 +14,29 @@ import (
 )
 
 const invocationWrapperArg = "__agent_forge_invocation_wrapper_7f21d8c4"
+const invocationStartFailed byte = 1
 
 func init() {
-	if len(os.Args) < 4 || os.Args[1] != invocationWrapperArg {
+	if len(os.Args) < 5 || os.Args[1] != invocationWrapperArg {
 		return
 	}
+	statusFD, err := strconv.Atoi(os.Args[2])
+	if err != nil || statusFD < 3 {
+		os.Exit(127)
+	}
+	status := os.NewFile(uintptr(statusFD), "invocation-status")
+	unix.CloseOnExec(statusFD)
 	if unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != nil {
 		os.Exit(127)
 	}
-	cmd := &exec.Cmd{Path: os.Args[2], Args: os.Args[3:], Env: os.Environ(), Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr}
+	cmd := &exec.Cmd{Path: os.Args[3], Args: os.Args[4:], Env: os.Environ(), Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr}
 	if cmd.Start() != nil {
+		_, _ = status.Write([]byte{invocationStartFailed})
+		_ = status.Close()
 		os.Exit(127)
 	}
-	err := cmd.Wait()
+	_ = status.Close()
+	err = cmd.Wait()
 	unclean := invocationHoldsOutput(os.Getpid())
 	cleanupInvocation(os.Getpid())
 	if unclean {
@@ -41,19 +53,42 @@ func init() {
 
 func RunInvocation(ctx context.Context, cmd *exec.Cmd) error {
 	if cmd.Err != nil {
-		return cmd.Err
+		return fmt.Errorf("%w: %v", ErrStart, cmd.Err)
 	}
 	info, err := os.Stat(cmd.Path)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
-		return &os.PathError{Op: "fork/exec", Path: cmd.Path, Err: syscall.ENOENT}
+		return fmt.Errorf("%w: %v", ErrStart, &os.PathError{Op: "fork/exec", Path: cmd.Path, Err: syscall.ENOENT})
 	}
 	executable, err := os.Executable()
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrStart, err)
 	}
-	args := append([]string{executable, invocationWrapperArg, cmd.Path}, cmd.Args...)
+	statusReader, statusWriter, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrStart, err)
+	}
+	defer statusReader.Close()
+	statusFD := 3 + len(cmd.ExtraFiles)
+	cmd.ExtraFiles = append(append([]*os.File(nil), cmd.ExtraFiles...), statusWriter)
+	args := append([]string{executable, invocationWrapperArg, strconv.Itoa(statusFD), cmd.Path}, cmd.Args...)
 	cmd.Path, cmd.Args, cmd.Env = executable, args, invocationWrapperEnvironment(cmd.Env)
-	return Run(ctx, cmd)
+	runErr := Run(ctx, cmd)
+	_ = statusWriter.Close()
+	_ = statusReader.SetReadDeadline(time.Now().Add(cleanupGrace))
+	var marker [1]byte
+	n, _ := statusReader.Read(marker[:])
+	if n == 1 && marker[0] == invocationStartFailed {
+		return ErrStart
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	var execErr *exec.Error
+	var pathErr *os.PathError
+	if errors.As(runErr, &execErr) || errors.As(runErr, &pathErr) {
+		return fmt.Errorf("%w: %v", ErrStart, runErr)
+	}
+	return runErr
 }
 
 func invocationHoldsOutput(root int) bool {

@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -34,6 +33,9 @@ type exchangeResponse struct {
 }
 
 func Run(parent context.Context, argv []string, request Request, options Options) (Result, error) {
+	if parent.Err() != nil {
+		return Result{}, ErrCancelled
+	}
 	if len(argv) == 0 || len(argv) > 64 || argv[0] == "" || options.Timeout <= 0 || options.OutputBytes <= 0 || !validRequestPayload(request) {
 		return Result{}, ErrStart
 	}
@@ -53,6 +55,9 @@ func Run(parent context.Context, argv []string, request Request, options Options
 	}
 	ctx, cancel := context.WithTimeout(parent, options.Timeout)
 	defer cancel()
+	if ctx.Err() != nil {
+		return Result{}, ErrCancelled
+	}
 	processCtx, stopProcess := context.WithCancel(context.Background())
 	defer stopProcess()
 	cmd := exec.Command(argv[0], argv[1:]...)
@@ -82,6 +87,10 @@ func Run(parent context.Context, argv []string, request Request, options Options
 	case response := <-exchangeDone:
 		result, exchangeErr = response.result, response.err
 	case <-budget.exceeded:
+		if ctx.Err() != nil {
+			abortRun(stopProcess, stdin, stdoutReader, processDone, exchangeDone)
+			return Result{}, ErrCancelled
+		}
 		abortRun(stopProcess, stdin, stdoutReader, processDone, exchangeDone)
 		return Result{}, errors.New("plugin protocol failed")
 	case <-ctx.Done():
@@ -93,18 +102,21 @@ func Run(parent context.Context, argv []string, request Request, options Options
 		case <-budget.exceeded:
 			timer.Stop()
 			abortRun(stopProcess, stdin, stdoutReader, processDone, exchangeDone)
-			return Result{}, errors.New("plugin protocol failed")
+			return Result{}, ErrCancelled
 		case <-timer.C:
 			abortRun(stopProcess, stdin, stdoutReader, processDone, exchangeDone)
 			return Result{}, ErrCancelled
 		}
+		abortRun(stopProcess, stdin, stdoutReader, processDone, nil)
+		return Result{}, ErrCancelled
 	}
 	_ = stdin.Close()
 	if exchangeErr != nil && !errors.Is(exchangeErr, ErrOperation) {
 		processErr := abortRun(stopProcess, stdin, stdoutReader, processDone, nil)
-		var execErr *exec.Error
-		var pathErr *os.PathError
-		if errors.As(processErr, &execErr) || errors.As(processErr, &pathErr) {
+		if ctx.Err() != nil {
+			return Result{}, ErrCancelled
+		}
+		if errors.Is(processErr, processtree.ErrStart) {
 			return Result{}, ErrStart
 		}
 		if errors.Is(exchangeErr, errCancelSent) || errors.Is(exchangeErr, ErrCancelled) {
@@ -128,16 +140,26 @@ func Run(parent context.Context, argv []string, request Request, options Options
 			processDone = nil
 			if processErr != nil {
 				abortRun(stopProcess, stdin, stdoutReader, nil, nil)
+				if ctx.Err() != nil {
+					return Result{}, ErrCancelled
+				}
 				return Result{}, errors.New("plugin protocol failed")
 			}
 		case clean := <-tailDone:
 			if !clean {
 				abortRun(stopProcess, stdin, stdoutReader, processDone, nil)
+				if ctx.Err() != nil {
+					return Result{}, ErrCancelled
+				}
 				return Result{}, errors.New("plugin protocol failed")
 			}
 			cleanEOF = true
 			tailDone = nil
 		case <-budget.exceeded:
+			if ctx.Err() != nil {
+				abortRun(stopProcess, stdin, stdoutReader, processDone, nil)
+				return Result{}, ErrCancelled
+			}
 			abortRun(stopProcess, stdin, stdoutReader, processDone, nil)
 			return Result{}, errors.New("plugin protocol failed")
 		case <-ctx.Done():
@@ -145,6 +167,9 @@ func Run(parent context.Context, argv []string, request Request, options Options
 			return Result{}, ErrCancelled
 		case <-timer.C:
 			abortRun(stopProcess, stdin, stdoutReader, processDone, nil)
+			if ctx.Err() != nil {
+				return Result{}, ErrCancelled
+			}
 			return Result{}, errors.New("plugin protocol failed")
 		}
 	}

@@ -3,11 +3,13 @@ package pluginprotocol
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -171,6 +173,61 @@ time.sleep(10)
 	}
 }
 
+func TestRunCancellationInterruptsMarkerSynchronizedBlockedExecuteWrite(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "initialized")
+	plugin := pythonPlugin(t, `
+import json,pathlib,sys,time
+init=json.loads(sys.stdin.readline())
+print(json.dumps({"version":"v1","id":init["id"],"type":"initialized","capabilities":["workspace_edit"]},separators=(",",":")),flush=True)
+pathlib.Path(`+strconv.Quote(marker)+`).write_text("initialized")
+time.sleep(10)
+`)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := Run(ctx, []string{plugin}, Request{Operation: WorkspaceEdit, Workspace: "/work", Instruction: strings.Repeat("\x01", MaxTextBytes), TimeoutMS: 1000}, Options{Timeout: 5 * time.Second, OutputBytes: 1 << 20})
+		done <- err
+	}()
+	waitForFile(t, marker)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrCancelled) {
+			t.Fatalf("Run = %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not stop after cancellation")
+	}
+}
+
+func TestRunCancellationDuringStartup(t *testing.T) {
+	plugin := pythonPlugin(t, `
+import time
+time.sleep(10)
+`)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	if _, err := Run(ctx, []string{plugin}, Request{Operation: Text, Input: "x"}, Options{Timeout: time.Second, OutputBytes: 1 << 20}); !errors.Is(err, ErrCancelled) {
+		t.Fatalf("Run = %v, want cancellation", err)
+	}
+}
+
+func TestRunAlreadyCancelledDoesNotStartPlugin(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "started")
+	plugin := pythonPlugin(t, `
+import pathlib
+pathlib.Path(`+strconv.Quote(marker)+`).write_text("started")
+`)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := Run(ctx, []string{plugin}, Request{Operation: Text, Input: "x"}, Options{Timeout: time.Second, OutputBytes: 1 << 20}); !errors.Is(err, ErrCancelled) {
+		t.Fatalf("Run = %v, want cancellation", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("cancelled Run started plugin: %v", err)
+	}
+}
+
 func TestRunCancellationDuringTerminalDrain(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "terminal")
 	plugin := pythonPlugin(t, `
@@ -285,6 +342,78 @@ print(json.dumps({"version":"v1","id":init["id"],"type":"result"},separators=(",
 	defer cancel()
 	if _, err := Run(ctx, []string{plugin}, Request{Operation: WorkspaceEdit, Workspace: "/work", Instruction: "edit", TimeoutMS: 1000}, Options{Timeout: time.Second, OutputBytes: 1 << 20, Capabilities: []Capability{Cancel}}); !errors.Is(err, ErrCancelled) {
 		t.Fatalf("cancel/success race = %v, want cancelled", err)
+	}
+}
+
+func TestRunMissingInterpreterIsStartFailure(t *testing.T) {
+	plugin := filepath.Join(t.TempDir(), "plugin")
+	if err := os.WriteFile(plugin, []byte("#!/definitely/missing/interpreter\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(context.Background(), []string{plugin}, Request{Operation: Text, Input: "x"}, Options{Timeout: time.Second, OutputBytes: 1 << 20}); !errors.Is(err, ErrStart) {
+		t.Fatalf("Run = %v, want start failure", err)
+	}
+}
+
+func TestRunMissingExecutableIsStartFailure(t *testing.T) {
+	plugin := filepath.Join(t.TempDir(), "missing")
+	if _, err := Run(context.Background(), []string{plugin}, Request{Operation: Text, Input: "x"}, Options{Timeout: time.Second, OutputBytes: 1 << 20}); !errors.Is(err, ErrStart) {
+		t.Fatalf("Run = %v, want start failure", err)
+	}
+}
+
+func TestRunExit127IsNotStartFailure(t *testing.T) {
+	plugin := pythonPlugin(t, `raise SystemExit(127)`)
+	if _, err := Run(context.Background(), []string{plugin}, Request{Operation: Text, Input: "x"}, Options{Timeout: time.Second, OutputBytes: 1 << 20}); err == nil || errors.Is(err, ErrStart) {
+		t.Fatalf("Run = %v, want non-start protocol failure", err)
+	}
+}
+
+func TestRunConcurrentStartupStatusesDoNotCross(t *testing.T) {
+	openFDs := -1
+	if runtime.GOOS == "linux" {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Fatal(err)
+		}
+		openFDs = len(entries)
+	}
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing-interpreter")
+	if err := os.WriteFile(missing, []byte("#!/definitely/missing/interpreter\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	exit127 := pythonPlugin(t, `raise SystemExit(127)`)
+	var wg sync.WaitGroup
+	errs := make(chan string, 20)
+	for i := range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			plugin := exit127
+			wantStart := i%2 == 0
+			if wantStart {
+				plugin = missing
+			}
+			_, err := Run(context.Background(), []string{plugin}, Request{Operation: Text, Input: "x"}, Options{Timeout: 5 * time.Second, OutputBytes: 1 << 20})
+			if errors.Is(err, ErrStart) != wantStart {
+				errs <- fmt.Sprintf("invocation %d: Run = %T %v, want start failure %t", i, err, err, wantStart)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if openFDs >= 0 {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) > openFDs {
+			t.Fatalf("open file descriptors = %d, want at most %d", len(entries), openFDs)
+		}
 	}
 }
 
