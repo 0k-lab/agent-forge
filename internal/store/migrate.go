@@ -4,18 +4,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 )
 
 const schemaVersion = 3
 
-var migrationMu sync.Mutex
-
 func migrate(db *sql.DB) error {
-	// ponytail: process-local lock; use a cross-process migration lock if multiple Gates ever share one database.
-	migrationMu.Lock()
-	defer migrationMu.Unlock()
 	var version int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version < 0 || version > schemaVersion {
 		return errors.New("unsupported database schema")

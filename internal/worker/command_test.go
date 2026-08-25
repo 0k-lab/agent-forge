@@ -16,14 +16,14 @@ func TestCommandTimeoutKillsDescendantPipeHolders(t *testing.T) {
 		t.Skip("process groups are Unix-specific")
 	}
 	tests := map[string]func(*testing.T, string){
-		"plugin": func(t *testing.T, pidFile string) {
+		"plugin setsid escape": func(t *testing.T, pidFile string) {
 			started := time.Now()
-			_, err := invokeLocal(context.Background(), []string{"/bin/sh", "-c", `sleep 2 & echo $! > "$PID_FILE"; wait`}, pluginRequest{Version: "v1"}, 20*time.Millisecond, 1024, []string{"PID_FILE=" + pidFile})
+			_, err := invokeLocal(context.Background(), []string{"/bin/sh", "-c", `setsid /bin/sh -c 'echo $$ > "$PID_FILE"; sleep 3' & wait`}, pluginRequest{Version: "v1"}, 20*time.Millisecond, 1024, []string{"PID_FILE=" + pidFile})
 			assertTimedOutTree(t, started, pidFile, err)
 		},
-		"scoped check": func(t *testing.T, pidFile string) {
+		"scoped check setsid escape": func(t *testing.T, pidFile string) {
 			started := time.Now()
-			result := runScopedCheckLocal(context.Background(), t.TempDir(), []string{"PID_FILE=" + pidFile}, []string{"/bin/sh", "-c", `sleep 2 & echo $! > "$PID_FILE"; wait`}, 20*time.Millisecond, 1024)
+			result := runScopedCheckLocal(context.Background(), t.TempDir(), []string{"PID_FILE=" + pidFile}, []string{"/bin/sh", "-c", `setsid /bin/sh -c 'echo $$ > "$PID_FILE"; sleep 3' & wait`}, 20*time.Millisecond, 1024)
 			assertTimedOutTree(t, started, pidFile, result.err)
 			if !result.timedOut {
 				t.Fatal("scoped check did not retain timeout classification")

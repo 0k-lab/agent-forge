@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"agent-forge/internal/protocol"
@@ -22,6 +23,8 @@ type Store struct {
 	db                *sql.DB
 	debugCursorSecret [32]byte
 }
+
+var initializationMu sync.Mutex
 
 type RecoveryPolicy struct {
 	LeaseTTL         time.Duration
@@ -119,6 +122,9 @@ type Worker struct {
 }
 
 func Open(path string) (_ *Store, retErr error) {
+	// ponytail: process-local serialization; use a cross-process lock if multiple Gates ever initialize one database.
+	initializationMu.Lock()
+	defer initializationMu.Unlock()
 	dsn, err := parseSQLiteDSN(path)
 	if err != nil {
 		return nil, err
