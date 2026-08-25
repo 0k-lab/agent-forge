@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -79,7 +80,7 @@ func testRecoveryPolicy() RecoveryPolicy {
 }
 
 func TestRecoverySurvivesReopen(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "forge.db")
+	path := filepath.Join(secureTempDir(t), "forge.db")
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -288,7 +289,7 @@ func TestRetryableFailureRetriesUntilMaxAttempts(t *testing.T) {
 }
 
 func TestRetryBudgetDecreaseAfterRestartFailsWaitingJob(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "forge.db")
+	path := filepath.Join(secureTempDir(t), "forge.db")
 	start := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	oldPolicy := testRecoveryPolicy()
 	s, err := Open(path)
@@ -535,7 +536,7 @@ func TestSchemaRejectsSecondActiveAttemptForJob(t *testing.T) {
 }
 
 func TestLegacyDatabaseMigratesActiveLease(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "legacy.db")
+	path := filepath.Join(secureTempDir(t), "legacy.db")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
@@ -547,6 +548,9 @@ func TestLegacyDatabaseMigratesActiveLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	s, err := Open(path)

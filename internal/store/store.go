@@ -105,8 +105,24 @@ type Worker struct {
 	LastSeen  time.Time `json:"last_seen"`
 }
 
-func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+func Open(path string) (_ *Store, retErr error) {
+	dsn, err := parseSQLiteDSN(path)
+	if err != nil {
+		return nil, err
+	}
+	postOpen := func() error { return nil }
+	if !dsn.memory {
+		postOpen, err = prepareSQLiteFile(dsn)
+		if err != nil {
+			return nil, err
+		}
+	}
+	defer func() {
+		if retErr != nil && !errors.Is(retErr, ErrInsecureDatabase) {
+			retErr = ErrDatabaseOpen
+		}
+	}()
+	db, err := sql.Open("sqlite", dsn.sqliteDSN)
 	if err != nil {
 		return nil, err
 	}
@@ -215,6 +231,10 @@ CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value BLOB NOT NULL);
 		return nil, errors.New("invalid debug cursor secret")
 	}
 	copy(s.debugCursorSecret[:], secret)
+	if err = postOpen(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return s, nil
 }
 func (s *Store) Close() error { return s.db.Close() }

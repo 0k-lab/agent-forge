@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -17,7 +18,7 @@ import (
 )
 
 func TestOpenPersistsOneValidDebugCursorSecret(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "forge.db")
+	path := filepath.Join(secureTempDir(t), "forge.db")
 	const opens = 8
 	secrets := make(chan []byte, opens)
 	errs := make(chan error, opens)
@@ -74,7 +75,7 @@ func TestOpenPersistsOneValidDebugCursorSecret(t *testing.T) {
 }
 
 func TestOpenRejectsMalformedDebugCursorSecret(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "forge.db")
+	path := filepath.Join(secureTempDir(t), "forge.db")
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -248,12 +249,21 @@ func TestDebugTimelineOmitsUnknownRawEventDetail(t *testing.T) {
 
 func testStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "forge.db"))
+	s, err := Open(filepath.Join(secureTempDir(t), "forge.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+func secureTempDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }
 
 func TestCreateCodingJobValidatesBaseSHA(t *testing.T) {

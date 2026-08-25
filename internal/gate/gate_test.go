@@ -8,8 +8,10 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -22,8 +24,17 @@ import (
 	"github.com/coder/websocket/wsjson"
 )
 
+func secureTempDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func TestWorkerConnectionHeartbeatFailureAndLaterLease(t *testing.T) {
-	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +103,7 @@ func TestWorkerConnectionHeartbeatFailureAndLaterLease(t *testing.T) {
 }
 
 func TestWorkerConnectionBindsEvidenceWithoutClearingLease(t *testing.T) {
-	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +158,7 @@ func TestWorkerConnectionRejectsMismatchedLeaseMessagesGenerically(t *testing.T)
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+			s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -182,7 +193,7 @@ func TestWorkerConnectionRejectsMismatchedLeaseMessagesGenerically(t *testing.T)
 }
 
 func TestWorkerConnectionRejectsUnknownMessageFields(t *testing.T) {
-	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +237,7 @@ func TestWorkerConnectionRejectsInvalidEvidenceWithoutMutation(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+			s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -262,7 +273,7 @@ func TestWorkerConnectionRejectsInvalidEvidenceWithoutMutation(t *testing.T) {
 }
 
 func TestEvidenceSurvivesGateRestartBeforeTerminalResult(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "forge.db")
+	path := filepath.Join(secureTempDir(t), "forge.db")
 	start := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	policy := store.RecoveryPolicy{LeaseTTL: time.Minute, BaseRetryBackoff: time.Second, MaxAttempts: 3}
 	base := strings.Repeat("a", 40)
@@ -327,7 +338,7 @@ func TestGateOwnsBoundedFailurePolicy(t *testing.T) {
 		{"max attempts", protocol.FailureExecution, protocol.DispositionRetryable, "failed", "retryable_failed", 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+			s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -367,7 +378,7 @@ func TestGateOwnsBoundedFailurePolicy(t *testing.T) {
 	}
 
 	t.Run("unknown code", func(t *testing.T) {
-		s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+		s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -397,7 +408,7 @@ func TestGateOwnsBoundedFailurePolicy(t *testing.T) {
 }
 
 func TestGateRestartRecoversLeaseAndRejectsLateOldResult(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "forge.db")
+	path := filepath.Join(secureTempDir(t), "forge.db")
 	start := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	var clock atomic.Int64
 	clock.Store(start.UnixNano())
@@ -434,9 +445,21 @@ func TestGateRestartRecoversLeaseAndRejectsLateOldResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { cancel(); <-recoveryErr }()
+	recoveryStopped := false
+	defer func() {
+		if !recoveryStopped {
+			cancel()
+			<-recoveryErr
+		}
+	}()
 	if attempts, err := s.Attempts(job.ID); err != nil || len(attempts) != 1 || attempts[0].ID != old.AttemptID || attempts[0].Status != "expired" {
 		t.Fatalf("recovered attempts = %#v, %v", attempts, err)
+	}
+	cancel()
+	recoveryRunErr := <-recoveryErr
+	recoveryStopped = true
+	if !errors.Is(recoveryRunErr, context.Canceled) {
+		t.Fatalf("stop recovery: %v", recoveryRunErr)
 	}
 
 	h, _ = NewHandlerWithOptions(s, map[string]string{"token": "worker"}, "owner", options)
@@ -518,7 +541,7 @@ func waitWorkerDisconnected(t *testing.T, s *store.Store, workerID string) {
 }
 
 func TestDebugCursorsAreAuthenticatedScopedAndStableAcrossRestart(t *testing.T) {
-	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -589,7 +612,7 @@ func TestDebugCursorsAreAuthenticatedScopedAndStableAcrossRestart(t *testing.T) 
 }
 
 func TestDebugCursorKeyBindsDatabaseAndOwnerToken(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "forge.db")
+	path := filepath.Join(secureTempDir(t), "forge.db")
 	s, err := store.Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -612,7 +635,7 @@ func TestDebugCursorKeyBindsDatabaseAndOwnerToken(t *testing.T) {
 	assertDebugStatus(t, NewHandler(s, nil, "owner-secret"), "/v1/debug/jobs?cursor="+cursor, "owner-secret", http.StatusOK)
 	assertDebugStatus(t, NewHandler(s, nil, "changed-owner"), "/v1/debug/jobs?cursor="+cursor, "changed-owner", http.StatusBadRequest)
 
-	other, err := store.Open(filepath.Join(t.TempDir(), "other.db"))
+	other, err := store.Open(filepath.Join(secureTempDir(t), "other.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -624,7 +647,7 @@ func TestDebugCursorKeyBindsDatabaseAndOwnerToken(t *testing.T) {
 }
 
 func TestDebugLimitsRejectNonPositiveAndCapLargeValues(t *testing.T) {
-	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -651,7 +674,7 @@ func TestDebugLimitsRejectNonPositiveAndCapLargeValues(t *testing.T) {
 func TestDebugJobsAndWorkersHideStoreFailures(t *testing.T) {
 	for _, path := range []string{"/v1/debug/jobs", "/v1/debug/workers"} {
 		t.Run(path+" database", func(t *testing.T) {
-			s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+			s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -665,7 +688,7 @@ func TestDebugJobsAndWorkersHideStoreFailures(t *testing.T) {
 			}
 		})
 		t.Run(path+" context", func(t *testing.T) {
-			s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+			s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -682,7 +705,7 @@ func TestDebugJobsAndWorkersHideStoreFailures(t *testing.T) {
 			}
 		})
 		t.Run(path+" scan", func(t *testing.T) {
-			dbPath := filepath.Join(t.TempDir(), "forge.db")
+			dbPath := filepath.Join(secureTempDir(t), "forge.db")
 			s, err := store.Open(dbPath)
 			if err != nil {
 				t.Fatal(err)
@@ -772,7 +795,7 @@ func ownerTokenOnlyCursor(t *testing.T, ownerToken string, payload debugCursorPa
 }
 
 func TestDebugAPIRequiresOwnerAndReturnsOnlySanitizedData(t *testing.T) {
-	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -831,7 +854,7 @@ func TestDebugAPIRequiresOwnerAndReturnsOnlySanitizedData(t *testing.T) {
 }
 
 func TestAttemptEvidenceAPIRequiresOwnerAndReturnsOnlyStructuredEvidence(t *testing.T) {
-	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -923,7 +946,7 @@ func assertNoDebugSensitiveKeys(t *testing.T, value any) {
 }
 
 func TestDebugRoutesAreGETOnlyAndViewerIsLockedDown(t *testing.T) {
-	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1055,7 +1078,7 @@ func TestValidateTaskAcceptsAbsentOrPairedCommitAuthor(t *testing.T) {
 }
 
 func TestSubmitRejectsUppercaseBaseSHAWithoutPersistingJob(t *testing.T) {
-	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1075,7 +1098,7 @@ func TestSubmitRejectsUppercaseBaseSHAWithoutPersistingJob(t *testing.T) {
 }
 
 func TestWorkerWebSocketRequiresMatchingBearerToken(t *testing.T) {
-	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1112,7 +1135,7 @@ func TestWorkerWebSocketRequiresMatchingBearerToken(t *testing.T) {
 }
 
 func TestOwnerHTTPAPIRequiresDistinctBearerToken(t *testing.T) {
-	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1155,7 +1178,7 @@ func TestOwnerHTTPAPIRequiresDistinctBearerToken(t *testing.T) {
 
 func TestOwnerHTTPRoutesFailClosedWithoutConfiguredToken(t *testing.T) {
 	for _, ownerToken := range []string{"", "worker-secret"} {
-		s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+		s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 		if err != nil {
 			t.Fatal(err)
 		}

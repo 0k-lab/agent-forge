@@ -30,8 +30,9 @@ go build -o bin/forge-codex-plugin ./cmd/forge-codex-plugin
 Terminal 1:
 
 ```sh
+install -d -m 0700 ./forge-state
 FORGE_OWNER_TOKEN=fake-owner-token FORGE_WORKER_TOKEN=fake-worker-token \
-  ./bin/forge-gate -addr 127.0.0.1:18080 -db ./forge.db -worker-id worker-1 \
+  ./bin/forge-gate -addr 127.0.0.1:18080 -db ./forge-state/forge.db -worker-id worker-1 \
   -lease-ttl 30s -retry-base 1s -max-attempts 3 -recovery-interval 1s
 ```
 
@@ -43,6 +44,22 @@ FORGE_WORKER_TOKEN=fake-worker-token ./bin/forge-worker \
   -repo-root /srv/forge/repos -plugin ./bin/forge-ref-plugin \
   -heartbeat-interval 10s
 ```
+
+## SQLite storage security
+
+File-backed storage provides cross-UID confidentiality when Gate's immediate database directory is owned by its effective UID and has no group/world permission bits. A dedicated unprivileged UID is recommended, but Gate does not require root and does not reject effective UID 0. Both of these forms select the same file:
+
+```sh
+install -d -m 0700 /srv/forge/state
+./bin/forge-gate -db /srv/forge/state/forge.db # plus the required tokens/options
+./bin/forge-gate -db 'file:///srv/forge/state/forge.db?mode=rwc&cache=private' # equivalent URI form
+```
+
+Gate requires trusted, non-symlink path ancestors and checks that the immediate parent is private and effective-UID owned. The database and any existing `-journal`, `-wal`, and `-shm` files must be regular, non-symlink, effective-UID-owned files with exact mode `0600`. A missing database is atomically pre-created and verified as `0600`; startup always performs schema writes/migrations. Existing insecure files fail closed without chmod, removal, or replacement. Repair one offline only after taking a backup and verifying its owner and contents.
+
+`:memory:`, `file::memory:?cache=private`, `file::memory:?cache=shared`, named or empty `file:` memory DSNs with `mode=memory`, relative or absolute plain paths, and validated `file:` paths are supported. File DSNs allow only absent `mode` or `mode=rwc` and optional cache value `private` or `shared`; all other or duplicate parameters are rejected. On non-Unix systems memory databases work, but file-backed storage returns an unsupported-storage error.
+
+The private owned parent prevents mutation by other UIDs, and atomic `O_EXCL` creation protects the absent final target. This preflight is not a custom-VFS, race-free defense against a malicious process running as the same UID; the runtime and same-UID processes must be trusted. These filesystem controls are permissions, not encryption.
 
 Submit and inspect:
 
@@ -92,7 +109,7 @@ Workers heartbeat the exact job/attempt/Worker tuple while executing. The Worker
 
 Gate performs an expiry sweep before it starts serving, then repeats at `-recovery-interval`. Restarting Gate with the same SQLite database preserves attempt history and recovers expired leases. A sweep or Store failure stops Gate rather than disabling recovery. Run Gate and Worker under supervisors: Workers return after Gate disconnects and the supervisor should reconnect them; Gate should also be restarted after a fatal recovery error.
 
-The sanitized timeline exposes attempt ordinals, lease expiry, retry scheduling, dispositions, bounded failure codes, and success without task content, result bodies, tokens, private repository paths, or cursor secrets. Storage ownership and filesystem permissions are separate issue #13 hardening and are not implemented here.
+The sanitized timeline exposes attempt ordinals, lease expiry, retry scheduling, dispositions, bounded failure codes, and success without task content, result bodies, tokens, private repository paths, or cursor secrets.
 
 Submit a coding task with an absolute local repository path, full base SHA, instruction, explicit argv arrays, and an optional paired commit author:
 
@@ -106,4 +123,4 @@ The terminal job contains `candidate_sha`; its deterministic candidate ref keeps
 
 Owner-token holders are authorized to request commands only inside configured repository roots. Production Workers should run as dedicated unprivileged accounts or containers. The plugin receives only `PATH`, `HOME`, `CODEX_HOME`, `CODEX_BIN`, and `TMPDIR` when set; scoped tests receive an isolated home, temp, and cache.
 
-Run `scripts/e2e.sh` for the reference transport proof, `scripts/recovery-e2e.sh` for restart/expiry/retry/late-result recovery, `scripts/evidence-e2e.sh` for the self-contained bounded-evidence/privacy proof, and `CODEX_BIN=/path/to/codex scripts/coding-e2e.sh` for the real coding proof. The scripts use synthetic data; recovery artifacts stay in a temporary directory and all spawned processes are cleaned up.
+Run `scripts/e2e.sh` for the reference transport proof, `scripts/recovery-e2e.sh` for restart/expiry/retry/late-result recovery, `scripts/evidence-e2e.sh` for the self-contained bounded-evidence/privacy proof, `scripts/sqlite-permissions-e2e.sh` for the Gate SQLite permission/startup proof, and `CODEX_BIN=/path/to/codex scripts/coding-e2e.sh` for the real coding proof. The scripts use synthetic data; recovery artifacts stay in a temporary directory and all spawned processes are cleaned up.
