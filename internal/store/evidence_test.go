@@ -16,7 +16,7 @@ import (
 )
 
 func TestAttemptEvidenceSurvivesStoreReopen(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "forge.db")
+	path := filepath.Join(secureTempDir(t), "forge.db")
 	start := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	base := strings.Repeat("a", 40)
 	records := []protocol.AttemptEvidence{{

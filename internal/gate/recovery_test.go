@@ -16,7 +16,7 @@ type fakeSweeper struct {
 }
 
 func TestStartRecoverySweepsBeforeReturnAndStopsOnCancellation(t *testing.T) {
-	s, err := store.Open(filepath.Join(t.TempDir(), "forge.db"))
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

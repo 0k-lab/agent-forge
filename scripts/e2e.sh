@@ -4,6 +4,7 @@ ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 RUN="$ROOT/.e2e-run"
 rm -rf "$RUN"
 mkdir -p "$RUN" "$ROOT/evidence"
+chmod 700 "$RUN"
 GATE_PID=
 WORKER_PID=
 OWNER_TOKEN=fake-owner-token-reference-e2e
