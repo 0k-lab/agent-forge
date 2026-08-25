@@ -29,7 +29,8 @@ func executeCodingOutcomeWithRunner(ctx context.Context, pluginPath string, root
 	if err != nil {
 		return codingOutcome{err: invalidTask(err), evidence: []protocol.AttemptEvidence{newEvidence(task.BaseSHA, protocol.EvidencePhasePreparation, protocol.EvidenceReasonInvalidRepository)}, cleanup: func() *protocol.AttemptEvidence { return nil }}
 	}
-	settings := codingSettings{pluginArgv: []string{pluginPath}, repository: repository, environment: pluginEnvironment(), pluginTimeout: 15 * time.Minute, checkTimeout: 10 * time.Minute, gitTimeout: 10 * time.Minute, cleanupTimeout: 10 * time.Second, pluginOutput: 1 << 20, checkOutput: protocol.MaxEvidenceOutputBytes, gitOutput: 1 << 20}
+	environment := pluginEnvironment()
+	settings := codingSettings{pluginArgv: []string{pluginPath}, repository: repository, pluginEnvironment: environment, checkEnvironment: environment, pluginTimeout: 15 * time.Minute, checkTimeout: 10 * time.Minute, gitTimeout: 10 * time.Minute, cleanupTimeout: 10 * time.Second, pluginOutput: 1 << 20, checkOutput: protocol.MaxEvidenceOutputBytes, gitOutput: 1 << 20}
 	return executeCodingOutcomeSettings(ctx, settings, jobID, attemptID, task, runCheck)
 }
 

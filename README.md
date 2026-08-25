@@ -6,7 +6,7 @@ A minimal Go vertical slice: submit a job to **forge-gate**, persist it in SQLit
 
 - **Gate** owns repository IDs/default branches, Worker pools and authenticated slots, submission-time lifecycle/execution policy resolution, leases, and authoritative SQLite state.
 - **Worker** owns repository-ID-to-local-path and plugin-ID-to-local-argv mappings, canonical repository/worktree/runtime roots, inherited-environment allowlisting, and local timeout/output ceilings. Local paths and plugin argv never cross the Worker/Gate boundary.
-- **Plugin** is an edit-only subprocess contract. The reference plugin accepts legacy input; `forge-codex-plugin` accepts a workspace and instruction, invokes `CODEX_BIN` (default `codex`) with bounded output and a timeout, and never reports business success or commits.
+- **Plugin** uses the strict NDJSON [plugin protocol v1](docs/plugin-protocol-v1.md). The reference plugin implements `text`; `forge-codex-plugin` implements `workspace_edit`, invokes `CODEX_BIN` (default `codex`) with bounded output and a timeout, obtains the actual-diff commit subject through Codex structured output, and never reports business success or commits.
 - This MVP deliberately has no control panel, Docker, GitHub integration, reviewer, mTLS, PostgreSQL, or plugin marketplace. Its only browser UI is a read-only debug viewer.
 
 ## Build and test
@@ -38,8 +38,10 @@ Gate config (`gate.json`):
 Worker config (`worker.json`):
 
 ```json
-{"version":1,"gate_url":"ws://127.0.0.1:18080","id":"worker-1","token_env":"FORGE_WORKER_TOKEN","heartbeat_interval":"10s","concurrency":2,"repository_roots":["/srv/forge/repos"],"worktree_root":"/srv/forge/worktrees","runtime_root":"/srv/forge/runtime","repositories":[{"id":"agent-forge","path":"/srv/forge/repos/agent-forge"}],"plugins":[{"id":"codex","argv":["/srv/forge/bin/forge-codex-plugin"]},{"id":"reference","argv":["/srv/forge/bin/forge-ref-plugin"]}],"environment_allowlist":["PATH","CODEX_HOME","CODEX_BIN"],"ceilings":{"plugin_timeout":"15m","check_timeout":"10m","git_timeout":"1m","cleanup_timeout":"10s","plugin_output_bytes":1048576,"check_output_bytes":2048,"git_output_bytes":1048576}}
+{"version":1,"gate_url":"ws://127.0.0.1:18080","id":"worker-1","token_env":"FORGE_WORKER_TOKEN","heartbeat_interval":"10s","concurrency":2,"repository_roots":["/srv/forge/repos"],"worktree_root":"/srv/forge/worktrees","runtime_root":"/srv/forge/runtime","repositories":[{"id":"agent-forge","path":"/srv/forge/repos/agent-forge"}],"plugins":[{"id":"codex","argv":["/srv/forge/bin/forge-codex-plugin"]},{"id":"reference","argv":["/srv/forge/bin/forge-ref-plugin"]}],"environment_allowlist":["PATH","CODEX_HOME","CODEX_BIN"],"check_environment_allowlist":["PATH"],"ceilings":{"plugin_timeout":"15m","check_timeout":"10m","git_timeout":"1m","cleanup_timeout":"10s","plugin_output_bytes":1048576,"check_output_bytes":2048,"git_output_bytes":1048576}}
 ```
+
+`environment_allowlist` is the ceiling for policy-requested plugin variables. Scoped checks inherit only its explicit `check_environment_allowlist` subset; absent or empty means none, apart from Worker-created `HOME`, `TMPDIR`, and `XDG_CACHE_HOME`.
 
 ```sh
 FORGE_OWNER_TOKEN=fake-owner-token FORGE_WORKER_TOKEN=fake-worker-token ./bin/forge-gate -config gate.json
@@ -127,4 +129,4 @@ The terminal job contains `candidate_sha`; its deterministic candidate ref keeps
 
 Before worktree creation, Worker requires the exact base commit to exist and be an ancestor of its configured local `refs/heads/<default_branch>`. It never fetches. Unknown IDs, default-branch mismatch, symlink/canonical drift, root escape, or Gate limits above local ceilings fail closed with path/argv/secret-free errors. Scoped argv remains task data; no central verification profile or global command allowlist is introduced. Production Workers should run as dedicated unprivileged accounts or containers.
 
-Run `scripts/e2e.sh` for the reference transport proof, `scripts/recovery-e2e.sh` for restart/expiry/retry/late-result recovery, `scripts/evidence-e2e.sh` for the self-contained bounded-evidence/privacy proof, `scripts/sqlite-permissions-e2e.sh` for the Gate SQLite permission/startup proof, and `CODEX_BIN=/path/to/codex scripts/coding-e2e.sh` for the real coding proof. The scripts use synthetic data; recovery artifacts stay in a temporary directory and all spawned processes are cleaned up.
+Run `scripts/e2e.sh` for the reference transport proof, `scripts/plugin-conformance-e2e.sh` for deterministic reference/Python/fake-Codex protocol conformance, `scripts/recovery-e2e.sh` for restart/expiry/retry/late-result recovery, `scripts/evidence-e2e.sh` for the self-contained bounded-evidence/privacy proof, `scripts/sqlite-permissions-e2e.sh` for the Gate SQLite permission/startup proof, and `CODEX_BIN=/path/to/codex scripts/coding-e2e.sh` for the real coding proof. The scripts use synthetic data; recovery artifacts stay in a temporary directory and all spawned processes are cleaned up.

@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,8 +17,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"agent-forge/internal/configjson"
+	"agent-forge/internal/pluginprotocol"
 	"agent-forge/internal/processtree"
 	"agent-forge/internal/protocol"
 	"github.com/coder/websocket"
@@ -32,12 +33,6 @@ type pluginRequest struct {
 	Workspace   string `json:"workspace,omitempty"`
 	Instruction string `json:"instruction,omitempty"`
 }
-type pluginResponse struct {
-	Version string `json:"version"`
-	Result  string `json:"result"`
-	Error   string `json:"error,omitempty"`
-}
-
 type pluginFailure struct{ reason string }
 
 func (e pluginFailure) Error() string { return "plugin failed" }
@@ -65,7 +60,7 @@ type codingSettings struct {
 	pluginArgv                           []string
 	repository                           string
 	worktreeRoot, runtimeRoot            string
-	environment                          []string
+	pluginEnvironment, checkEnvironment  []string
 	pluginTimeout, checkTimeout          time.Duration
 	gitTimeout, cleanupTimeout           time.Duration
 	pluginOutput, checkOutput, gitOutput int64
@@ -297,43 +292,30 @@ func classifyFailure(err error) (code, disposition string) {
 	}
 }
 func invokeLocal(parent context.Context, argv []string, request pluginRequest, timeout time.Duration, outputBytes int64, environment []string) (string, error) {
-	if len(argv) == 0 || timeout <= 0 || outputBytes <= 0 {
-		return "", pluginFailure{protocol.EvidenceReasonPluginStartFailed}
+	result, err := invokeLocalResult(parent, argv, request, timeout, outputBytes, environment)
+	return result.Output, err
+}
+
+func invokeLocalResult(parent context.Context, argv []string, request pluginRequest, timeout time.Duration, outputBytes int64, environment []string) (pluginprotocol.Result, error) {
+	operation := pluginprotocol.Text
+	protocolRequest := pluginprotocol.Request{Operation: operation, Input: request.Input}
+	var capabilities []pluginprotocol.Capability
+	if request.Workspace != "" {
+		operation = pluginprotocol.WorkspaceEdit
+		protocolRequest = pluginprotocol.Request{Operation: operation, Workspace: request.Workspace, Instruction: request.Instruction, TimeoutMS: timeout.Milliseconds()}
+		capabilities = []pluginprotocol.Capability{pluginprotocol.Progress, pluginprotocol.Cancel, pluginprotocol.CommitSubject}
 	}
-	ctx, cancel := context.WithTimeout(parent, timeout)
-	defer cancel()
-	body, err := json.Marshal(request)
+	result, err := pluginprotocol.Run(parent, argv, protocolRequest, pluginprotocol.Options{Timeout: timeout, OutputBytes: outputBytes, Capabilities: capabilities, Environment: environment})
 	if err != nil {
-		return "", err
-	}
-	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.Env = environment
-	cmd.Stdin = bytes.NewReader(append(body, '\n'))
-	var out bytes.Buffer
-	budget := &outputBudget{n: outputBytes}
-	cmd.Stdout = &limitedWriter{w: &out, budget: budget}
-	cmd.Stderr = &limitedWriter{w: io.Discard, budget: budget}
-	if err := processtree.Run(ctx, cmd); err != nil {
-		var startErr *exec.Error
-		var pathErr *os.PathError
-		if errors.As(err, &startErr) || errors.As(err, &pathErr) {
-			return "", pluginFailure{protocol.EvidenceReasonPluginStartFailed}
+		reason := protocol.EvidenceReasonPluginProtocolFailed
+		if errors.Is(err, pluginprotocol.ErrStart) {
+			reason = protocol.EvidenceReasonPluginStartFailed
+		} else if errors.Is(err, pluginprotocol.ErrOperation) {
+			reason = protocol.EvidenceReasonPluginReportedFailure
 		}
-		return "", pluginFailure{protocol.EvidenceReasonPluginProtocolFailed}
+		return pluginprotocol.Result{}, pluginFailure{reason}
 	}
-	var response pluginResponse
-	decoder := json.NewDecoder(bytes.NewReader(out.Bytes()))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&response); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
-		return "", pluginFailure{protocol.EvidenceReasonPluginProtocolFailed}
-	}
-	if response.Version != "v1" {
-		return "", pluginFailure{protocol.EvidenceReasonPluginProtocolFailed}
-	}
-	if response.Error != "" {
-		return "", pluginFailure{protocol.EvidenceReasonPluginReportedFailure}
-	}
-	return response.Result, nil
+	return result, nil
 }
 
 func executeCodingOutcomeSettings(ctx context.Context, settings codingSettings, jobID, attemptID string, task protocol.CodingTask, runCheck scopedCheckRunner) codingOutcome {
@@ -344,12 +326,17 @@ func executeCodingOutcomeSettings(ctx context.Context, settings codingSettings, 
 	if err := protocol.ValidateCommitAuthor(task.CommitAuthorName, task.CommitAuthorEmail); err != nil {
 		return fail(protocol.EvidencePhasePreparation, protocol.EvidenceReasonInvalidTask, invalidTask(err))
 	}
-	if len(task.Tests) == 0 || len(task.Tests) > 32 || !fixedLowerHex(task.BaseSHA, 40) {
+	if task.Instruction == "" || len(task.Instruction) > pluginprotocol.MaxTextBytes || !utf8.ValidString(task.Instruction) || len(task.Tests) == 0 || len(task.Tests) > 32 || !fixedLowerHex(task.BaseSHA, 40) {
 		return fail(protocol.EvidencePhasePreparation, protocol.EvidenceReasonInvalidTask, invalidTask(errors.New("invalid coding task")))
 	}
 	for _, argv := range task.Tests {
-		if len(argv) == 0 || len(argv) > 64 {
+		if len(argv) == 0 || len(argv) > 64 || argv[0] == "" {
 			return fail(protocol.EvidencePhasePreparation, protocol.EvidenceReasonInvalidTask, invalidTask(errors.New("invalid coding task")))
+		}
+		for _, argument := range argv {
+			if len(argument) > 4096 || !utf8.ValidString(argument) || strings.IndexByte(argument, 0) >= 0 {
+				return fail(protocol.EvidencePhasePreparation, protocol.EvidenceReasonInvalidTask, invalidTask(errors.New("invalid coding task")))
+			}
 		}
 	}
 	repository := settings.repository
@@ -372,12 +359,24 @@ func executeCodingOutcomeSettings(ctx context.Context, settings codingSettings, 
 			return out
 		}
 	}
-	testEnv := append([]string{}, settings.environment...)
+	testEnv := make([]string, 0, len(settings.checkEnvironment)+3)
+	for _, value := range settings.checkEnvironment {
+		if !strings.HasPrefix(value, "HOME=") && !strings.HasPrefix(value, "TMPDIR=") && !strings.HasPrefix(value, "XDG_CACHE_HOME=") {
+			testEnv = append(testEnv, value)
+		}
+	}
 	testEnv = append(testEnv,
 		"HOME="+filepath.Join(runtimeDir, "home"),
 		"TMPDIR="+filepath.Join(runtimeDir, "tmp"),
 		"XDG_CACHE_HOME="+filepath.Join(runtimeDir, "cache"),
 	)
+	pluginEnv := make([]string, 0, len(settings.pluginEnvironment)+1)
+	for _, value := range settings.pluginEnvironment {
+		if !strings.HasPrefix(value, "TMPDIR=") {
+			pluginEnv = append(pluginEnv, value)
+		}
+	}
+	pluginEnv = append(pluginEnv, "TMPDIR="+filepath.Join(runtimeDir, "tmp"))
 	worktree, err := os.MkdirTemp(settings.worktreeRoot, "forge-worktree-")
 	if err != nil {
 		out := fail(protocol.EvidencePhasePreparation, protocol.EvidenceReasonWorktreeSetupFailed, err)
@@ -397,7 +396,8 @@ func executeCodingOutcomeSettings(ctx context.Context, settings codingSettings, 
 		return codingOutcome{err: errors.New("worktree base mismatch"), evidence: []protocol.AttemptEvidence{newEvidence(task.BaseSHA, protocol.EvidencePhasePreparation, protocol.EvidenceReasonWorktreeSetupFailed)}, cleanup: cleanup}
 	}
 	pluginStarted := time.Now()
-	if _, err := invokeLocal(ctx, settings.pluginArgv, pluginRequest{Version: "v1", Workspace: worktree, Instruction: task.Instruction}, settings.pluginTimeout, settings.pluginOutput, settings.environment); err != nil {
+	pluginResult, err := invokeLocalResult(ctx, settings.pluginArgv, pluginRequest{Version: "v1", Workspace: worktree, Instruction: task.Instruction}, settings.pluginTimeout, settings.pluginOutput, pluginEnv)
+	if err != nil {
 		reason := protocol.EvidenceReasonPluginProtocolFailed
 		var failure pluginFailure
 		if errors.As(err, &failure) {
@@ -406,6 +406,10 @@ func executeCodingOutcomeSettings(ctx context.Context, settings codingSettings, 
 		record := newEvidence(task.BaseSHA, protocol.EvidencePhasePlugin, reason)
 		record.DurationMS = boundedDurationMS(time.Since(pluginStarted), settings.pluginTimeout)
 		return codingOutcome{err: err, evidence: []protocol.AttemptEvidence{record}, cleanup: cleanup}
+	}
+	commitSubject := "chore: apply coding task"
+	if pluginResult.CommitSubject != nil {
+		commitSubject = *pluginResult.CommitSubject
 	}
 	head, headErr := gitOutputLimited(ctx, worktree, settings.gitTimeout, settings.gitOutput, "rev-parse", "HEAD")
 	if headErr != nil || head != task.BaseSHA {
@@ -417,6 +421,13 @@ func executeCodingOutcomeSettings(ctx context.Context, settings codingSettings, 
 	}
 	if changes == "" {
 		return codingOutcome{err: errors.New("no changes"), evidence: []protocol.AttemptEvidence{newEvidence(task.BaseSHA, protocol.EvidencePhaseWorkspaceValidation, protocol.EvidenceReasonNoChanges)}, cleanup: cleanup}
+	}
+	if err := gitCommandLimited(ctx, worktree, settings.gitTimeout, settings.gitOutput, nil, "add", "-A"); err != nil {
+		return codingOutcome{err: err, evidence: []protocol.AttemptEvidence{newEvidence(task.BaseSHA, protocol.EvidencePhaseWorkspaceValidation, protocol.EvidenceReasonInvalidWorkspaceChange)}, cleanup: cleanup}
+	}
+	recordedTree, err := gitOutputLimited(ctx, worktree, settings.gitTimeout, settings.gitOutput, "write-tree")
+	if err != nil || !fixedLowerHex(recordedTree, 40) {
+		return codingOutcome{err: errors.New("invalid candidate tree"), evidence: []protocol.AttemptEvidence{newEvidence(task.BaseSHA, protocol.EvidencePhaseWorkspaceValidation, protocol.EvidenceReasonInvalidWorkspaceChange)}, cleanup: cleanup}
 	}
 	var evidence []protocol.AttemptEvidence
 	candidateFailure := func() protocol.AttemptEvidence {
@@ -443,8 +454,12 @@ func executeCodingOutcomeSettings(ctx context.Context, settings codingSettings, 
 		}
 		evidence = append(evidence, record)
 	}
-	if err := gitCommandLimited(ctx, worktree, settings.gitTimeout, settings.gitOutput, nil, "add", "-A"); err != nil {
-		return codingOutcome{err: err, evidence: append(evidence, candidateFailure()), cleanup: cleanup}
+	postCheckHead, err := gitOutputLimited(ctx, worktree, settings.gitTimeout, settings.gitOutput, "rev-parse", "HEAD")
+	postCheckTree, treeErr := gitOutputLimited(ctx, worktree, settings.gitTimeout, settings.gitOutput, "write-tree")
+	untracked, untrackedErr := gitOutputLimited(ctx, worktree, settings.gitTimeout, settings.gitOutput, "ls-files", "--others", "--exclude-standard")
+	worktreeErr := gitCommandLimited(ctx, worktree, settings.gitTimeout, settings.gitOutput, nil, "diff", "--quiet")
+	if err != nil || treeErr != nil || untrackedErr != nil || worktreeErr != nil || postCheckHead != task.BaseSHA || postCheckTree != recordedTree || untracked != "" {
+		return codingOutcome{err: errors.New("checks mutated candidate"), evidence: append(evidence, candidateFailure()), cleanup: cleanup}
 	}
 	authorName, authorEmail := task.CommitAuthorName, task.CommitAuthorEmail
 	if authorName == "" && authorEmail == "" {
@@ -456,14 +471,15 @@ func executeCodingOutcomeSettings(ctx context.Context, settings codingSettings, 
 		"GIT_COMMITTER_NAME=Agent Forge",
 		"GIT_COMMITTER_EMAIL=forge@example.invalid",
 	}
-	if err := gitCommandLimited(ctx, worktree, settings.gitTimeout, settings.gitOutput, identityEnv, "commit", "-m", "chore: apply coding task"); err != nil {
-		return codingOutcome{err: err, evidence: append(evidence, candidateFailure()), cleanup: cleanup}
-	}
-	sha, err := gitOutputLimited(ctx, worktree, settings.gitTimeout, settings.gitOutput, "rev-parse", "HEAD")
+	sha, err := gitOutputLimitedEnv(ctx, worktree, settings.gitTimeout, settings.gitOutput, identityEnv, "commit-tree", recordedTree, "-p", task.BaseSHA, "-m", commitSubject)
 	if err != nil {
 		return codingOutcome{err: err, evidence: append(evidence, candidateFailure()), cleanup: cleanup}
 	}
 	candidate = sha
+	candidateTree, err := gitOutputLimited(ctx, repository, settings.gitTimeout, settings.gitOutput, "rev-parse", sha+"^{tree}")
+	if err != nil || candidateTree != recordedTree {
+		return codingOutcome{err: errors.New("candidate tree mismatch"), evidence: append(evidence, candidateFailure()), cleanup: cleanup}
+	}
 	parent, err := gitOutputLimited(ctx, worktree, settings.gitTimeout, settings.gitOutput, "rev-parse", sha+"^")
 	if err != nil || parent != task.BaseSHA {
 		return codingOutcome{err: errors.New("candidate parent mismatch"), evidence: append(evidence, candidateFailure()), cleanup: cleanup}
@@ -481,6 +497,10 @@ func executeCodingOutcomeSettings(ctx context.Context, settings codingSettings, 
 	parent, err = gitOutputLimited(ctx, repository, settings.gitTimeout, settings.gitOutput, "rev-parse", retained+"^")
 	if err != nil || parent != task.BaseSHA {
 		return codingOutcome{err: errors.New("retained candidate parent mismatch"), evidence: append(evidence, candidateFailure()), cleanup: cleanup}
+	}
+	retainedTree, err := gitOutputLimited(ctx, repository, settings.gitTimeout, settings.gitOutput, "rev-parse", retained+"^{tree}")
+	if err != nil || retainedTree != recordedTree {
+		return codingOutcome{err: errors.New("retained candidate tree mismatch"), evidence: append(evidence, candidateFailure()), cleanup: cleanup}
 	}
 	for i := range evidence {
 		evidence[i].CandidateSHA = sha
@@ -662,10 +682,14 @@ func gitCommandLimited(parent context.Context, dir string, timeout time.Duration
 }
 
 func gitOutputLimited(parent context.Context, dir string, timeout time.Duration, outputBytes int64, args ...string) (string, error) {
+	return gitOutputLimitedEnv(parent, dir, timeout, outputBytes, nil, args...)
+}
+
+func gitOutputLimitedEnv(parent context.Context, dir string, timeout time.Duration, outputBytes int64, env []string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = []string{"PATH=" + environmentValue("PATH", "/usr/local/bin:/usr/bin:/bin")}
+	cmd.Env = append([]string{"PATH=" + environmentValue("PATH", "/usr/local/bin:/usr/bin:/bin")}, env...)
 	var out bytes.Buffer
 	budget := &outputBudget{n: outputBytes}
 	cmd.Stdout = &limitedWriter{w: &out, budget: budget}
