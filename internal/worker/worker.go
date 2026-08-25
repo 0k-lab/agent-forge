@@ -522,15 +522,19 @@ func fixedLowerHex(value string, size int) bool {
 
 func runScopedCheckLocal(parent context.Context, worktree string, env, argv []string, timeout time.Duration, outputBytes int64) scopedCheckResult {
 	started := time.Now()
+	executable, err := resolveCheckExecutable(worktree, env, argv[0])
+	if err != nil {
+		return scopedCheckResult{duration: time.Since(started), err: err}
+	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	capture := &boundedCapture{limit: int(outputBytes)}
-	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd := exec.Command(executable, argv[1:]...)
 	cmd.Dir = worktree
 	cmd.Env = env
 	cmd.Stdout = capture
 	cmd.Stderr = capture
-	err := processtree.Run(ctx, cmd)
+	err = processtree.Run(ctx, cmd)
 	output, redacted, truncated := capture.safeOutput()
 	result := scopedCheckResult{output: output, redacted: redacted, truncated: truncated, duration: time.Since(started), timedOut: errors.Is(ctx.Err(), context.DeadlineExceeded), err: err}
 	if cmd.ProcessState != nil {
@@ -539,6 +543,38 @@ func runScopedCheckLocal(parent context.Context, worktree string, env, argv []st
 		}
 	}
 	return result
+}
+
+func resolveCheckExecutable(worktree string, env []string, name string) (string, error) {
+	fail := func() (string, error) { return "", errors.New("scoped check executable unavailable") }
+	if filepath.IsAbs(name) {
+		return name, nil
+	}
+	if strings.ContainsRune(name, filepath.Separator) {
+		return filepath.Join(worktree, name), nil
+	}
+	var pathValue string
+	found := false
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "PATH=") {
+			pathValue, found = strings.TrimPrefix(entry, "PATH="), true
+			break
+		}
+	}
+	if !found {
+		return fail()
+	}
+	for _, directory := range filepath.SplitList(pathValue) {
+		if !filepath.IsAbs(directory) {
+			directory = filepath.Join(worktree, directory)
+		}
+		candidate := filepath.Join(directory, name)
+		info, err := os.Stat(candidate)
+		if err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+			return candidate, nil
+		}
+	}
+	return fail()
 }
 
 type boundedCapture struct {

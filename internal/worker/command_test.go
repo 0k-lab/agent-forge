@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -10,6 +11,45 @@ import (
 	"testing"
 	"time"
 )
+
+func TestScopedCheckResolvesExecutableFromCheckEnvironment(t *testing.T) {
+	worktree, ambientBin, checkBin := t.TempDir(), t.TempDir(), t.TempDir()
+	write := func(dir, name, output string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf '"+output+"'\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	write(ambientBin, "ambient-only-check", "ambient")
+	write(checkBin, "allowed-check", "allowed")
+	relativeBin := filepath.Join(worktree, "check-bin")
+	if err := os.Mkdir(relativeBin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write(relativeBin, "relative-path-check", "relative-path")
+	relative := write(worktree, "repo-check", "relative")
+	t.Setenv("PATH", ambientBin)
+
+	for _, tt := range []struct {
+		name      string
+		env, argv []string
+		wantErr   bool
+	}{
+		{"ambient PATH is ignored", []string{"PATH=/bin"}, []string{"ambient-only-check"}, true},
+		{"check PATH is used", []string{"PATH=" + checkBin}, []string{"allowed-check"}, false},
+		{"relative check PATH uses worktree", []string{"PATH=check-bin"}, []string{"relative-path-check"}, false},
+		{"absent PATH fails closed", nil, []string{"ambient-only-check"}, true},
+		{"repo-relative is explicit", nil, []string{"./" + filepath.Base(relative)}, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			result := runScopedCheckLocal(context.Background(), worktree, tt.env, tt.argv, time.Second, 1024)
+			if (result.err != nil) != tt.wantErr || !tt.wantErr && (!result.redacted || result.output != "[REDACTED]") || strings.Contains(result.output, ambientBin) {
+				t.Fatalf("result = %#v, want error %v", result, tt.wantErr)
+			}
+		})
+	}
+}
 
 func TestCommandTimeoutKillsDescendantPipeHolders(t *testing.T) {
 	if runtime.GOOS == "windows" {

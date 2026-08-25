@@ -38,7 +38,7 @@ Workspace execution and success:
 {"version":"v1","id":"0123456789abcdef0123456789abcdef","type":"result","commit_subject":"feat: describe the edit"}
 ```
 
-The workspace result has exactly the common fields and optional `commit_subject`. If present, `commit_subject` requires negotiation, is 1..256 UTF-8 bytes, has no leading/trailing Unicode whitespace, controls, CR/LF/NUL/U+0085/U+2028/U+2029, or logical second line. When absent, Worker uses `chore: apply coding task`. Worker passes it as one argv element.
+The workspace result has exactly the common fields and optional `commit_subject`. If present, `commit_subject` requires negotiation, is 1..256 UTF-8 bytes, has no leading/trailing Unicode whitespace, Unicode control or format characters, U+2028/U+2029, or logical second line. When absent, Worker uses `chore: apply coding task`. Worker passes it as one argv element.
 
 Progress requires negotiation, is limited to 128 frames, and has monotonically consecutive sequence numbers starting at 1. `stage` is one of `started`, `working`, `finalizing`; `text` is at most 1,024 UTF-8 bytes:
 
@@ -52,7 +52,7 @@ Failure has `category` equal to `invalid_request`, `incompatible`, `execution_fa
 {"version":"v1","id":"0123456789abcdef0123456789abcdef","type":"failure","category":"execution_failed"}
 ```
 
-If local context expires after negotiated execution, Worker sends exactly one cancel and allows 250 ms to drain; otherwise it terminates and reaps the existing ordinary/setsid process tree. Cancellation is authoritative even if success races it:
+If local context expires after negotiated execution, Worker sends exactly one cancel and allows 250 ms to drain. On Linux, each invocation runs under a child-subreaper wrapper that performs bounded, PID-identity-safe termination and reaping of invocation descendants after successful, failed, or cancelled completion, including ordinary and setsid descendants that remain attached or are reparented to the wrapper. This is best-effort cleanup for trusted local same-UID plugins, not hostile-plugin containment; without a cgroup or PID namespace, a deliberately adversarial process may escape tracking or interfere with the Worker. Other supported systems retain bounded ordinary process-group cleanup on cancellation. Cancellation is authoritative even if success races it:
 
 ```json
 {"version":"v1","id":"0123456789abcdef0123456789abcdef","type":"cancel"}

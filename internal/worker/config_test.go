@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -122,6 +123,19 @@ func TestParseWorkerConfigCanonicalizesExecutablePlugin(t *testing.T) {
 		if _, err := ParseConfig([]byte(body), func(string) string { return "worker-secret" }); err == nil {
 			t.Fatalf("accepted unsafe plugin executable %q", path)
 		}
+	}
+}
+
+func TestParseWorkerConfigRejectsInvalidPluginArguments(t *testing.T) {
+	valid := validWorkerConfig(t)
+	body := rewriteWorkerConfig(t, valid, func(raw *rawWorkerConfig) { raw.Plugins[0].Argv[1] = "bad\x00argument" })
+	invalidUTF8 := bytes.Replace([]byte(valid), []byte(`"ok"`), []byte{'"', 'b', 'a', 'd', 0xff, '"'}, 1)
+	for name, data := range map[string][]byte{"NUL": []byte(body), "invalid UTF-8": invalidUTF8} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseConfig(data, func(string) string { return "worker-secret" }); err == nil || strings.Contains(err.Error(), "bad") {
+				t.Fatalf("ParseConfig error = %v", err)
+			}
+		})
 	}
 }
 

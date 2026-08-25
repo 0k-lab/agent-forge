@@ -359,7 +359,7 @@ func ValidateCommitSubject(subject *string, negotiated bool) error {
 		return errors.New("invalid commit subject")
 	}
 	for _, r := range value {
-		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == '\u2028' || r == '\u2029' {
 			return errors.New("invalid commit subject")
 		}
 	}

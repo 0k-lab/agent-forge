@@ -69,9 +69,10 @@ func TestServeRejectsUnsupportedOptionalCapabilities(t *testing.T) {
 }
 
 func TestCommitSubject(t *testing.T) {
-	valid := "feat: describe the change"
-	if err := ValidateCommitSubject(&valid, true); err != nil {
-		t.Fatal(err)
+	for _, valid := range []string{"feat: describe the change", "feat: support café ☕"} {
+		if err := ValidateCommitSubject(&valid, true); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := ValidateCommitSubject(nil, false); err != nil {
 		t.Fatal(err)
@@ -85,6 +86,10 @@ func TestCommitSubject(t *testing.T) {
 		"control":        "subject\u0007",
 		"next line":      "subject\u0085body",
 		"line separator": "subject\u2028body",
+		"bidi embedding": "subject\u202a.txt",
+		"bidi override":  "subject\u202egnp.exe",
+		"bidi isolate":   "subject\u2066text\u2069",
+		"direction mark": "subject\u200e",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := ValidateCommitSubject(&subject, true); err == nil {
@@ -92,6 +97,15 @@ func TestCommitSubject(t *testing.T) {
 			}
 		})
 	}
+	for _, r := range []rune{'\u200e', '\u200f', '\u202a', '\u202b', '\u202c', '\u202d', '\u202e', '\u2066', '\u2067', '\u2068', '\u2069'} {
+		t.Run(fmt.Sprintf("format U+%04X", r), func(t *testing.T) {
+			subject := "subject" + string(r)
+			if err := ValidateCommitSubject(&subject, true); err == nil {
+				t.Fatal("accepted Unicode format character")
+			}
+		})
+	}
+	valid := "feat: describe the change"
 	if err := ValidateCommitSubject(&valid, false); err == nil {
 		t.Fatal("accepted subject without negotiated capability")
 	}

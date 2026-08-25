@@ -68,7 +68,7 @@ func Run(parent context.Context, argv []string, request Request, options Options
 	reader := bufio.NewReaderSize(stdoutReader, MaxFrameBytes+1)
 	processDone := make(chan error, 1)
 	go func() {
-		processDone <- processtree.Run(processCtx, cmd)
+		processDone <- processtree.RunInvocation(processCtx, cmd)
 		_ = stdoutWriter.Close()
 	}()
 	exchangeDone := make(chan exchangeResponse, 1)

@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"agent-forge/internal/configjson"
 )
@@ -94,6 +95,9 @@ func LoadConfig(path string) (Config, error) {
 }
 
 func ParseConfig(data []byte, getenv func(string) string) (Config, error) {
+	if !utf8.Valid(data) {
+		return Config{}, errWorkerConfig
+	}
 	var raw rawWorkerConfig
 	if err := configjson.Decode(data, &raw); err != nil {
 		return Config{}, err
@@ -154,7 +158,7 @@ func ParseConfig(data []byte, getenv func(string) string) (Config, error) {
 			return Config{}, errWorkerConfig
 		}
 		for _, arg := range plugin.Argv {
-			if arg == "" || len(arg) > 4096 {
+			if arg == "" || len(arg) > 4096 || !utf8.ValidString(arg) || strings.IndexByte(arg, 0) >= 0 {
 				return Config{}, errWorkerConfig
 			}
 		}
