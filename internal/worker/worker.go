@@ -534,7 +534,7 @@ func runScopedCheckLocal(parent context.Context, worktree string, env, argv []st
 	cmd.Env = env
 	cmd.Stdout = capture
 	cmd.Stderr = capture
-	err = processtree.Run(ctx, cmd)
+	err = processtree.RunInvocation(ctx, cmd)
 	output, redacted, truncated := capture.safeOutput()
 	result := scopedCheckResult{output: output, redacted: redacted, truncated: truncated, duration: time.Since(started), timedOut: errors.Is(ctx.Err(), context.DeadlineExceeded), err: err}
 	if cmd.ProcessState != nil {

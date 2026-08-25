@@ -2,6 +2,7 @@ package pluginprotocol
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -156,19 +157,35 @@ func TestRunCancellationInterruptsBlockedExecuteWrite(t *testing.T) {
 import json,pathlib,subprocess,sys,time
 init=json.loads(sys.stdin.readline())
 child=subprocess.Popen(["sleep","10"],start_new_session=`+newSession+`)
-pathlib.Path(`+strconv.Quote(pidFile)+`).write_text(str(child.pid))
+stat=pathlib.Path("/proc/"+str(child.pid)+"/stat")
+pathlib.Path(`+strconv.Quote(pidFile)+`).write_text(str(child.pid)+(" "+stat.read_text().split()[21] if stat.exists() else ""))
 print(json.dumps({"version":"v1","id":init["id"],"type":"initialized","capabilities":["workspace_edit"]},separators=(",",":")),flush=True)
+pathlib.Path(`+strconv.Quote(pidFile+".initialized")+`).write_text("ready")
 time.sleep(10)
 `)
-			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
+			done := make(chan error, 1)
 			started := time.Now()
-			_, err := Run(ctx, []string{plugin}, Request{Operation: WorkspaceEdit, Workspace: "/work", Instruction: strings.Repeat("\x01", MaxTextBytes), TimeoutMS: 1000}, Options{Timeout: 5 * time.Second, OutputBytes: 1 << 20})
+			go func() {
+				_, err := Run(ctx, []string{plugin}, Request{Operation: WorkspaceEdit, Workspace: "/work", Instruction: strings.Repeat("\x01", MaxTextBytes), TimeoutMS: 1000}, Options{Timeout: 5 * time.Second, OutputBytes: 1 << 20})
+				done <- err
+			}()
+			child := waitForChild(t, pidFile)
+			waitForFile(t, pidFile+".initialized")
+			cancel()
+			err := <-done
 			if !errors.Is(err, ErrCancelled) || time.Since(started) >= time.Second {
 				t.Fatalf("Run = %v after %v, want bounded cancellation", err, time.Since(started))
 			}
-			child := waitForChild(t, pidFile)
-			t.Cleanup(func() { _ = child.Kill() })
+			deadline := time.Now().Add(250 * time.Millisecond)
+			for childMarkerRunning(pidFile) && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if childMarkerRunning(pidFile) {
+				_ = child.Kill()
+				t.Fatal("child remains alive after cancellation")
+			}
 		})
 	}
 }
@@ -307,40 +324,59 @@ print(json.dumps({"version":"v1","id":init["id"],"type":"result","output":"ok"},
 }
 
 func TestRunSendsOneNegotiatedCancel(t *testing.T) {
-	marker := filepath.Join(t.TempDir(), "cancel")
+	dir := t.TempDir()
+	ready, marker := filepath.Join(dir, "ready"), filepath.Join(dir, "cancel")
 	plugin := pythonPlugin(t, `
 import json,pathlib,sys
 init=json.loads(sys.stdin.readline())
 print(json.dumps({"version":"v1","id":init["id"],"type":"initialized","capabilities":["workspace_edit","cancel"]},separators=(",",":")),flush=True)
 json.loads(sys.stdin.readline())
+pathlib.Path(`+strconv.Quote(ready)+`).write_text("ready")
 cancel=json.loads(sys.stdin.readline())
 pathlib.Path(`+strconv.Quote(marker)+`).write_text(json.dumps(cancel))
 print(json.dumps({"version":"v1","id":init["id"],"type":"failure","category":"cancelled"},separators=(",",":")),flush=True)
 `)
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	_, err := Run(ctx, []string{plugin}, Request{Operation: WorkspaceEdit, Workspace: "/work", Instruction: "edit", TimeoutMS: 1000}, Options{Timeout: time.Second, OutputBytes: 1 << 20, Capabilities: []Capability{Cancel}})
-	if err == nil {
-		t.Fatal("cancelled operation succeeded")
+	done := make(chan error, 1)
+	go func() {
+		_, err := Run(ctx, []string{plugin}, Request{Operation: WorkspaceEdit, Workspace: "/work", Instruction: "edit", TimeoutMS: 1000}, Options{Timeout: time.Second, OutputBytes: 1 << 20, Capabilities: []Capability{Cancel}})
+		done <- err
+	}()
+	waitForFile(t, ready)
+	cancel()
+	if err := <-done; !errors.Is(err, ErrCancelled) {
+		t.Fatalf("Run = %v, want cancellation", err)
 	}
 	body, readErr := os.ReadFile(marker)
-	if readErr != nil || strings.Count(string(body), `"type": "cancel"`) != 1 {
+	var frame cancelFrame
+	decodeErr := json.Unmarshal(body, &frame)
+	if readErr != nil || decodeErr != nil || frame.Version != Version || frame.Type != "cancel" || !validID(frame.ID) || strings.Count(string(body), `"type": "cancel"`) != 1 {
 		t.Fatalf("cancel marker = %q, %v", body, readErr)
 	}
 }
 
 func TestRunCancellationWinsSuccessRace(t *testing.T) {
+	ready := filepath.Join(t.TempDir(), "ready")
 	plugin := pythonPlugin(t, `
-import json,sys
+import json,pathlib,sys
 init=json.loads(sys.stdin.readline())
 print(json.dumps({"version":"v1","id":init["id"],"type":"initialized","capabilities":["workspace_edit","cancel"]},separators=(",",":")),flush=True)
 json.loads(sys.stdin.readline())
+pathlib.Path(`+strconv.Quote(ready)+`).write_text("ready")
 json.loads(sys.stdin.readline())
 print(json.dumps({"version":"v1","id":init["id"],"type":"result"},separators=(",",":")),flush=True)
 `)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if _, err := Run(ctx, []string{plugin}, Request{Operation: WorkspaceEdit, Workspace: "/work", Instruction: "edit", TimeoutMS: 1000}, Options{Timeout: time.Second, OutputBytes: 1 << 20, Capabilities: []Capability{Cancel}}); !errors.Is(err, ErrCancelled) {
+	done := make(chan error, 1)
+	go func() {
+		_, err := Run(ctx, []string{plugin}, Request{Operation: WorkspaceEdit, Workspace: "/work", Instruction: "edit", TimeoutMS: 1000}, Options{Timeout: time.Second, OutputBytes: 1 << 20, Capabilities: []Capability{Cancel}})
+		done <- err
+	}()
+	waitForFile(t, ready)
+	cancel()
+	if err := <-done; !errors.Is(err, ErrCancelled) {
 		t.Fatalf("cancel/success race = %v, want cancelled", err)
 	}
 }
@@ -524,7 +560,12 @@ func waitForChild(t *testing.T, path string) *os.Process {
 	for time.Now().Before(deadline) {
 		body, err := os.ReadFile(path)
 		if err == nil {
-			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(body)))
+			fields := strings.Fields(string(body))
+			if len(fields) == 0 {
+				time.Sleep(time.Millisecond)
+				continue
+			}
+			pid, parseErr := strconv.Atoi(fields[0])
 			if parseErr == nil && pid > 0 {
 				process, findErr := os.FindProcess(pid)
 				if findErr == nil {
@@ -536,6 +577,31 @@ func waitForChild(t *testing.T, path string) *os.Process {
 	}
 	t.Fatal("child did not start")
 	return nil
+}
+
+func childMarkerRunning(path string) bool {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	fields := strings.Fields(string(body))
+	if len(fields) == 0 {
+		return false
+	}
+	pid, err := strconv.Atoi(fields[0])
+	if err != nil {
+		return false
+	}
+	if len(fields) > 1 {
+		stat, err := os.ReadFile(filepath.Join("/proc", fields[0], "stat"))
+		if err != nil {
+			return false
+		}
+		current := strings.Fields(string(stat))
+		return len(current) >= 22 && current[21] == fields[1] && current[2] != "Z"
+	}
+	process, _ := os.FindProcess(pid)
+	return process.Signal(os.Signal(nil)) == nil
 }
 
 func TestWaitForChildRetriesIncompleteMarker(t *testing.T) {

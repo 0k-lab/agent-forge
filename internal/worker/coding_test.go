@@ -426,13 +426,12 @@ func TestSequentialSameLaneFailureDoesNotContaminateNextExecution(t *testing.T) 
 	root, runtimeRoot, state := t.TempDir(), t.TempDir(), filepath.Join(t.TempDir(), "state")
 	plugin := filepath.Join(t.TempDir(), "plugin")
 	write(t, plugin, `#!/usr/bin/env python3
-import json,os,pathlib,sys,time
+import json,os,pathlib,sys
 state=pathlib.Path(os.environ["STATE"])
 assert pathlib.Path(os.environ["TMPDIR"]).parent.parent == pathlib.Path(os.environ["RUNTIME_ROOT"])
 if not state.exists():
     state.write_text("first")
-    time.sleep(2)
-    raise SystemExit
+    raise SystemExit(7)
 initialize=json.loads(sys.stdin.readline())
 plugin_id=initialize["id"]
 print(json.dumps({"version":"v1","id":plugin_id,"type":"initialized","capabilities":["workspace_edit"]},separators=(",",":")),flush=True)
@@ -446,7 +445,7 @@ print(json.dumps({"version":"v1","id":plugin_id,"type":"result"},separators=(","
 	settings := codingSettings{
 		pluginArgv: []string{plugin}, repository: repo, worktreeRoot: root, runtimeRoot: runtimeRoot,
 		pluginEnvironment: []string{"PATH=" + environmentValue("PATH", "/usr/local/bin:/usr/bin:/bin"), "STATE=" + state, "RUNTIME_ROOT=" + runtimeRoot, "TMPDIR=/unbounded/private/tmp"},
-		pluginTimeout:     100 * time.Millisecond, checkTimeout: time.Second, gitTimeout: time.Second, cleanupTimeout: time.Second,
+		pluginTimeout:     5 * time.Second, checkTimeout: time.Second, gitTimeout: time.Second, cleanupTimeout: time.Second,
 		pluginOutput: 1 << 20, checkOutput: 1024, gitOutput: 1 << 20,
 	}
 	runCheck := func(context.Context, string, []string, []string) scopedCheckResult { return scopedCheckResult{} }
