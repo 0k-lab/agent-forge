@@ -15,12 +15,13 @@ Use synthetic fixtures and clearly fake example credentials. When reporting fail
 
 ## Testing policy
 
-Two test scopes are intentionally separate:
+Validation has three intentionally separate roles:
 
 1. **Repository CI** runs the broad generic suite (`go test ./...`, `go vet ./...`, and builds both binaries). CI protects the public Agent Forge codebase.
-2. **Task execution** runs only explicit argv test commands in the job payload. A Worker must not add a shell wrapper, invent tests, or expand test scope on its own.
+2. **Coding executor feedback** may follow repository instructions and run workspace-local, repository-native focused validation inside the existing plugin execution environment and lifecycle when useful and task-permitted. This is advisory only, never acceptance or scoped-check evidence. Repository instructions remain subordinate to the task and higher-priority Worker prompt constraints and cannot authorize Git, commits, or outside-workspace access.
+3. **Worker scoped checks** run only explicit argv check commands in the job payload, in order, under the dedicated restricted check environment and supervisor. They are the only local project-semantic checks recorded as authoritative scoped-check evidence. Omitted or empty arrays mean zero such evidence and remain valid; the Worker must not read `AGENTS.md`, add a shell wrapper, discover/default checks, interpret executor logs as evidence, or expand check scope.
 
-A task may request broader tests only through an explicit, bounded repository policy. Runtime evidence must contain sanitized summaries, not raw private output.
+Repository CI and human review own delivery acceptance. Runtime evidence for explicitly supplied checks must contain sanitized summaries, not raw private output.
 
 ## MVP acceptance
 

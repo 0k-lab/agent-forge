@@ -301,6 +301,32 @@ func TestCodingOutcomeBindsSuccessfulCandidateToPriorChecks(t *testing.T) {
 	}
 }
 
+func TestCodingOutcomeWithoutScopedChecksCreatesCandidate(t *testing.T) {
+	repo, base, plugin := codingFixture(t, "#!/bin/sh\nexit 0\n")
+	jobID, attemptID := strings.Repeat("1", 32), strings.Repeat("2", 32)
+	runner := func(context.Context, string, []string, []string) scopedCheckResult {
+		t.Fatal("scoped check runner called")
+		return scopedCheckResult{}
+	}
+	outcome := executeCodingOutcomeWithRunner(context.Background(), plugin, []string{repo}, jobID, attemptID, protocol.CodingTask{
+		Repository: repo, BaseSHA: base, Instruction: "edit",
+	}, runner)
+	defer outcome.cleanup()
+	if outcome.err != nil || !fixedLowerHex(outcome.candidateSHA, 40) || len(outcome.evidence) != 0 {
+		t.Fatalf("outcome = %#v", outcome)
+	}
+	ref := "refs/agent-forge/candidates/" + jobID + "/" + attemptID
+	if got := git(t, repo, "rev-parse", "--verify", ref+"^{commit}"); got != outcome.candidateSHA {
+		t.Fatalf("candidate ref = %s, want %s", got, outcome.candidateSHA)
+	}
+	if got := git(t, repo, "rev-parse", outcome.candidateSHA+"^"); got != base {
+		t.Fatalf("candidate parent = %s, want %s", got, base)
+	}
+	if got := git(t, repo, "show", outcome.candidateSHA+":answer.txt"); got != "candidate" {
+		t.Fatalf("candidate content = %q", got)
+	}
+}
+
 func TestCodingOutcomeCleanupIsIdempotentAndLeavesEvidenceInMemory(t *testing.T) {
 	repo, base, plugin := codingFixture(t, "#!/bin/sh\nexit 0\n")
 	marker := filepath.Join(t.TempDir(), "workspace")

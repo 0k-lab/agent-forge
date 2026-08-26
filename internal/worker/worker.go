@@ -326,7 +326,7 @@ func executeCodingOutcomeSettings(ctx context.Context, settings codingSettings, 
 	if err := protocol.ValidateCommitAuthor(task.CommitAuthorName, task.CommitAuthorEmail); err != nil {
 		return fail(protocol.EvidencePhasePreparation, protocol.EvidenceReasonInvalidTask, invalidTask(err))
 	}
-	if task.Instruction == "" || len(task.Instruction) > pluginprotocol.MaxTextBytes || !utf8.ValidString(task.Instruction) || len(task.Tests) == 0 || len(task.Tests) > 32 || !fixedLowerHex(task.BaseSHA, 40) {
+	if task.Instruction == "" || len(task.Instruction) > pluginprotocol.MaxTextBytes || !utf8.ValidString(task.Instruction) || len(task.Tests) > 32 || !fixedLowerHex(task.BaseSHA, 40) {
 		return fail(protocol.EvidencePhasePreparation, protocol.EvidenceReasonInvalidTask, invalidTask(errors.New("invalid coding task")))
 	}
 	for _, argv := range task.Tests {

@@ -78,6 +78,25 @@ func TestConfiguredSubmissionResolvesRepositoryPolicyAndPool(t *testing.T) {
 	}
 }
 
+func TestConfiguredSubmissionAcceptsOmittedOrEmptyScopedChecks(t *testing.T) {
+	_, _, server := configuredGate(t)
+	for name, tests := range map[string]string{"omitted": "", "empty": `,"tests":[]`} {
+		t.Run(name, func(t *testing.T) {
+			request := `{"repository_id":"agent-forge","base_sha":"` + strings.Repeat("a", 40) + `","instruction":"change"` + tests + `}`
+			req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/jobs", strings.NewReader(request))
+			req.Header.Set("Authorization", "Bearer owner")
+			response, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusCreated {
+				t.Fatalf("submit status = %d", response.StatusCode)
+			}
+		})
+	}
+}
+
 func TestConfiguredStartupRejectsMalformedRowsBeforeDisconnectOrLease(t *testing.T) {
 	values := map[string]string{"FORGE_OWNER_TOKEN": "owner", "FORGE_WORKER_TOKEN": "worker"}
 	config, err := ParseConfig([]byte(validGateConfig), func(name string) string { return values[name] })

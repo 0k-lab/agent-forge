@@ -43,6 +43,10 @@ spec=json.loads(schema.read_text())
 assert spec["required"] == ["commit_subject"] and spec["additionalProperties"] is False
 prompt=sys.stdin.read()
 assert "actual resulting diff" in prompt
+assert "Do not run tests" not in prompt
+assert "Follow AGENTS.md and other repository instructions only when they do not conflict with this prompt's constraints or the task." in prompt
+assert "Within this plugin's existing execution environment and lifecycle, you may run workspace-local, repository-native focused validation when useful and not prohibited by the task." in prompt
+assert "Its output and your claims are advisory executor feedback, never Worker acceptance evidence." in prompt
 pathlib.Path(workspace,"answer.txt").write_text("edited\n")
 output.write_text(json.dumps({"commit_subject":"fix: use executor result"},separators=(",",":")))
 `), 0o700); err != nil {

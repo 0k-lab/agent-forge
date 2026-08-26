@@ -117,16 +117,20 @@ Gate performs an expiry sweep before it starts serving, then repeats at the conf
 
 The sanitized timeline exposes attempt ordinals, lease expiry, retry scheduling, dispositions, bounded failure codes, and success without task content, result bodies, tokens, private repository paths, or cursor secrets.
 
-Submit a coding task with a stable repository ID, full base SHA, instruction, explicit scoped argv arrays, and an optional paired commit author:
+Submit a coding task with a stable repository ID, full base SHA, instruction, optional scoped-check argv arrays, and an optional paired commit author:
 
 ```json
 {"repository_id":"agent-forge","base_sha":"0123456789abcdef0123456789abcdef01234567","instruction":"Fix the failing focused test.","tests":[["go","test","./internal/example","-run","TestFocused"]],"commit_author_name":"kricha","commit_author_email":"4619899+kricha@users.noreply.github.com"}
 ```
 
+The Codex plugin may follow non-conflicting repository instructions and run workspace-local, repository-native focused validation inside its existing execution environment and lifecycle. That output and any resulting claim are advisory executor feedback, never Worker acceptance evidence. Repository instructions cannot override the task or higher-priority Worker prompt constraints, authorize Git or commits, or allow access outside the workspace.
+
+Only `tests` argv explicitly supplied by the task run as authoritative Worker scoped checks, in their dedicated restricted check environment and supervisor. The Worker never reads `AGENTS.md`, discovers or defaults checks, or treats executor logs as check evidence. `tests` may be omitted or empty; the Worker then still creates and validates the structural candidate commit/ref but emits zero scoped-check evidence. Repository CI and human review own delivery acceptance.
+
 `commit_author_name` and `commit_author_email` must be supplied together or both omitted. Names are limited to 256 bytes and emails to 254 bytes; leading or trailing Unicode whitespace, unsafe Git-header characters, and malformed addresses are rejected. A supplied identity becomes the exact Git Author, while Git Committer remains `Agent Forge <forge@example.invalid>`. If both fields are omitted, both identities use that Agent Forge fallback for compatibility.
 
 The terminal job contains `candidate_sha`; its deterministic candidate ref keeps that commit reachable after worktree removal, reflog expiration, and garbage collection. With no configured repository roots, legacy jobs still run and coding jobs fail with a bounded reason.
 
-Before worktree creation, Worker requires the exact base commit to exist and be an ancestor of its configured local `refs/heads/<default_branch>`. It never fetches. Unknown IDs, default-branch mismatch, symlink/canonical drift, root escape, or Gate limits above local ceilings fail closed with path/argv/secret-free errors. Scoped argv remains task data; no central verification profile or global command allowlist is introduced. Production Workers should run as dedicated unprivileged accounts or containers.
+Before worktree creation, Worker requires the exact base commit to exist and be an ancestor of its configured local `refs/heads/<default_branch>`. It never fetches. Unknown IDs, default-branch mismatch, symlink/canonical drift, root escape, or Gate limits above local ceilings fail closed with path/argv/secret-free errors. Supplied scoped argv remains task data; no central verification profile or global command allowlist is introduced. Production Workers should run as dedicated unprivileged accounts or containers.
 
 Run `scripts/e2e.sh` for the reference transport proof, `scripts/plugin-conformance-e2e.sh` for deterministic reference/Python/fake-Codex protocol conformance, `scripts/recovery-e2e.sh` for restart/expiry/retry/late-result recovery, `scripts/evidence-e2e.sh` for the self-contained bounded-evidence/privacy proof, `scripts/sqlite-permissions-e2e.sh` for the Gate SQLite permission/startup proof, and `CODEX_BIN=/path/to/codex scripts/coding-e2e.sh` for the real coding proof. The scripts use synthetic data; recovery artifacts stay in a temporary directory and all spawned processes are cleaned up.

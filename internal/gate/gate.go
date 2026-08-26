@@ -522,8 +522,8 @@ func validateTask(task protocol.CodingTask) error {
 	if err := protocol.ValidateBaseSHA(task.BaseSHA); err != nil {
 		return err
 	}
-	if task.Instruction == "" || len(task.Instruction) > 65536 || len(task.Tests) == 0 || len(task.Tests) > 32 {
-		return errors.New("instruction and scoped tests are required")
+	if task.Instruction == "" || len(task.Instruction) > 65536 || len(task.Tests) > 32 {
+		return errors.New("invalid instruction or scoped tests")
 	}
 	for _, argv := range task.Tests {
 		if len(argv) == 0 || len(argv) > 64 {
