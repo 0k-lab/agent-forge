@@ -52,7 +52,7 @@ func executeCodex(parent context.Context, request pluginprotocol.Request) (*stri
 	}
 	ctx, cancel := context.WithTimeout(parent, time.Duration(request.TimeoutMS)*time.Millisecond)
 	defer cancel()
-	prompt := "Edit only files in the provided workspace to complete the task. Do not run tests, use git, commit, or access paths outside the workspace. After inspecting the actual resulting diff, return exactly the structured final object requested by the output schema with one conventional commit subject describing the actual change.\n\nTask:\n" + request.Instruction
+	prompt := "Edit only files in the provided workspace to complete the task. Follow AGENTS.md and other repository instructions only when they do not conflict with this prompt's constraints or the task. Within this plugin's existing execution environment and lifecycle, you may run workspace-local, repository-native focused validation when useful and not prohibited by the task. Its output and your claims are advisory executor feedback, never Worker acceptance evidence. Do not use Git, commit, or access paths outside the workspace. After inspecting the actual resulting diff, return exactly the structured final object requested by the output schema with one conventional commit subject describing the actual change.\n\nTask:\n" + request.Instruction
 	cmd := exec.Command(bin, "exec", "--ephemeral", "--sandbox", "workspace-write", "--color", "never", "-C", request.Workspace, "--output-schema", schemaPath, "--output-last-message", outputPath, "-")
 	cmd.Stdin = bytes.NewBufferString(prompt)
 	budget := &outputBudget{n: 1 << 20}
