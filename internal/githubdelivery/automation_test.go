@@ -31,8 +31,14 @@ func (h *automationHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/octo/repo":
 		io.WriteString(w, `{"full_name":"octo/repo","private":false,"owner":{"type":"User"}}`)
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/octo/repo/installation":
-		io.WriteString(w, `{"id":7,"permissions":{"actions":"read","contents":"write","pull_requests":"write"}}`)
+		io.WriteString(w, `{"id":7,"permissions":{"contents":"write","pull_requests":"write"}}`)
 	case r.Method == http.MethodPost && r.URL.Path == "/app/installations/7/access_tokens":
+		var body struct {
+			Permissions map[string]string `json:"permissions"`
+		}
+		if json.NewDecoder(r.Body).Decode(&body) != nil || body.Permissions["actions"] != "" {
+			h.t.Fatalf("installation token requested Actions permission: %#v", body.Permissions)
+		}
 		io.WriteString(w, `{"token":"installation-token","expires_at":"2099-01-01T00:00:00Z"}`)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/octo/repo/git/ref/heads/"):
 		sha := h.candidate
@@ -55,6 +61,9 @@ func (h *automationHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/octo/repo/pulls/42":
 		io.WriteString(w, h.pullJSON(h.changedHead))
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/octo/repo/actions/runs":
+		if r.Header.Get("Authorization") != "" {
+			h.t.Fatal("public Actions observation used installation credentials")
+		}
 		if h.transientRuns > 0 {
 			h.transientRuns--
 			w.WriteHeader(http.StatusServiceUnavailable)

@@ -41,7 +41,7 @@ func DeliverAndMerge(parent context.Context, cfg Config, input Publication, opti
 	}
 	op := normalizeOptions(options.Options)
 	api := newAPI(cfg, op, key)
-	permissions := map[string]string{"actions": "read", "contents": "write", "pull_requests": "write"}
+	permissions := map[string]string{"contents": "write", "pull_requests": "write"}
 	installation, err := api.preflight(ctx, permissions)
 	if err != nil {
 		return AutomationResult{}, err
@@ -95,7 +95,7 @@ func DeliverAndMerge(parent context.Context, cfg Config, input Publication, opti
 		if err := exactPullIdentity(pr, input); err != nil {
 			return AutomationResult{}, err
 		}
-		runs, err := api.workflowRuns(ctx, token, input)
+		runs, err := api.workflowRuns(ctx, input)
 		if err != nil {
 			return AutomationResult{}, err
 		}
@@ -212,13 +212,13 @@ type workflowRun struct {
 	Conclusion string `json:"conclusion"`
 }
 
-func (a *apiClient) workflowRuns(ctx context.Context, token string, input Publication) ([]workflowRun, error) {
+func (a *apiClient) workflowRuns(ctx context.Context, input Publication) ([]workflowRun, error) {
 	query := url.Values{"head_sha": {input.CandidateSHA}, "branch": {input.NewBranch}, "event": {"pull_request"}, "per_page": {"100"}}
 	var response struct {
 		TotalCount int           `json:"total_count"`
 		Runs       []workflowRun `json:"workflow_runs"`
 	}
-	status, err := a.request(ctx, http.MethodGet, "/repos/"+escaped(a.cfg.Owner)+"/"+escaped(a.cfg.Repository)+"/actions/runs?"+query.Encode(), token, nil, &response)
+	status, err := a.request(ctx, http.MethodGet, "/repos/"+escaped(a.cfg.Owner)+"/"+escaped(a.cfg.Repository)+"/actions/runs?"+query.Encode(), "", nil, &response)
 	if err != nil {
 		return nil, err
 	}
