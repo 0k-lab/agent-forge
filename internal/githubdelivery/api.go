@@ -83,7 +83,8 @@ func (a *apiClient) preflight(ctx context.Context, required map[string]string) (
 		return 0, classify(status)
 	}
 	for name, permission := range required {
-		if installation.Permissions[name] != permission {
+		actual := installation.Permissions[name]
+		if actual != permission && !(permission == "read" && actual == "write") {
 			return 0, failure("permission_missing")
 		}
 	}
@@ -143,16 +144,21 @@ func (a *apiClient) branch(ctx context.Context, token, branch string) (string, b
 }
 
 type pull struct {
-	Number  int    `json:"number"`
-	HTMLURL string `json:"html_url"`
-	Title   string `json:"title"`
-	Body    string `json:"body"`
-	Head    struct {
+	Number         int    `json:"number"`
+	HTMLURL        string `json:"html_url"`
+	Title          string `json:"title"`
+	Body           string `json:"body"`
+	State          string `json:"state"`
+	Merged         bool   `json:"merged"`
+	MergeCommitSHA string `json:"merge_commit_sha"`
+	Head           struct {
 		Ref   string `json:"ref"`
 		Label string `json:"label"`
+		SHA   string `json:"sha"`
 	} `json:"head"`
 	Base struct {
 		Ref string `json:"ref"`
+		SHA string `json:"sha"`
 	} `json:"base"`
 }
 
@@ -252,6 +258,23 @@ func (a *apiClient) reconcilePR(ctx context.Context, token string, input Publica
 		}
 		if pr != nil {
 			return finish(*pr)
+		}
+		if status == http.StatusUnprocessableEntity {
+			closedQuery := url.Values{"state": {"closed"}, "head": {a.cfg.Owner + ":" + input.NewBranch}, "base": {input.BaseBranch}}
+			var closed []pull
+			closedStatus, closedErr := a.request(ctx, "GET", "/repos/"+escaped(a.cfg.Owner)+"/"+escaped(a.cfg.Repository)+"/pulls?"+closedQuery.Encode(), token, nil, &closed)
+			if closedErr != nil {
+				return "", closedErr
+			}
+			if closedStatus != http.StatusOK {
+				return "", classify(closedStatus)
+			}
+			if len(closed) > 1 || len(closed) == 1 && (!closed[0].Merged || closed[0].Head.SHA != "" && closed[0].Head.SHA != input.CandidateSHA) {
+				return "", failure("pull_request_conflict")
+			}
+			if len(closed) == 1 {
+				return finish(closed[0])
+			}
 		}
 		if attempt == 1 {
 			if createErr != nil || retryable(status) || status >= 200 && status < 300 {

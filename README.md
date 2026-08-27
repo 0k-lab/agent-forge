@@ -4,10 +4,10 @@ A minimal Go vertical slice: submit a job to **forge-gate**, persist it in SQLit
 
 ## Boundaries
 
-- **Gate** owns repository registrations and authorization, public-source clone/fetch/reuse, prepared local repository paths, Worker pools and authenticated slots, submission-time lifecycle/execution policy resolution, leases, and authoritative SQLite state.
-- **Worker** consumes Gate-prepared local repositories, maps legacy static repository IDs to local paths, and owns plugin-ID-to-local-argv mappings, worktree/runtime roots, inherited-environment allowlisting, and local timeout/output ceilings. External repository URLs and credentials never cross the Gate/Worker boundary.
+- **Gate** owns repository registrations and authorization, public-source clone/fetch/reuse, prepared local repository paths, Worker pools and authenticated slots, submission-time lifecycle/execution policy resolution, leases, exact GitHub App publication, CI observation/merge, and authoritative SQLite state.
+- **Worker** consumes Gate-prepared local repositories, edits, runs only instructed checks, commits locally, and returns the candidate SHA/evidence. External repository URLs and GitHub credentials never cross the Gate/Worker boundary; Worker never clones, pushes, or writes external APIs.
 - **Plugin** uses the strict NDJSON [plugin protocol v1](docs/plugin-protocol-v1.md). The reference plugin implements `text`; `forge-codex-plugin` implements `workspace_edit`, invokes `CODEX_BIN` (default `codex`) with bounded output and a timeout, obtains the actual-diff commit subject through Codex structured output, and never reports business success or commits.
-- This MVP deliberately has no control panel, Docker, merge/CI orchestration, reviewer, mTLS, PostgreSQL, or plugin marketplace. Its only browser UI is a read-only debug viewer. GitHub delivery is an optional, separate local CLI.
+- This MVP deliberately has no control panel, Docker, reviewer, mTLS, PostgreSQL, or plugin marketplace. Its only browser UI is a read-only debug viewer. GitHub delivery is optional.
 
 ## Build and test
 
@@ -61,6 +61,14 @@ FORGE_WORKER_TOKEN=fake-worker-token ./bin/forge-worker -config worker.json
 ```
 
 ## Optional GitHub delivery
+
+Add Gate-owned automatic delivery beside the public repository settings. The App ID value is read only from the named environment variable; the private key remains at the named protected path. Delivery retries do not rerun Worker:
+
+```json
+{"delivery":{"api_base":"https://api.github.com","github_app_id_env":"FORGE_GITHUB_APP_ID","github_app_private_key_path":"/srv/forge/secrets/github-app.pem","max_attempts":3,"retry_base":"5s","poll_interval":"10s","no_runs_grace":"2m","timeout":"30m"}}
+```
+
+With this configured, a coding candidate enters `delivering`; `forge submit --wait` continues through exact branch/PR reconciliation, canonical GitHub Actions polling, and exact-head merge. Status, result, and events expose only the delivery phase, deterministic branch, PR URL, CI state, merge SHA, and allowlisted failure code. Without it, candidate-only behavior is unchanged.
 
 `forge-github` publishes one already-reviewed Worker candidate without reading Gate SQLite or Worker credentials. It must run as the same trusted local UID that owns the non-group/world-writable repository root. Production config accepts only `https://api.github.com`. The config and App private key must be owned regular `0600` files in owned directories that are not group/world writable. `git_executable` must be the canonical absolute path of an owned executable regular file whose file and parent are not group/world writable.
 
@@ -160,7 +168,7 @@ Only `tests` argv explicitly supplied by the task run as authoritative Worker sc
 
 `commit_author_name` and `commit_author_email` must be supplied together or both omitted. Names are limited to 256 bytes and emails to 254 bytes; leading or trailing Unicode whitespace, unsafe Git-header characters, and malformed addresses are rejected. A supplied identity becomes the exact Git Author, while Git Committer remains `Agent Forge <forge@example.invalid>`. If both fields are omitted, both identities use that Agent Forge fallback for compatibility.
 
-The terminal job contains `candidate_sha`; its deterministic candidate ref keeps that commit reachable after worktree removal, reflog expiration, and garbage collection. With no configured repository roots, legacy jobs still run and coding jobs fail with a bounded reason.
+The coding attempt contains `candidate_sha`; its deterministic candidate ref keeps that commit reachable after worktree removal, reflog expiration, and garbage collection. Without automatic delivery it is also the terminal job result; with delivery configured the job becomes terminal only after merge or a typed delivery failure. With no configured repository roots, legacy jobs still run and coding jobs fail with a bounded reason.
 
 Before worktree creation, Worker requires the exact base commit to exist and be an ancestor of `refs/heads/<default_branch>`. Static registrations never fetch; Gate prepares configured public sources as described above. Unknown identities, default-branch mismatch, canonical path drift, or Gate limits above local ceilings fail closed with path/argv/secret-free errors. Supplied scoped argv remains task data; no central verification profile or global command allowlist is introduced. Production Workers should run as dedicated unprivileged accounts or containers.
 

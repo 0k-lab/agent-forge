@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -95,6 +95,17 @@ CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value BLOB NOT NULL);
 			}
 		}
 		_, err := tx.Exec(`CREATE INDEX IF NOT EXISTS jobs_worker_pool_ready ON jobs(worker_pool,status,retry_at,created_at,id)`)
+		return err
+	case 4:
+		_, err := tx.Exec(`CREATE TABLE IF NOT EXISTS deliveries (
+			job_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, candidate_sha TEXT NOT NULL, expected_tree_sha TEXT NOT NULL,
+			parent_sha TEXT NOT NULL, candidate_ref TEXT NOT NULL, repository_id TEXT NOT NULL, repository_url TEXT NOT NULL,
+			default_branch TEXT NOT NULL, branch TEXT NOT NULL, pr_title TEXT NOT NULL, pr_body TEXT NOT NULL,
+			phase TEXT NOT NULL CHECK(phase IN ('pending','publishing','ci','merging','retry_wait','merged','failed')),
+			pr_url TEXT NOT NULL DEFAULT '', pr_number INTEGER NOT NULL DEFAULT 0, ci_state TEXT NOT NULL DEFAULT '',
+			merge_sha TEXT NOT NULL DEFAULT '', failure_code TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0,
+			max_attempts INTEGER NOT NULL, retry_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);
+		CREATE INDEX IF NOT EXISTS deliveries_ready ON deliveries(phase,retry_at,updated_at,job_id);`)
 		return err
 	default:
 		return errors.New("unsupported database schema")

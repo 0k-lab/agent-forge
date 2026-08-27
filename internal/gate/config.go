@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"agent-forge/internal/configjson"
+	"agent-forge/internal/githubdelivery"
 	"agent-forge/internal/protocol"
 	"agent-forge/internal/store"
 )
@@ -56,6 +57,17 @@ type RepositoryRegistration struct {
 	Execution     ExecutionConfig `json:"execution"`
 }
 
+type DeliveryConfig struct {
+	APIBase        string
+	AppID          string `json:"-"`
+	PrivateKeyPath string
+	MaxAttempts    int
+	RetryBase      time.Duration
+	PollInterval   time.Duration
+	NoRunsGrace    time.Duration
+	Timeout        time.Duration
+}
+
 type Config struct {
 	Version              int
 	Listen               string
@@ -70,6 +82,7 @@ type Config struct {
 	Repositories         []RepositoryRegistration
 	PublicRepositoryRoot string
 	GitExecutable        string
+	Delivery             *DeliveryConfig
 	ownerToken           string
 	ownerDigest          [sha256.Size]byte
 	workerTokens         []workerCredential
@@ -120,6 +133,18 @@ type rawGateConfig struct {
 	Repositories         []rawRepository      `json:"repositories"`
 	PublicRepositoryRoot string               `json:"public_repository_root"`
 	GitExecutable        string               `json:"git_executable"`
+	Delivery             *rawDeliveryConfig   `json:"delivery"`
+}
+
+type rawDeliveryConfig struct {
+	APIBase        string `json:"api_base"`
+	AppIDEnv       string `json:"github_app_id_env"`
+	PrivateKeyPath string `json:"github_app_private_key_path"`
+	MaxAttempts    int    `json:"max_attempts"`
+	RetryBase      string `json:"retry_base"`
+	PollInterval   string `json:"poll_interval"`
+	NoRunsGrace    string `json:"no_runs_grace"`
+	Timeout        string `json:"timeout"`
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -209,6 +234,31 @@ func ParseConfig(data []byte, getenv func(string) string) (Config, error) {
 	}
 	if publicRepositories > 0 && c.PublicRepositoryRoot == "" {
 		return Config{}, errConfig
+	}
+	if raw.Delivery != nil {
+		d := &DeliveryConfig{APIBase: raw.Delivery.APIBase, AppID: getenv(raw.Delivery.AppIDEnv), PrivateKeyPath: raw.Delivery.PrivateKeyPath, MaxAttempts: raw.Delivery.MaxAttempts}
+		if publicRepositories == 0 || !envName.MatchString(raw.Delivery.AppIDEnv) || d.MaxAttempts < 1 || d.MaxAttempts > 100 {
+			return Config{}, errConfig
+		}
+		for _, item := range []struct {
+			value  string
+			target *time.Duration
+		}{{raw.Delivery.RetryBase, &d.RetryBase}, {raw.Delivery.PollInterval, &d.PollInterval}, {raw.Delivery.NoRunsGrace, &d.NoRunsGrace}, {raw.Delivery.Timeout, &d.Timeout}} {
+			if *item.target, err = boundedDuration(item.value, time.Millisecond, 24*time.Hour); err != nil {
+				return Config{}, errConfig
+			}
+		}
+		var source publicSource
+		for _, repository := range c.Repositories {
+			if repository.RepositoryURL != "" {
+				source, _ = canonicalPublicGitHubURL(repository.RepositoryURL)
+				break
+			}
+		}
+		if githubdelivery.ValidateConfig(githubdelivery.Config{Version: 1, APIBase: d.APIBase, Owner: source.Owner, Repository: source.Repository, LocalRepository: c.PublicRepositoryRoot, GitExecutable: c.GitExecutable, AppID: d.AppID, PrivateKeyPath: d.PrivateKeyPath}) != nil {
+			return Config{}, errConfig
+		}
+		c.Delivery = d
 	}
 	return c, nil
 }

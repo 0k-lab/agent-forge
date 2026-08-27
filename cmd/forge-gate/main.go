@@ -92,6 +92,9 @@ func run(args []string, logger *slog.Logger) error {
 	options.RecoveryInterval = config.RecoveryInterval
 	options.LeasePollInterval = config.LeasePollInterval
 	options.Logger = logger
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	options.Context = ctx
 	s, err := store.Open(config.Database)
 	if err != nil {
 		return err
@@ -101,8 +104,6 @@ func run(args []string, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	recoveryErr, err := gate.StartConfiguredRecovery(ctx, s, config.RecoveryInterval, options.Now)
 	if err != nil {
 		return fmt.Errorf("recovery startup: %w", err)

@@ -712,6 +712,13 @@ func (s *Store) CompleteCandidateAt(jobID, attemptID, candidateSHA string, at ti
 	return s.terminal(jobID, attemptID, "succeeded", "", candidateSHA, "", at.UTC())
 }
 
+func (s *Store) CompleteCandidateDeliveryLeaseAt(jobID, attemptID, slot, generation string, delivery Delivery, at time.Time) (Job, error) {
+	if delivery.JobID != jobID || delivery.AttemptID != attemptID || !lowerHex(jobID, 32) || !lowerHex(attemptID, 32) || !lowerHex(delivery.CandidateSHA, 40) || !lowerHex(delivery.ExpectedTreeSHA, 40) || !lowerHex(delivery.ParentSHA, 40) || delivery.CandidateRef != "refs/agent-forge/candidates/"+jobID+"/"+attemptID || delivery.RepositoryID == "" || delivery.RepositoryURL == "" || delivery.DefaultBranch == "" || delivery.Branch == "" || delivery.PRTitle == "" || delivery.MaxAttempts < 1 || delivery.MaxAttempts > 100 {
+		return Job{}, errors.New("invalid delivery")
+	}
+	return s.terminalOwnedState(jobID, attemptID, "succeeded", "", delivery.CandidateSHA, "", at.UTC(), slot, generation, true, &delivery)
+}
+
 func (s *Store) Fail(jobID, attemptID, code string) (Job, error) {
 	return s.FailAt(jobID, attemptID, code, TerminalFailure, time.Now().UTC(), DefaultRecoveryPolicy())
 }
@@ -780,6 +787,10 @@ func (s *Store) terminal(jobID, attemptID, attemptStatus, result, candidateSHA, 
 }
 
 func (s *Store) terminalOwned(jobID, attemptID, attemptStatus, result, candidateSHA, failure string, at time.Time, slot, generation string, enforceOwnership bool) (Job, error) {
+	return s.terminalOwnedState(jobID, attemptID, attemptStatus, result, candidateSHA, failure, at, slot, generation, enforceOwnership, nil)
+}
+
+func (s *Store) terminalOwnedState(jobID, attemptID, attemptStatus, result, candidateSHA, failure string, at time.Time, slot, generation string, enforceOwnership bool, delivery *Delivery) (Job, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Job{}, err
@@ -800,6 +811,9 @@ func (s *Store) terminalOwned(jobID, attemptID, attemptStatus, result, candidate
 	jobStatus := "failed"
 	if attemptStatus == "succeeded" {
 		jobStatus = "succeeded"
+	}
+	if delivery != nil {
+		jobStatus = "delivering"
 	}
 	disposition := ""
 	if attemptStatus == "terminal_failed" {
@@ -860,6 +874,14 @@ func (s *Store) terminalOwned(jobID, attemptID, attemptStatus, result, candidate
 		}
 		return Job{}, fmt.Errorf("job terminal update affected %d rows", n)
 	}
+	if delivery != nil {
+		if _, err = tx.Exec(`INSERT INTO deliveries(`+deliveryColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			delivery.JobID, delivery.AttemptID, delivery.CandidateSHA, delivery.ExpectedTreeSHA, delivery.ParentSHA, delivery.CandidateRef,
+			delivery.RepositoryID, delivery.RepositoryURL, delivery.DefaultBranch, delivery.Branch, delivery.PRTitle, delivery.PRBody,
+			"pending", "", 0, "", "", "", 0, delivery.MaxAttempts, 0, at.UnixNano()); err != nil {
+			return Job{}, err
+		}
+	}
 	detail := "result stored"
 	if failure != "" {
 		detail = "failure_code=" + failure
@@ -867,6 +889,10 @@ func (s *Store) terminalOwned(jobID, attemptID, attemptStatus, result, candidate
 		detail = "candidate_sha=" + candidateSHA
 	}
 	eventKind := jobStatus
+	if delivery != nil {
+		eventKind = "delivery_pending"
+		detail = "phase=pending candidate_sha=" + candidateSHA
+	}
 	if _, err = tx.Exec(`INSERT INTO events(job_id,kind,detail,at) VALUES(?,?,?,?)`, jobID, eventKind, detail, stamp); err != nil {
 		return Job{}, err
 	}

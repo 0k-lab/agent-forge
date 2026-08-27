@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"agent-forge/internal/configjson"
+	"agent-forge/internal/githubdelivery"
 	"agent-forge/internal/protocol"
 	"agent-forge/internal/store"
 	"github.com/coder/websocket"
@@ -51,10 +52,12 @@ type Options struct {
 	LeasePollInterval time.Duration
 	Now               func() time.Time
 	Logger            *slog.Logger
+	Context           context.Context
+	Delivery          githubdelivery.Options
 }
 
 func DefaultOptions() Options {
-	return Options{Policy: store.DefaultRecoveryPolicy(), RecoveryInterval: time.Second, LeasePollInterval: 100 * time.Millisecond, Now: time.Now, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	return Options{Policy: store.DefaultRecoveryPolicy(), RecoveryInterval: time.Second, LeasePollInterval: 100 * time.Millisecond, Now: time.Now, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Context: context.Background()}
 }
 
 func (o Options) Validate() error {
@@ -232,6 +235,9 @@ func NewConfiguredHandler(s *store.Store, config Config, options Options) (http.
 	if err := s.ValidateActivePolicies(); err != nil {
 		return nil, err
 	}
+	if err := s.ValidateDeliveries(); err != nil {
+		return nil, err
+	}
 	if err := s.MarkWorkersDisconnected(options.Now().UTC()); err != nil {
 		return nil, errors.New("worker startup state failed")
 	}
@@ -242,6 +248,16 @@ func NewConfiguredHandler(s *store.Store, config Config, options Options) (http.
 	config.ownerToken = ""
 	x := newServerWithOwner(s, nil, config.ownerDigest, true, cursorKey, options)
 	x.config = &config
+	if config.Delivery != nil {
+		if err := s.RecoverDeliveries(options.Now().UTC()); err != nil {
+			return nil, errors.New("delivery recovery failed")
+		}
+		ctx := options.Context
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		go x.deliveryLoop(ctx)
+	}
 	return x.routes(), nil
 }
 
@@ -476,7 +492,7 @@ func (x *server) submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	x.log("job_submitted", "job_id", j.ID, "status", j.Status)
-	writeJSON(w, 201, publicJob(j))
+	writeJSON(w, 201, x.publicJob(j))
 }
 
 func (x *server) submitConfigured(w http.ResponseWriter, r *http.Request) {
@@ -506,7 +522,7 @@ func (x *server) submitConfigured(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		x.log("job_submitted", "job_id", job.ID, "status", job.Status)
-		writeJSON(w, http.StatusCreated, publicJob(job))
+		writeJSON(w, http.StatusCreated, x.publicJob(job))
 		return
 	}
 	var repository *RepositoryRegistration
@@ -550,7 +566,7 @@ func (x *server) submitConfigured(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	x.log("job_submitted", "job_id", job.ID, "status", job.Status)
-	writeJSON(w, http.StatusCreated, publicJob(job))
+	writeJSON(w, http.StatusCreated, x.publicJob(job))
 }
 
 func validateTask(task protocol.CodingTask) error {
@@ -583,7 +599,7 @@ func (x *server) getJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, err)
 		return
 	}
-	writeJSON(w, 200, publicJob(j))
+	writeJSON(w, 200, x.publicJob(j))
 }
 
 func (x *server) getJobStatus(w http.ResponseWriter, r *http.Request) {
@@ -601,7 +617,10 @@ func (x *server) getJobStatus(w http.ResponseWriter, r *http.Request) {
 		writeResultError(w, http.StatusInternalServerError, CodeRequestFailed, "request failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, job)
+	writeJSON(w, http.StatusOK, struct {
+		store.DebugJob
+		Delivery *safeDelivery `json:"delivery,omitempty"`
+	}{job, x.safeDelivery(id)})
 }
 
 type ErrorCode string
@@ -658,21 +677,31 @@ type safeResultJob struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
-type publicJobResponse struct {
-	ID            string    `json:"id"`
-	Status        string    `json:"status"`
-	AttemptID     string    `json:"attempt_id,omitempty"`
-	WorkerID      string    `json:"worker_id,omitempty"`
-	RepositoryID  string    `json:"repository_id,omitempty"`
-	WorkerPool    string    `json:"worker_pool,omitempty"`
-	PolicyVersion int       `json:"policy_version,omitempty"`
-	CandidateSHA  string    `json:"candidate_sha,omitempty"`
-	FailureCode   string    `json:"failure_code,omitempty"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+type safeDelivery struct {
+	Phase       string `json:"phase"`
+	Branch      string `json:"branch,omitempty"`
+	PRURL       string `json:"pr_url,omitempty"`
+	CIState     string `json:"ci_state,omitempty"`
+	MergeSHA    string `json:"merge_sha,omitempty"`
+	FailureCode string `json:"failure_code,omitempty"`
 }
 
-func publicJob(job store.Job) publicJobResponse {
+type publicJobResponse struct {
+	ID            string        `json:"id"`
+	Status        string        `json:"status"`
+	AttemptID     string        `json:"attempt_id,omitempty"`
+	WorkerID      string        `json:"worker_id,omitempty"`
+	RepositoryID  string        `json:"repository_id,omitempty"`
+	WorkerPool    string        `json:"worker_pool,omitempty"`
+	PolicyVersion int           `json:"policy_version,omitempty"`
+	CandidateSHA  string        `json:"candidate_sha,omitempty"`
+	FailureCode   string        `json:"failure_code,omitempty"`
+	CreatedAt     time.Time     `json:"created_at"`
+	UpdatedAt     time.Time     `json:"updated_at"`
+	Delivery      *safeDelivery `json:"delivery,omitempty"`
+}
+
+func (x *server) publicJob(job store.Job) publicJobResponse {
 	response := publicJobResponse{
 		ID:            job.ID,
 		Status:        job.Status,
@@ -684,6 +713,7 @@ func publicJob(job store.Job) publicJobResponse {
 		FailureCode:   safeFailureCode(job.Error),
 		CreatedAt:     job.CreatedAt,
 		UpdatedAt:     job.UpdatedAt,
+		Delivery:      x.safeDelivery(job.ID),
 	}
 	if job.Task != nil {
 		response.RepositoryID = job.Task.RepositoryID
@@ -695,6 +725,7 @@ type jobResult struct {
 	Job      safeResultJob      `json:"job"`
 	Attempts []safeAttempt      `json:"attempts"`
 	Timeline []store.DebugEvent `json:"timeline"`
+	Delivery *safeDelivery      `json:"delivery,omitempty"`
 }
 
 const (
@@ -731,7 +762,7 @@ func (x *server) getResult(w http.ResponseWriter, r *http.Request) {
 		writeResultError(w, http.StatusInternalServerError, CodeRequestFailed, "request failed")
 		return
 	}
-	result := jobResult{Job: safeResultJob{ID: debugJob.ID, Kind: debugJob.Kind, Status: debugJob.Status, AttemptID: debugJob.AttemptID, WorkerID: debugJob.WorkerID, BaseSHA: debugJob.BaseSHA, CandidateSHA: debugJob.CandidateSHA, FailureCode: safeFailureCode(job.Error), CreatedAt: debugJob.CreatedAt, UpdatedAt: debugJob.UpdatedAt}, Attempts: make([]safeAttempt, 0, len(attempts))}
+	result := jobResult{Job: safeResultJob{ID: debugJob.ID, Kind: debugJob.Kind, Status: debugJob.Status, AttemptID: debugJob.AttemptID, WorkerID: debugJob.WorkerID, BaseSHA: debugJob.BaseSHA, CandidateSHA: debugJob.CandidateSHA, FailureCode: safeFailureCode(job.Error), CreatedAt: debugJob.CreatedAt, UpdatedAt: debugJob.UpdatedAt}, Attempts: make([]safeAttempt, 0, len(attempts)), Delivery: x.safeDelivery(id)}
 	for _, attempt := range attempts {
 		evidence, err := x.store.AttemptEvidence(id, attempt.ID)
 		if err != nil {
@@ -752,7 +783,7 @@ func (x *server) getResult(w http.ResponseWriter, r *http.Request) {
 	result.Timeline = make([]store.DebugEvent, 0, len(timeline.Events))
 	for _, event := range timeline.Events {
 		switch event.Type {
-		case "submitted", "leased", "lease_expired", "retryable_failed", "retry_scheduled", "failed", "succeeded":
+		case "submitted", "leased", "lease_expired", "retryable_failed", "retry_scheduled", "failed", "succeeded", "delivery_pending", "delivery_phase", "delivery_retry", "delivery_merged", "delivery_failed":
 		default:
 			continue
 		}
@@ -777,7 +808,37 @@ func safeFailureCode(code string) string {
 	case protocol.FailureInvalidTask, protocol.FailureScopedTest, protocol.FailureExecution, "max_attempts_exceeded":
 		return code
 	}
+	if deliveryFailureCodes[code] {
+		return code
+	}
 	return ""
+}
+
+var deliveryFailureCodes = map[string]bool{
+	"delivery_failed": true, "delivery_registration_changed": true, "delivery_automation_invalid": true,
+	"delivery_transient_api": true, "delivery_push_failed": true, "delivery_credential_expired": true,
+	"delivery_credential_invalid": true, "delivery_repository_not_found": true, "delivery_repository_not_selected": true,
+	"delivery_installation_absent": true, "delivery_permission_missing": true, "delivery_base_drift": true,
+	"delivery_branch_conflict": true, "delivery_push_conflict": true, "delivery_pull_request_conflict": true,
+	"delivery_head_changed": true, "delivery_base_changed": true, "delivery_ci_no_runs": true,
+	"delivery_ci_ambiguous": true, "delivery_ci_failed": true, "delivery_ci_timeout": true,
+	"delivery_merge_failed": true, "delivery_publication_invalid": true, "delivery_candidate_ref_mismatch": true,
+	"delivery_candidate_parent_mismatch": true, "delivery_candidate_tree_mismatch": true, "delivery_candidate_diff_invalid": true,
+	"delivery_local_repository_unsafe": true, "delivery_git_executable_unsafe": true, "delivery_staging_failed": true,
+	"delivery_command_output_exceeded": true, "delivery_api_rejected": true, "delivery_request_invalid": true,
+	"delivery_state_failed": true,
+}
+
+func (x *server) safeDelivery(jobID string) *safeDelivery {
+	delivery, err := x.store.Delivery(jobID)
+	if err != nil {
+		return nil
+	}
+	phase := delivery.Phase
+	if phase != "pending" && phase != "publishing" && phase != "ci" && phase != "merging" && phase != "retry_wait" && phase != "merged" && phase != "failed" {
+		return nil
+	}
+	return &safeDelivery{Phase: phase, Branch: delivery.Branch, PRURL: delivery.PRURL, CIState: delivery.CIState, MergeSHA: delivery.MergeSHA, FailureCode: safeFailureCode(delivery.FailureCode)}
 }
 
 func writeResultError(w http.ResponseWriter, status int, code ErrorCode, message string) {
@@ -797,10 +858,12 @@ func validJobID(id string) bool {
 }
 
 type eventResponse struct {
-	ID    int64     `json:"id"`
-	JobID string    `json:"job_id"`
-	Kind  string    `json:"kind"`
-	At    time.Time `json:"at"`
+	ID          int64     `json:"id"`
+	JobID       string    `json:"job_id"`
+	Kind        string    `json:"kind"`
+	At          time.Time `json:"at"`
+	Phase       string    `json:"phase,omitempty"`
+	FailureCode string    `json:"failure_code,omitempty"`
 }
 
 func (x *server) getEvents(w http.ResponseWriter, r *http.Request) {
@@ -812,6 +875,17 @@ func (x *server) getEvents(w http.ResponseWriter, r *http.Request) {
 	response := make([]eventResponse, len(events))
 	for i, event := range events {
 		response[i] = eventResponse{ID: event.ID, JobID: event.JobID, Kind: event.Kind, At: event.At}
+		if strings.HasPrefix(event.Kind, "delivery_") {
+			for _, field := range strings.Fields(event.Detail) {
+				key, value, ok := strings.Cut(field, "=")
+				if key == "phase" && ok && (value == "pending" || value == "publishing" || value == "ci" || value == "merging" || value == "retry_wait" || value == "merged" || value == "failed") {
+					response[i].Phase = value
+				}
+				if key == "failure_code" && ok {
+					response[i].FailureCode = safeFailureCode(value)
+				}
+			}
+		}
 	}
 	writeJSON(w, 200, response)
 }
@@ -1009,7 +1083,20 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 				return
 			} else if m.CandidateSHA != "" {
 				if x.config != nil {
-					terminalJob, resultErr = x.store.CompleteCandidateLeaseAt(m.JobID, m.AttemptID, effectiveID, generation, m.CandidateSHA, at)
+					repository, deliver := RepositoryRegistration{}, false
+					if x.config.Delivery != nil && active.Task != nil {
+						repository, deliver = x.repository(active.Task.RepositoryID)
+						deliver = deliver && repository.RepositoryURL != ""
+					}
+					if deliver {
+						var delivery store.Delivery
+						delivery, resultErr = x.deliveryForCandidate(ctx, *active, m.CandidateSHA)
+						if resultErr == nil {
+							terminalJob, resultErr = x.store.CompleteCandidateDeliveryLeaseAt(m.JobID, m.AttemptID, effectiveID, generation, delivery, at)
+						}
+					} else {
+						terminalJob, resultErr = x.store.CompleteCandidateLeaseAt(m.JobID, m.AttemptID, effectiveID, generation, m.CandidateSHA, at)
+					}
 				} else {
 					terminalJob, resultErr = x.store.CompleteCandidateAt(m.JobID, m.AttemptID, m.CandidateSHA, at)
 				}
