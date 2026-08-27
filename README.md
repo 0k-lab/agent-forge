@@ -68,7 +68,7 @@ Add Gate-owned automatic delivery beside the public repository settings. The App
 {"delivery":{"api_base":"https://api.github.com","github_app_id_env":"FORGE_GITHUB_APP_ID","github_app_private_key_path":"/srv/forge/secrets/github-app.pem","max_attempts":3,"retry_base":"5s","poll_interval":"10s","no_runs_grace":"2m","timeout":"30m"}}
 ```
 
-With this configured, a coding candidate enters `delivering`; `forge submit --wait` continues through exact branch/PR reconciliation, canonical GitHub Actions polling, and exact-head merge. Status, result, and events expose only the delivery phase, deterministic branch, PR URL, CI state, merge SHA, and allowlisted failure code. Without it, candidate-only behavior is unchanged.
+With this configured, a coding candidate enters `delivering`; `forge submit --wait` continues through exact branch/PR reconciliation, canonical GitHub Actions polling, and exact-head merge. Status, result, and events expose only the delivery phase, deterministic branch, PR URL, CI state, merge SHA, and allowlisted failure code. Public Actions runs are observed without an installation token, so the GitHub App does not require Actions permission. Without delivery configuration, candidate-only behavior is unchanged.
 
 `forge-github` publishes one already-reviewed Worker candidate without reading Gate SQLite or Worker credentials. It must run as the same trusted local UID that owns the non-group/world-writable repository root. Production config accepts only `https://api.github.com`. The config and App private key must be owned regular `0600` files in owned directories that are not group/world writable. `git_executable` must be the canonical absolute path of an owned executable regular file whose file and parent are not group/world writable.
 
