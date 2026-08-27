@@ -1,12 +1,12 @@
 CODING E2E PASS
-terminal_job={"status":"succeeded","candidate_sha":"ed8a9964771a42095cfca5a2c6bd2b7cef81344e","created_at":"2026-08-27T06:35:59.997682078Z","updated_at":"2026-08-27T06:36:23.223019379Z"}
-base_sha=aeef833b9864f518f6d70d37a12e9aed720f4e4d
-candidate_sha=ed8a9964771a42095cfca5a2c6bd2b7cef81344e
-candidate_parent=aeef833b9864f518f6d70d37a12e9aed720f4e4d
+terminal_job={"status":"succeeded","candidate_sha":"b648d09e3b5ea3544c6e60fc233a6dd0857c45be","created_at":"2026-08-27T07:27:27.066166915Z","updated_at":"2026-08-27T07:27:51.25339121Z"}
+base_sha=99c6e20129f53454adeb6ee3217404ba1949887a
+candidate_sha=b648d09e3b5ea3544c6e60fc233a6dd0857c45be
+candidate_parent=99c6e20129f53454adeb6ee3217404ba1949887a
 candidate_author=kricha <4619899+kricha@users.noreply.github.com>
 candidate_committer=Agent Forge <forge@example.invalid>
 candidate_subject=fix: return 42 from Answer
-candidate_ref=refs/agent-forge/candidates/62158df5a2daf290b1a11f4857e01b68/307affa96d1bf713e9157dfc47473f71
+candidate_ref=refs/agent-forge/candidates/8695d5e13f60fce142f1084c4ce80fff/b412714e0225bf392d1f54bd55cfdeff
 candidate_object=verified
 event_projection=verified
 scoped_test=passed

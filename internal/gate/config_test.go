@@ -2,6 +2,7 @@ package gate
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"agent-forge/internal/configjson"
+	"agent-forge/internal/githubdelivery"
 )
 
 const validGateConfig = `{
@@ -103,5 +105,42 @@ func TestParseConfigRejectsSecretCollisionsAndMissingSecrets(t *testing.T) {
 				t.Fatal("accepted invalid secret configuration")
 			}
 		})
+	}
+}
+
+func TestParseConfigResolvesOptionalDeliveryWithoutSerializingAppID(t *testing.T) {
+	public := publicGateConfig(t)
+	keyDir := t.TempDir()
+	if err := os.Chmod(keyDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	key := filepath.Join(keyDir, "github-app.pem")
+	if err := os.WriteFile(key, []byte("loaded only when delivery runs"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitDir := t.TempDir()
+	if err := os.Chmod(gitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git := filepath.Join(gitDir, "git")
+	if err := os.WriteFile(git, []byte("#!/bin/sh\nexec "+public.GitExecutable+" \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := githubdelivery.ValidateConfig(githubdelivery.Config{Version: 1, APIBase: "https://api.github.com", Owner: "0k-lab", Repository: "agent-forge", LocalRepository: public.PublicRepositoryRoot, GitExecutable: git, AppID: "987654321", PrivateKeyPath: key}); err != nil {
+		t.Fatalf("delivery fixture: %v", err)
+	}
+	body := strings.Replace(validGateConfig, `"repositories": [`, `"public_repository_root":`+quoteJSON(public.PublicRepositoryRoot)+`,"git_executable":`+quoteJSON(git)+`,"delivery":{"api_base":"https://api.github.com","github_app_id_env":"FORGE_GITHUB_APP_ID","github_app_private_key_path":`+quoteJSON(key)+`,"max_attempts":3,"retry_base":"1s","poll_interval":"1s","no_runs_grace":"1s","timeout":"1s"},"repositories": [`, 1)
+	body = strings.Replace(body, `"id":"agent-forge"`, `"id":"agent-forge","repository_url":"https://github.com/0k-lab/agent-forge.git"`, 1)
+	values := map[string]string{"FORGE_OWNER_TOKEN": "owner", "FORGE_WORKER_TOKEN": "worker", "FORGE_GITHUB_APP_ID": "987654321"}
+	config, err := ParseConfig([]byte(body), func(name string) string { return values[name] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Delivery == nil || config.Delivery.RetryBase != time.Second || config.Delivery.PollInterval != time.Second || config.Delivery.NoRunsGrace != time.Second || config.Delivery.Timeout != time.Second {
+		t.Fatalf("delivery = %#v", config.Delivery)
+	}
+	encoded, err := json.Marshal(config)
+	if err != nil || strings.Contains(string(encoded), "987654321") {
+		t.Fatalf("serialized delivery credentials: %s, %v", encoded, err)
 	}
 }

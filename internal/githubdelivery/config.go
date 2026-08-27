@@ -75,6 +75,25 @@ func ParseConfig(data []byte, getenv func(string) string) (Config, error) {
 	return Config{Version: 1, APIBase: raw.APIBase, Owner: raw.Owner, Repository: raw.Repository, LocalRepository: repo, GitExecutable: git, AppID: appID, PrivateKeyPath: key}, nil
 }
 
+func ValidateConfig(config Config) error {
+	if config.Version != 1 || config.APIBase != "https://api.github.com" || !ownerName.MatchString(config.Owner) || !repoName.MatchString(config.Repository) {
+		return errConfig
+	}
+	if _, err := strconv.ParseUint(config.AppID, 10, 64); err != nil || config.AppID == "0" {
+		return errConfig
+	}
+	if _, err := ownedDirectory(config.LocalRepository); err != nil {
+		return errConfig
+	}
+	if _, err := protectedFile(config.PrivateKeyPath); err != nil {
+		return errConfig
+	}
+	if _, err := protectedExecutable(config.GitExecutable); err != nil {
+		return errConfig
+	}
+	return nil
+}
+
 func ownedDirectory(path string) (string, error) {
 	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return "", errConfig

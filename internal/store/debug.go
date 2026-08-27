@@ -37,6 +37,7 @@ type DebugEvent struct {
 	RetryAt        *time.Time `json:"retry_at,omitempty"`
 	Disposition    string     `json:"disposition,omitempty"`
 	FailureCode    string     `json:"failure_code,omitempty"`
+	Phase          string     `json:"phase,omitempty"`
 }
 
 type DebugPosition struct {
@@ -237,6 +238,10 @@ func (s *Store) DebugJobTimeline(ctx context.Context, id string, limit int, posi
 			case "failure_code":
 				if value == protocol.FailureInvalidTask || value == protocol.FailureScopedTest || value == protocol.FailureExecution || value == "max_attempts_exceeded" {
 					event.FailureCode = value
+				}
+			case "phase":
+				if value == "pending" || value == "publishing" || value == "ci" || value == "merging" || value == "retry_wait" || value == "merged" || value == "failed" {
+					event.Phase = value
 				}
 			}
 		}
