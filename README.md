@@ -7,7 +7,7 @@ A minimal Go vertical slice: submit a job to **forge-gate**, persist it in SQLit
 - **Gate** owns repository registrations and authorization, public-source clone/fetch/reuse, prepared local repository paths, Worker pools and authenticated slots, submission-time lifecycle/execution policy resolution, leases, and authoritative SQLite state.
 - **Worker** consumes Gate-prepared local repositories, maps legacy static repository IDs to local paths, and owns plugin-ID-to-local-argv mappings, worktree/runtime roots, inherited-environment allowlisting, and local timeout/output ceilings. External repository URLs and credentials never cross the Gate/Worker boundary.
 - **Plugin** uses the strict NDJSON [plugin protocol v1](docs/plugin-protocol-v1.md). The reference plugin implements `text`; `forge-codex-plugin` implements `workspace_edit`, invokes `CODEX_BIN` (default `codex`) with bounded output and a timeout, obtains the actual-diff commit subject through Codex structured output, and never reports business success or commits.
-- This MVP deliberately has no control panel, Docker, GitHub App/delivery integration, reviewer, mTLS, PostgreSQL, or plugin marketplace. Its only browser UI is a read-only debug viewer.
+- This MVP deliberately has no control panel, Docker, merge/CI orchestration, reviewer, mTLS, PostgreSQL, or plugin marketplace. Its only browser UI is a read-only debug viewer. GitHub delivery is an optional, separate local CLI.
 
 ## Build and test
 
@@ -24,11 +24,12 @@ go build -o bin/forge-worker ./cmd/forge-worker
 go build -o bin/forge-ref-plugin ./cmd/forge-ref-plugin
 go build -o bin/forge-codex-plugin ./cmd/forge-codex-plugin
 go build -o bin/forge ./cmd/forge
+go build -o bin/forge-github ./cmd/forge-github
 ```
 
 ## Run
 
-Both commands accept only `-config`. Config files name secret environment variables; secret values never enter config, SQLite, leases, evidence, or logs.
+Gate and Worker accept only `-config`. Config files name secret environment variables; secret values never enter config, SQLite, leases, evidence, or logs.
 
 Gate config (`gate.json`):
 
@@ -58,6 +59,23 @@ Before creating a pending job, Gate maps the configured URL to a SHA-256-named b
 FORGE_OWNER_TOKEN=fake-owner-token FORGE_WORKER_TOKEN=fake-worker-token ./bin/forge-gate -config gate.json
 FORGE_WORKER_TOKEN=fake-worker-token ./bin/forge-worker -config worker.json
 ```
+
+## Optional GitHub delivery
+
+`forge-github` publishes one already-reviewed Worker candidate without reading Gate SQLite or Worker credentials. It must run as the same trusted local UID that owns the non-group/world-writable repository root. Production config accepts only `https://api.github.com`. The config and App private key must be owned regular `0600` files in owned directories that are not group/world writable. `git_executable` must be the canonical absolute path of an owned executable regular file whose file and parent are not group/world writable.
+
+```json
+{"version":1,"api_base":"https://api.github.com","owner":"octo-org","repository":"project","local_repository":"/srv/forge/repos/project","git_executable":"/srv/forge/bin/git","github_app_id_env":"FORGE_GITHUB_APP_ID","github_app_private_key_path":"/srv/forge/secrets/github-app.pem"}
+```
+
+Pass the strict publication JSON on stdin so values and credentials do not enter argv. `candidate_ref` is the exact deterministic Worker ref, and `expected_parent_sha` must equal the current local `refs/heads/<base_branch>`:
+
+```sh
+printf '%s\n' '{"version":1,"candidate_sha":"2222222222222222222222222222222222222222","expected_parent_sha":"1111111111111111111111111111111111111111","expected_tree_sha":"3333333333333333333333333333333333333333","candidate_ref":"refs/agent-forge/candidates/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","base_branch":"main","new_branch":"forge/job-123","pr_title":"Reviewed candidate","pr_body":"Ready for review."}' |
+  FORGE_GITHUB_APP_ID=12345 ./bin/forge-github -config github.json
+```
+
+The CLI fails closed on a dirty worktree, local ownership or Git safety failure, base drift, candidate/ref/tree/parent mismatch, unsafe or conflicting branches, installation/repository/permission failures, and bounded API failures. It derives only `contents:write` and `pull_requests:write`, adding `workflows:write` when the exact base-to-candidate diff changes `.github/workflows` or a descendant. It copies the exact candidate and base history into a fresh private bare repository, reverifies their identities there, and performs the credentialed push only from that clean repository with isolated Git configuration. It then creates or reconciles one open PR. Repeating the same request returns the same branch and PR. It never merges or waits for CI.
 
 Configs are strict versioned JSON: unknown/duplicate fields, trailing data, unsafe or duplicate IDs/references, missing/colliding token values, noncanonical paths, and contradictory bounds fail startup with bounded value-free errors. `concurrency: 2` opens two independent outbound lanes (`worker-1` and `worker-1#1` server-side); attempts are never multiplexed on one WebSocket.
 
