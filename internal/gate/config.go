@@ -4,8 +4,10 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
+	"net/url"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"agent-forge/internal/configjson"
@@ -48,26 +50,29 @@ type WorkerRegistration struct {
 
 type RepositoryRegistration struct {
 	ID            string          `json:"id"`
+	RepositoryURL string          `json:"repository_url,omitempty"`
 	DefaultBranch string          `json:"default_branch"`
 	WorkerPool    string          `json:"worker_pool"`
 	Execution     ExecutionConfig `json:"execution"`
 }
 
 type Config struct {
-	Version           int
-	Listen            string
-	Database          string
-	OwnerTokenEnv     string
-	RecoveryInterval  time.Duration
-	LeasePollInterval time.Duration
-	DefaultPool       string
-	Lifecycle         LifecycleConfig
-	DefaultExecution  ExecutionConfig
-	Workers           []WorkerRegistration
-	Repositories      []RepositoryRegistration
-	ownerToken        string
-	ownerDigest       [sha256.Size]byte
-	workerTokens      []workerCredential
+	Version              int
+	Listen               string
+	Database             string
+	OwnerTokenEnv        string
+	RecoveryInterval     time.Duration
+	LeasePollInterval    time.Duration
+	DefaultPool          string
+	Lifecycle            LifecycleConfig
+	DefaultExecution     ExecutionConfig
+	Workers              []WorkerRegistration
+	Repositories         []RepositoryRegistration
+	PublicRepositoryRoot string
+	GitExecutable        string
+	ownerToken           string
+	ownerDigest          [sha256.Size]byte
+	workerTokens         []workerCredential
 }
 
 type workerCredential struct {
@@ -95,23 +100,26 @@ type durationExecution struct {
 
 type rawRepository struct {
 	ID            string            `json:"id"`
+	RepositoryURL string            `json:"repository_url"`
 	DefaultBranch string            `json:"default_branch"`
 	WorkerPool    string            `json:"worker_pool"`
 	Execution     durationExecution `json:"execution"`
 }
 
 type rawGateConfig struct {
-	Version           int                  `json:"version"`
-	Listen            string               `json:"listen"`
-	Database          string               `json:"database"`
-	OwnerTokenEnv     string               `json:"owner_token_env"`
-	RecoveryInterval  string               `json:"recovery_interval"`
-	LeasePollInterval string               `json:"lease_poll_interval"`
-	DefaultPool       string               `json:"default_pool"`
-	Lifecycle         durationLifecycle    `json:"lifecycle"`
-	DefaultExecution  durationExecution    `json:"default_execution"`
-	Workers           []WorkerRegistration `json:"workers"`
-	Repositories      []rawRepository      `json:"repositories"`
+	Version              int                  `json:"version"`
+	Listen               string               `json:"listen"`
+	Database             string               `json:"database"`
+	OwnerTokenEnv        string               `json:"owner_token_env"`
+	RecoveryInterval     string               `json:"recovery_interval"`
+	LeasePollInterval    string               `json:"lease_poll_interval"`
+	DefaultPool          string               `json:"default_pool"`
+	Lifecycle            durationLifecycle    `json:"lifecycle"`
+	DefaultExecution     durationExecution    `json:"default_execution"`
+	Workers              []WorkerRegistration `json:"workers"`
+	Repositories         []rawRepository      `json:"repositories"`
+	PublicRepositoryRoot string               `json:"public_repository_root"`
+	GitExecutable        string               `json:"git_executable"`
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -144,8 +152,16 @@ func ParseConfig(data []byte, getenv func(string) string) (Config, error) {
 	if c.DefaultExecution, err = parseExecution(raw.DefaultExecution); err != nil {
 		return Config{}, errConfig
 	}
-	if c.Version != 1 || c.Listen == "" || len(c.Listen) > 256 || c.Database == "" || len(c.Database) > 4096 || !envName.MatchString(c.OwnerTokenEnv) || !configID.MatchString(c.DefaultPool) || c.RecoveryInterval > c.Lifecycle.LeaseTTL || len(c.Workers) == 0 || len(c.Workers) > maxGateSlots || len(c.Repositories) > 1024 {
+	if c.Version != 1 || c.Listen == "" || len(c.Listen) > 256 || c.Database == "" || len(c.Database) > 4096 || !envName.MatchString(c.OwnerTokenEnv) || !configID.MatchString(c.DefaultPool) || c.RecoveryInterval > c.Lifecycle.LeaseTTL || len(c.Workers) == 0 || len(c.Workers) > maxGateSlots || len(raw.Repositories) > 1024 || (raw.PublicRepositoryRoot == "") != (raw.GitExecutable == "") {
 		return Config{}, errConfig
+	}
+	if raw.PublicRepositoryRoot != "" {
+		if c.PublicRepositoryRoot, err = preparePublicRepositoryRoot(raw.PublicRepositoryRoot); err != nil {
+			return Config{}, errConfig
+		}
+		if c.GitExecutable, err = canonicalGitExecutable(raw.GitExecutable); err != nil {
+			return Config{}, errConfig
+		}
 	}
 	c.ownerToken = getenv(c.OwnerTokenEnv)
 	if c.ownerToken == "" {
@@ -176,13 +192,23 @@ func ParseConfig(data []byte, getenv func(string) string) (Config, error) {
 		return Config{}, errConfig
 	}
 	repositories := map[string]bool{}
+	publicRepositories := 0
 	for _, repository := range raw.Repositories {
 		execution, err := parseExecution(repository.Execution)
 		if err != nil || !configID.MatchString(repository.ID) || repositories[repository.ID] || protocol.ValidateBranchName(repository.DefaultBranch) != nil || !pools[repository.WorkerPool] {
 			return Config{}, errConfig
 		}
+		if repository.RepositoryURL != "" {
+			if _, err := canonicalPublicGitHubURL(repository.RepositoryURL); err != nil {
+				return Config{}, errConfig
+			}
+			publicRepositories++
+		}
 		repositories[repository.ID] = true
-		c.Repositories = append(c.Repositories, RepositoryRegistration{repository.ID, repository.DefaultBranch, repository.WorkerPool, execution})
+		c.Repositories = append(c.Repositories, RepositoryRegistration{repository.ID, repository.RepositoryURL, repository.DefaultBranch, repository.WorkerPool, execution})
+	}
+	if publicRepositories > 0 && c.PublicRepositoryRoot == "" {
+		return Config{}, errConfig
 	}
 	return c, nil
 }
@@ -242,4 +268,23 @@ func (c Config) resolvedPolicy(pool string, execution ExecutionConfig, repositor
 			PluginOutputBytes: execution.PluginOutputBytes, CheckOutputBytes: execution.CheckOutputBytes, GitOutputBytes: execution.GitOutputBytes,
 		},
 	}
+}
+
+func canonicalPublicGitHubURL(value string) (publicSource, error) {
+	u, err := url.Parse(value)
+	if err != nil || u.Scheme != "https" || u.Host != "github.com" || u.User != nil || u.Port() != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawPath != "" || u.Opaque != "" {
+		return publicSource{}, errConfig
+	}
+	parts := strings.Split(u.Path, "/")
+	if len(parts) != 3 || parts[0] != "" {
+		return publicSource{}, errConfig
+	}
+	if !strings.HasSuffix(parts[2], ".git") {
+		return publicSource{}, errConfig
+	}
+	source := publicSource{Owner: parts[1], Repository: strings.TrimSuffix(parts[2], ".git")}
+	if source.Validate() != nil || source.URL() != value {
+		return publicSource{}, errConfig
+	}
+	return source, nil
 }

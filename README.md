@@ -4,10 +4,10 @@ A minimal Go vertical slice: submit a job to **forge-gate**, persist it in SQLit
 
 ## Boundaries
 
-- **Gate** owns repository IDs/default branches, Worker pools and authenticated slots, submission-time lifecycle/execution policy resolution, leases, and authoritative SQLite state.
-- **Worker** owns repository-ID-to-local-path and plugin-ID-to-local-argv mappings, canonical repository/worktree/runtime roots, inherited-environment allowlisting, and local timeout/output ceilings. Local paths and plugin argv never cross the Worker/Gate boundary.
+- **Gate** owns repository registrations and authorization, public-source clone/fetch/reuse, prepared local repository paths, Worker pools and authenticated slots, submission-time lifecycle/execution policy resolution, leases, and authoritative SQLite state.
+- **Worker** consumes Gate-prepared local repositories, maps legacy static repository IDs to local paths, and owns plugin-ID-to-local-argv mappings, worktree/runtime roots, inherited-environment allowlisting, and local timeout/output ceilings. External repository URLs and credentials never cross the Gate/Worker boundary.
 - **Plugin** uses the strict NDJSON [plugin protocol v1](docs/plugin-protocol-v1.md). The reference plugin implements `text`; `forge-codex-plugin` implements `workspace_edit`, invokes `CODEX_BIN` (default `codex`) with bounded output and a timeout, obtains the actual-diff commit subject through Codex structured output, and never reports business success or commits.
-- This MVP deliberately has no control panel, Docker, GitHub integration, reviewer, mTLS, PostgreSQL, or plugin marketplace. Its only browser UI is a read-only debug viewer.
+- This MVP deliberately has no control panel, Docker, GitHub App/delivery integration, reviewer, mTLS, PostgreSQL, or plugin marketplace. Its only browser UI is a read-only debug viewer.
 
 ## Build and test
 
@@ -43,6 +43,16 @@ Worker config (`worker.json`):
 ```
 
 `environment_allowlist` is the ceiling for policy-requested plugin variables. Scoped checks inherit only its explicit `check_environment_allowlist` subset; absent or empty means none, apart from Worker-created `HOME`, `TMPDIR`, and `XDG_CACHE_HOME`.
+
+Public GitHub HTTPS sources are opt-in Gate repository registrations. Gate config owns the canonical URL, repository root, Git executable, default branch, and execution policy:
+
+```json
+{"public_repository_root":"/srv/forge/public-repositories","git_executable":"/usr/bin/git","repositories":[{"id":"agent-forge","repository_url":"https://github.com/0k-lab/agent-forge.git","default_branch":"main","worker_pool":"coding","execution":{"plugin_id":"codex","environment":["PATH","CODEX_HOME","CODEX_BIN"],"plugin_timeout":"15m","check_timeout":"10m","git_timeout":"1m","cleanup_timeout":"10s","plugin_output_bytes":1048576,"check_output_bytes":2048,"git_output_bytes":1048576}}]}
+```
+
+Submit `{"repository_id":"agent-forge","base_sha":"<40 lowercase hex>","instruction":"..."}`. Config accepts only the exact public HTTPS clone-URL shape: no credentials, port, query, fragment, escaping, missing `.git`, trailing slash, dot segment, host alias, or case folding.
+
+Before creating a pending job, Gate maps the configured URL to a SHA-256-named bare repository under `public_repository_root`, serializes provisioning, atomically installs a temporary clone, and fetches only the configured default branch without tags, prompts, credentials, global/system Git config, redirects, or hooks. Reuse validates the bare repository and exact origin; the requested base must exist and be an ancestor of the fetched branch. Preparation failures return bounded structured Gate errors without repository paths. Worker receives only the prepared local path and expected base, then creates the candidate commit and cleans its worktree.
 
 ```sh
 FORGE_OWNER_TOKEN=fake-owner-token FORGE_WORKER_TOKEN=fake-worker-token ./bin/forge-gate -config gate.json
@@ -134,6 +144,6 @@ Only `tests` argv explicitly supplied by the task run as authoritative Worker sc
 
 The terminal job contains `candidate_sha`; its deterministic candidate ref keeps that commit reachable after worktree removal, reflog expiration, and garbage collection. With no configured repository roots, legacy jobs still run and coding jobs fail with a bounded reason.
 
-Before worktree creation, Worker requires the exact base commit to exist and be an ancestor of its configured local `refs/heads/<default_branch>`. It never fetches. Unknown IDs, default-branch mismatch, symlink/canonical drift, root escape, or Gate limits above local ceilings fail closed with path/argv/secret-free errors. Supplied scoped argv remains task data; no central verification profile or global command allowlist is introduced. Production Workers should run as dedicated unprivileged accounts or containers.
+Before worktree creation, Worker requires the exact base commit to exist and be an ancestor of `refs/heads/<default_branch>`. Static registrations never fetch; Gate prepares configured public sources as described above. Unknown identities, default-branch mismatch, canonical path drift, or Gate limits above local ceilings fail closed with path/argv/secret-free errors. Supplied scoped argv remains task data; no central verification profile or global command allowlist is introduced. Production Workers should run as dedicated unprivileged accounts or containers.
 
-Run `scripts/e2e.sh` for the reference transport proof, `scripts/plugin-conformance-e2e.sh` for deterministic reference/Python/fake-Codex protocol conformance, `scripts/recovery-e2e.sh` for restart/expiry/retry/late-result recovery, `scripts/evidence-e2e.sh` for the self-contained bounded-evidence/privacy proof, `scripts/sqlite-permissions-e2e.sh` for the Gate SQLite permission/startup proof, and `CODEX_BIN=/path/to/codex scripts/coding-e2e.sh` for the real coding proof. The scripts use synthetic data; recovery artifacts stay in a temporary directory and all spawned processes are cleaned up.
+Run `scripts/e2e.sh` for the reference transport proof, `scripts/public-source-e2e.sh` for the Gate clone/preparation through Worker candidate/cleanup proof, `scripts/plugin-conformance-e2e.sh` for deterministic reference/Python/fake-Codex protocol conformance, `scripts/recovery-e2e.sh` for restart/expiry/retry/late-result recovery, `scripts/evidence-e2e.sh` for the self-contained bounded-evidence/privacy proof, `scripts/sqlite-permissions-e2e.sh` for the Gate SQLite permission/startup proof, and `CODEX_BIN=/path/to/codex scripts/coding-e2e.sh` for the real coding proof. The scripts use synthetic data; recovery artifacts stay in a temporary directory and all spawned processes are cleaned up.

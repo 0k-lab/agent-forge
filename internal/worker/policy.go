@@ -21,6 +21,10 @@ type localLease struct {
 }
 
 func resolveLease(config Config, message protocol.Message) (localLease, error) {
+	return resolveLeaseContext(context.Background(), config, message)
+}
+
+func resolveLeaseContext(parent context.Context, config Config, message protocol.Message) (localLease, error) {
 	fail := func() (localLease, error) { return localLease{}, errors.New("lease policy rejected") }
 	if message.Type != protocol.MessageLease || message.Policy == nil || message.Policy.Validate() != nil {
 		return fail()
@@ -79,24 +83,32 @@ func resolveLease(config Config, message protocol.Message) (localLease, error) {
 		}
 		return resolved, nil
 	}
-	if message.Task.Repository != "" || message.Task.RepositoryID == "" || message.Task.RepositoryID != e.RepositoryID || protocol.ValidateBaseSHA(message.Task.BaseSHA) != nil {
+	if message.Task.RepositoryID == "" || message.Task.RepositoryID != e.RepositoryID || protocol.ValidateBaseSHA(message.Task.BaseSHA) != nil {
 		return fail()
 	}
-	var repository string
-	for _, registration := range config.Repositories {
-		if registration.ID == message.Task.RepositoryID {
-			canonical, err := allowedRepository(registration.Path, config.RepositoryRoots)
-			if err != nil || canonical != registration.Path {
-				return fail()
+	repository := message.Task.Repository
+	if repository != "" {
+		canonical, err := canonicalDirectory(repository)
+		if err != nil || canonical != repository {
+			return fail()
+		}
+		repository = canonical
+	} else {
+		for _, registration := range config.Repositories {
+			if registration.ID == message.Task.RepositoryID {
+				canonical, err := allowedRepository(registration.Path, config.RepositoryRoots)
+				if err != nil || canonical != registration.Path {
+					return fail()
+				}
+				repository = canonical
+				break
 			}
-			repository = canonical
-			break
 		}
 	}
 	if repository == "" {
 		return fail()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(e.GitTimeoutNanos))
+	ctx, cancel := context.WithTimeout(parent, time.Duration(e.GitTimeoutNanos))
 	defer cancel()
 	branch := "refs/heads/" + e.DefaultBranch
 	if gitQuiet(ctx, repository, e.GitOutputBytes, "cat-file", "-e", message.Task.BaseSHA+"^{commit}") != nil || gitQuiet(ctx, repository, e.GitOutputBytes, "show-ref", "--verify", "--quiet", branch) != nil || gitQuiet(ctx, repository, e.GitOutputBytes, "merge-base", "--is-ancestor", message.Task.BaseSHA, branch) != nil {
@@ -107,7 +119,7 @@ func resolveLease(config Config, message protocol.Message) (localLease, error) {
 }
 
 func executeConfiguredOutcome(ctx context.Context, config Config, message protocol.Message) leaseOutcome {
-	resolved, err := resolveLease(config, message)
+	resolved, err := resolveLeaseContext(ctx, config, message)
 	if err != nil {
 		return leaseOutcome{err: invalidTask(err)}
 	}

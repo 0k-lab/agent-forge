@@ -64,6 +64,16 @@ func TestResolveConfiguredLeaseUsesOnlyLocalRegistries(t *testing.T) {
 	}
 }
 
+func TestResolveConfiguredLeaseUsesGatePreparedRepository(t *testing.T) {
+	c, message, _ := configuredWorkerAndLease(t)
+	message.Task.Repository = c.Repositories[0].Path
+	c.Repositories = nil
+	resolved, err := resolveLease(c, message)
+	if err != nil || resolved.repository != message.Task.Repository {
+		t.Fatalf("resolved lease = %#v, %v", resolved, err)
+	}
+}
+
 func TestResolveConfiguredLeaseSeparatesPluginAndCheckEnvironments(t *testing.T) {
 	c, message, _ := configuredWorkerAndLease(t)
 	c.EnvironmentAllowlist = append(c.EnvironmentAllowlist, "UNLISTED")

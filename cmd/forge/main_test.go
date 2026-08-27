@@ -68,8 +68,8 @@ func TestStatusEventsAndResultUseStrictOwnerRoutes(t *testing.T) {
 	}
 }
 
-func TestSubmitForwardsRepositoryURLExactly(t *testing.T) {
-	want := `{"repository_url":"ssh://git@example.invalid/team/private.git","base_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","instruction":"private","tests":[]}`
+func TestSubmitForwardsRepositoryIDExactly(t *testing.T) {
+	want := `{"repository_id":"agent-forge","base_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","instruction":"private","tests":[]}`
 	useHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		if string(body) != want {

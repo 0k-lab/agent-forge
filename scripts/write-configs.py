@@ -3,11 +3,15 @@ import json
 import os
 import sys
 
-gate_path, worker_path, listen, database, gate_url, worker_id, repository_id, repository_path, plugin_id, plugin_path, lease_ttl, retry_base, max_attempts, heartbeat = sys.argv[1:]
+if len(sys.argv) not in (15, 17):
+    raise SystemExit("usage: write-configs.py ... heartbeat [public-repository-url /absolute/git]")
+gate_path, worker_path, listen, database, gate_url, worker_id, repository_id, repository_path, plugin_id, plugin_path, lease_ttl, retry_base, max_attempts, heartbeat = sys.argv[1:15]
+public_url, git_executable = sys.argv[15:] if len(sys.argv) == 17 else ("", "")
 root = os.path.dirname(worker_path)
 worktree_root, runtime_root = os.path.join(root, "worktrees"), os.path.join(root, "runtime")
 repository_root = repository_path if repository_path != "-" else os.path.join(root, "repositories")
-for path in (worktree_root, runtime_root, repository_root):
+public_root = os.path.join(root, "public-repositories")
+for path in (worktree_root, runtime_root, repository_root) + ((public_root,) if public_url else ()):
     os.makedirs(path, mode=0o700, exist_ok=True)
 execution = {
     "plugin_id": plugin_id, "environment": ["PATH", "CODEX_HOME", "CODEX_BIN"],
@@ -20,8 +24,12 @@ gate = {
     "lifecycle": {"lease_ttl": lease_ttl, "retry_base": retry_base, "max_attempts": int(max_attempts)},
     "default_execution": execution,
     "workers": [{"id": worker_id, "pool": "default", "token_env": "FORGE_WORKER_TOKEN", "concurrency": 1}],
-    "repositories": [] if repository_path == "-" else [{"id": repository_id, "default_branch": "main", "worker_pool": "default", "execution": execution}],
+    "repositories": [] if repository_path == "-" and not public_url else [{"id": repository_id, "default_branch": "main", "worker_pool": "default", "execution": execution}],
 }
+if public_url:
+    gate["repositories"][0]["repository_url"] = public_url
+    gate["public_repository_root"] = public_root
+    gate["git_executable"] = os.path.realpath(git_executable)
 worker = {
     "version": 1, "gate_url": gate_url, "id": worker_id, "token_env": "FORGE_WORKER_TOKEN",
     "heartbeat_interval": heartbeat, "concurrency": 1, "repository_roots": [repository_root],
