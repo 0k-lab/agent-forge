@@ -17,7 +17,7 @@ start_gate() {
 	PID=$!
 	PIDS+=("$PID")
 	for _ in {1..100}; do
-		grep -q 'forge-gate listening' "$log" && return
+		grep -q '"event":"listening"' "$log" && return
 		kill -0 "$PID" 2>/dev/null || break
 		sleep 0.05
 	done
@@ -37,7 +37,7 @@ expect_failure() {
 		"$RUN/forge-gate" -config "$log.gate.json" >"$log" 2>&1; then
 		return 1
 	fi
-	! grep -q 'forge-gate listening' "$log"
+	! grep -q '"event":"listening"' "$log"
 }
 
 private=$RUN/private
@@ -67,11 +67,11 @@ chmod 644 "$insecure"
 before=$(stat -c '%i:%a' "$insecure")
 expect_failure "$insecure" "$RUN/insecure.log"
 [[ $(stat -c '%i:%a' "$insecure") == "$before" ]]
-! grep -Eq 'forge-gate listening|synthetic-private-path' "$RUN/insecure.log"
+! grep -Eq '"event":"listening"|synthetic-private-path' "$RUN/insecure.log"
 
 malformed="file:$private/synthetic-credential%zz.db"
 expect_failure "$malformed" "$RUN/malformed.log"
-! grep -Eq 'forge-gate listening|synthetic-credential' "$RUN/malformed.log"
+! grep -Eq '"event":"listening"|synthetic-credential' "$RUN/malformed.log"
 
 start_gate :memory: "$RUN/memory.log"
 stop_gate

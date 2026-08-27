@@ -12,6 +12,7 @@ var (
 	ErrInsecureDatabase        = errors.New("insecure database storage")
 	ErrUnsupportedDatabase     = errors.New("database storage is unsupported")
 	ErrDatabaseOpen            = errors.New("database open failed")
+	ErrAlreadyOwned            = errors.New("store already owned")
 )
 
 type sqliteDSN struct {

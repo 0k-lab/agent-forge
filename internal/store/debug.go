@@ -91,6 +91,10 @@ func scanDebugJob(row scanner) (DebugJob, error) {
 	return job, err
 }
 
+func (s *Store) DebugJob(ctx context.Context, id string) (DebugJob, error) {
+	return scanDebugJob(s.db.QueryRowContext(ctx, `SELECT `+debugJobColumns+` FROM jobs WHERE id=?`, id))
+}
+
 func (s *Store) RecentDebugJobs(ctx context.Context, limit int, position *DebugPosition) (DebugJobPage, error) {
 	limit = debugLimit(limit)
 	query := `SELECT ` + debugJobColumns + ` FROM jobs`

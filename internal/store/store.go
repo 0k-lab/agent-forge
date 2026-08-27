@@ -22,6 +22,9 @@ import (
 type Store struct {
 	db                *sql.DB
 	debugCursorSecret [32]byte
+	lock              io.Closer
+	closeOnce         sync.Once
+	closeErr          error
 }
 
 var initializationMu sync.Mutex
@@ -122,12 +125,28 @@ type Worker struct {
 }
 
 func Open(path string) (_ *Store, retErr error) {
-	// ponytail: process-local serialization; use a cross-process lock if multiple Gates ever initialize one database.
 	initializationMu.Lock()
 	defer initializationMu.Unlock()
 	dsn, err := parseSQLiteDSN(path)
 	if err != nil {
 		return nil, err
+	}
+	defer func() {
+		if retErr != nil && !errors.Is(retErr, ErrInsecureDatabase) && !errors.Is(retErr, ErrAlreadyOwned) {
+			retErr = ErrDatabaseOpen
+		}
+	}()
+	var lock io.Closer
+	if !dsn.memory {
+		lock, err = acquireSQLiteLock(dsn.path)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if retErr != nil {
+				_ = lock.Close()
+			}
+		}()
 	}
 	postOpen := func() error { return nil }
 	if !dsn.memory {
@@ -136,17 +155,12 @@ func Open(path string) (_ *Store, retErr error) {
 			return nil, err
 		}
 	}
-	defer func() {
-		if retErr != nil && !errors.Is(retErr, ErrInsecureDatabase) {
-			retErr = ErrDatabaseOpen
-		}
-	}()
 	db, err := sql.Open("sqlite", dsn.sqliteDSN)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
+	s := &Store{db: db, lock: lock}
 	if _, err = db.Exec(`PRAGMA busy_timeout=5000`); err != nil {
 		db.Close()
 		return nil, err
@@ -180,7 +194,15 @@ func Open(path string) (_ *Store, retErr error) {
 	}
 	return s, nil
 }
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	s.closeOnce.Do(func() {
+		s.closeErr = s.db.Close()
+		if s.lock != nil {
+			s.closeErr = errors.Join(s.closeErr, s.lock.Close())
+		}
+	})
+	return s.closeErr
+}
 func (s *Store) DebugCursorKey(ownerToken string) [sha256.Size]byte {
 	mac := hmac.New(sha256.New, s.debugCursorSecret[:])
 	_, _ = mac.Write([]byte("agent-forge/debug-cursor/key/v1\x00" + ownerToken))

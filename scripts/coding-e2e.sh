@@ -81,7 +81,7 @@ CANDIDATE=$(printf '%s' "$JOB" | python3 -c 'import json,sys; print(json.load(sy
 ATTEMPT_ID=$(printf '%s' "$JOB" | python3 -c 'import json,sys; print(json.load(sys.stdin)["attempt_id"])')
 CANDIDATE_REF="refs/agent-forge/candidates/$JOB_ID/$ATTEMPT_ID"
 EVENTS=$(curl -fsS -H "Authorization: Bearer $OWNER_TOKEN" "http://127.0.0.1:18081/v1/jobs/$JOB_ID/events")
-printf '%s' "$EVENTS" | python3 -c 'import json,sys; events=json.load(sys.stdin); candidate=sys.argv[1]; assert events[-1]["detail"] == "candidate_sha=" + candidate' "$CANDIDATE"
+printf '%s' "$EVENTS" | python3 -c 'import json,sys; events=json.load(sys.stdin); job=sys.argv[1]; allowed={"id","job_id","kind","at"}; assert events and all(set(event)==allowed and event["job_id"]==job for event in events) and all(a["id"] < b["id"] for a,b in zip(events,events[1:])) and events[-1]["kind"]=="succeeded"' "$JOB_ID"
 git -C "$REPO" cat-file -e "$CANDIDATE^{commit}"
 [ "$(git -C "$REPO" rev-parse "$CANDIDATE_REF")" = "$CANDIDATE" ]
 PARENT=$(git -C "$REPO" rev-parse "$CANDIDATE^")
@@ -115,7 +115,7 @@ TERMINAL=$(printf '%s' "$JOB" | python3 -c 'import json,sys; j=json.load(sys.std
   echo "candidate_subject=$SUBJECT"
   echo "candidate_ref=$CANDIDATE_REF"
   echo "candidate_object=verified"
-  echo "event_candidate_sha=verified"
+  echo "event_projection=verified"
   echo "scoped_test=passed"
   echo "worktrees_cleaned=verified"
   echo "candidate_survives_gc=verified"

@@ -7,12 +7,112 @@ import (
 	"errors"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 )
+
+func TestStoreLockLifecycleAndMode(t *testing.T) {
+	path := filepath.Join(privateTempDir(t), "forge.db")
+	old := syscall.Umask(0o777)
+	s, err := Open(path)
+	syscall.Umask(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPath := path + ".lock"
+	assertFileMode(t, lockPath, 0o600)
+	if other, err := Open(path); other != nil || !errors.Is(err, ErrAlreadyOwned) || err.Error() != "store already owned" || strings.Contains(err.Error(), path) {
+		if other != nil {
+			other.Close()
+		}
+		t.Fatalf("second Open = %#v, %q", other, err)
+	}
+	if _, err := os.Lstat(lockPath); err != nil {
+		t.Fatalf("active lock disappeared: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(lockPath); err != nil {
+		t.Fatalf("close unlinked lock: %v", err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStoreLockRejectsUnsafeArtifactsWithoutRepair(t *testing.T) {
+	for _, kind := range []string{"symlink", "mode"} {
+		t.Run(kind, func(t *testing.T) {
+			path := filepath.Join(privateTempDir(t), "forge.db")
+			lockPath := path + ".lock"
+			if kind == "symlink" {
+				target := filepath.Join(filepath.Dir(path), "target")
+				if err := os.WriteFile(target, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, lockPath); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(lockPath, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Lstat(lockPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if s, err := Open(path); s != nil || !errors.Is(err, ErrInsecureDatabase) {
+				if s != nil {
+					s.Close()
+				}
+				t.Fatalf("Open = %#v, %v", s, err)
+			}
+			after, err := os.Lstat(lockPath)
+			if err != nil || !os.SameFile(before, after) || before.Mode() != after.Mode() {
+				t.Fatalf("lock repaired or replaced: %v", err)
+			}
+			if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("rejected lock created database: %v", err)
+			}
+		})
+	}
+}
+
+func TestStoreLockRejectsSecondProcess(t *testing.T) {
+	path := filepath.Join(privateTempDir(t), "forge.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestStoreLockHelper$")
+	cmd.Env = append(os.Environ(), "FORGE_LOCK_HELPER="+path)
+	out, err := cmd.CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "store already owned" {
+		t.Fatalf("helper = %q, %v", out, err)
+	}
+}
+
+func TestStoreLockHelper(t *testing.T) {
+	path := os.Getenv("FORGE_LOCK_HELPER")
+	if path == "" {
+		return
+	}
+	_, err := Open(path)
+	if !errors.Is(err, ErrAlreadyOwned) {
+		os.Exit(2)
+	}
+	_, _ = os.Stdout.WriteString(err.Error())
+	os.Exit(0)
+}
 
 func TestOpenCreatesDatabaseMode0600UnderCommonUmasks(t *testing.T) {
 	for _, mask := range []int{0, 0o022, 0o077, 0o777} {
@@ -33,6 +133,65 @@ func TestOpenCreatesDatabaseMode0600UnderCommonUmasks(t *testing.T) {
 			}
 			assertFileMode(t, path, 0o600)
 		})
+	}
+}
+
+func TestOpenCreatesOnlyMissingImmediateParentMode0700(t *testing.T) {
+	for _, mask := range []int{0, 0o022, 0o077, 0o777} {
+		t.Run(fmtOctal(mask), func(t *testing.T) {
+			root := privateTempDir(t)
+			parent := filepath.Join(root, "state")
+			old := syscall.Umask(mask)
+			defer syscall.Umask(old)
+			s, err := Open(filepath.Join(parent, "forge.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			assertFileMode(t, parent, 0o700)
+			info, err := os.Lstat(parent)
+			if err != nil || fileUID(info) != uint32(os.Geteuid()) {
+				t.Fatalf("parent owner = %d, err=%v", fileUID(info), err)
+			}
+		})
+	}
+}
+
+func TestOpenDoesNotCreateMoreThanImmediateParent(t *testing.T) {
+	root := privateTempDir(t)
+	missing := filepath.Join(root, "missing")
+	if s, err := Open(filepath.Join(missing, "state", "forge.db")); err == nil {
+		s.Close()
+		t.Fatal("Open created multiple missing parent levels")
+	} else if !errors.Is(err, ErrInsecureDatabase) {
+		t.Fatalf("Open error = %v, want ErrInsecureDatabase", err)
+	}
+	if _, err := os.Lstat(missing); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Open created ancestor: %v", err)
+	}
+}
+
+func TestOpenRejectsRacedInsecureParentWithoutRepair(t *testing.T) {
+	root := privateTempDir(t)
+	parent := filepath.Join(root, "state")
+	if err := os.Mkdir(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Lstat(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s, err := Open(filepath.Join(parent, "forge.db")); err == nil {
+		s.Close()
+		t.Fatal("Open accepted raced insecure parent")
+	} else if !errors.Is(err, ErrInsecureDatabase) {
+		t.Fatalf("Open error = %v, want ErrInsecureDatabase", err)
+	}
+	after, err := os.Lstat(parent)
+	if err != nil || !os.SameFile(before, after) || after.Mode().Perm() != 0o755 {
+		t.Fatalf("Open repaired or replaced parent: %v", err)
 	}
 }
 
@@ -418,6 +577,29 @@ func TestOpenRejectsWrongOwnershipWhenAvailable(t *testing.T) {
 		t.Fatal("Open accepted wrong-owner parent")
 	} else if !errors.Is(err, ErrInsecureDatabase) {
 		t.Fatalf("Open error = %v, want ErrInsecureDatabase", err)
+	}
+
+	lockDir := privateTempDir(t)
+	lockDatabase := filepath.Join(lockDir, "forge.db")
+	lockPath := lockDatabase + ".lock"
+	if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(lockPath, 65534, -1); err != nil {
+		t.Skipf("cannot create wrong-owner lock fixture: %v", err)
+	}
+	if s, err := Open(lockDatabase); err == nil {
+		s.Close()
+		t.Fatal("Open accepted wrong-owner lock")
+	} else if !errors.Is(err, ErrInsecureDatabase) {
+		t.Fatalf("Open error = %v, want ErrInsecureDatabase", err)
+	}
+	info, err := os.Lstat(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileUID(info) != 65534 {
+		t.Fatalf("Open repaired wrong-owner lock: owner=%d", fileUID(info))
 	}
 }
 

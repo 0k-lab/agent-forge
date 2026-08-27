@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -31,6 +32,61 @@ func secureTempDir(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return dir
+}
+
+func TestLifecycleLoggerEmitsOnlyAllowlistedFields(t *testing.T) {
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var logs bytes.Buffer
+	options := DefaultOptions()
+	options.LeasePollInterval = time.Millisecond
+	options.Logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	x := newServer(s, map[string]string{"worker-secret": "worker-1"}, "owner-secret", options)
+	h := x.routes()
+	base := strings.Repeat("a", 40)
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(`{"repository":"/private/repo","base_sha":"`+base+`","instruction":"private instruction"}`))
+	req.Header.Set("Authorization", "Bearer owner-secret")
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, req)
+	var job store.Job
+	if err := json.NewDecoder(res.Body).Decode(&job); err != nil {
+		t.Fatal(err)
+	}
+	x.log("worker_connected", "worker_id", "worker-1")
+	x.log("attempt_leased", "job_id", job.ID, "attempt_id", strings.Repeat("2", 32), "worker_id", "worker-1", "status", "leased")
+	x.log("evidence_bound", "job_id", job.ID, "attempt_id", strings.Repeat("2", 32), "worker_id", "worker-1")
+	x.log("terminal_failure", "job_id", job.ID, "attempt_id", strings.Repeat("2", 32), "worker_id", "worker-1", "status", "failed", "failure_code", protocol.FailureScopedTest)
+	x.log("attempt_retry", "job_id", job.ID, "attempt_id", strings.Repeat("2", 32), "worker_id", "worker-1", "status", "retry_wait", "failure_code", protocol.FailureExecution)
+	x.log("terminal_success", "job_id", job.ID, "attempt_id", strings.Repeat("2", 32), "worker_id", "worker-1", "status", "succeeded")
+	x.log("terminal_candidate", "job_id", job.ID, "attempt_id", strings.Repeat("2", 32), "worker_id", "worker-1", "status", "succeeded", "candidate_sha", strings.Repeat("b", 40))
+	x.log("worker_disconnected", "worker_id", "worker-1")
+
+	body := logs.String()
+	for _, event := range []string{"job_submitted", "worker_connected", "attempt_leased", "evidence_bound", "attempt_retry", "terminal_failure", "terminal_success", "terminal_candidate", "worker_disconnected"} {
+		if !strings.Contains(body, `"event":"`+event+`"`) {
+			t.Fatalf("missing event %q in %s", event, body)
+		}
+	}
+	for _, secret := range []string{"owner-secret", "worker-secret", "private instruction", "/private/repo", "job accepted", protocol.EvidenceReasonPluginFailed} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("logs exposed %q: %s", secret, body)
+		}
+	}
+	allowed := map[string]bool{"time": true, "level": true, "msg": true, "component": true, "event": true, "job_id": true, "attempt_id": true, "worker_id": true, "ordinal": true, "status": true, "failure_code": true, "candidate_sha": true}
+	for _, line := range strings.Split(strings.TrimSpace(body), "\n") {
+		var fields map[string]any
+		if err := json.Unmarshal([]byte(line), &fields); err != nil {
+			t.Fatal(err)
+		}
+		for key := range fields {
+			if !allowed[key] {
+				t.Fatalf("unexpected log field %q in %s", key, line)
+			}
+		}
+	}
 }
 
 func TestWorkerConnectionHeartbeatFailureAndLaterLease(t *testing.T) {
@@ -924,6 +980,333 @@ func TestAttemptEvidenceAPIRequiresOwnerAndReturnsOnlyStructuredEvidence(t *test
 		if res.Code != http.StatusNotFound {
 			t.Fatalf("GET %s = %d: %s, want 404", missing, res.Code, res.Body.String())
 		}
+	}
+}
+
+func TestJobResultAPIRequiresOwnerAndAggregatesOrderedHistory(t *testing.T) {
+	databasePath := filepath.Join(secureTempDir(t), "forge.db")
+	s, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	start := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	base, candidate := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	job, err := s.CreateCodingJob(protocol.CodingTask{Repository: "/repo", BaseSHA: base, Instruction: "edit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := store.RecoveryPolicy{LeaseTTL: time.Minute, BaseRetryBackoff: time.Second, MaxAttempts: 3}
+	first, ok, err := s.LeaseNextAt("worker-1", start, policy)
+	if err != nil || !ok {
+		t.Fatalf("first lease = %#v, %v, %v", first, ok, err)
+	}
+	if err := s.BindEvidenceAt(job.ID, first.AttemptID, "worker-1", []protocol.AttemptEvidence{{EvidenceID: strings.Repeat("1", 32), Phase: protocol.EvidencePhasePlugin, Reason: protocol.EvidenceReasonPluginFailed, BaseSHA: base}}, start.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.FailAt(job.ID, first.AttemptID, protocol.FailureExecution, store.RetryableFailure, start.Add(2*time.Millisecond), policy); err != nil {
+		t.Fatal(err)
+	}
+	second, ok, err := s.LeaseNextAt("worker-2", start.Add(2*time.Second), policy)
+	if err != nil || !ok {
+		t.Fatalf("second lease = %#v, %v, %v", second, ok, err)
+	}
+	if _, err := s.CompleteCandidateAt(job.ID, second.AttemptID, candidate, start.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO events(job_id,kind,detail,at) VALUES(?,?,?,?)`, job.ID, "private_kind", "/private/repo instruction=secret argv=go-test plugin-output attempt=private-attempt", start.Add(4*time.Second).Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewHandler(s, map[string]string{"worker": "worker-1"}, "owner")
+	path := "/v1/jobs/" + job.ID + "/result"
+	for _, token := range []string{"", "worker"} {
+		if res := debugRequest(t, h, path, token); res.Code != http.StatusUnauthorized {
+			t.Fatalf("unauthorized result = %d", res.Code)
+		}
+	}
+	res := debugRequest(t, h, path, "owner")
+	if res.Code != http.StatusOK {
+		t.Fatalf("GET result = %d: %s", res.Code, res.Body.String())
+	}
+	var got struct {
+		Job      store.Job `json:"job"`
+		Attempts []struct {
+			store.Attempt
+			Evidence []protocol.AttemptEvidence `json:"evidence"`
+		} `json:"attempts"`
+		Events []store.DebugEvent `json:"timeline"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	var value any
+	if err := json.Unmarshal(res.Body.Bytes(), &value); err != nil {
+		t.Fatal(err)
+	}
+	assertNoDebugSensitiveKeys(t, value)
+	if got.Job.ID != job.ID || got.Job.Status != "succeeded" || got.Job.CandidateSHA != candidate {
+		t.Fatalf("authoritative job = %#v", got.Job)
+	}
+	if len(got.Attempts) != 2 || got.Attempts[0].Ordinal != 1 || got.Attempts[1].Ordinal != 2 || len(got.Attempts[0].Evidence) != 1 || len(got.Attempts[1].Evidence) != 0 {
+		t.Fatalf("attempt aggregates = %#v", got.Attempts)
+	}
+	if len(got.Events) < 4 {
+		t.Fatalf("events = %#v", got.Events)
+	}
+	for _, private := range []string{"/private/repo", "instruction=secret", "argv=go-test", "plugin-output", "private_kind", "private-attempt", `"detail"`, `"task"`, `"repository"`, `"tests"`, `"output"`, `"argv"`} {
+		if strings.Contains(res.Body.String(), private) {
+			t.Fatalf("result exposed %q: %s", private, res.Body.String())
+		}
+	}
+	missing := debugRequest(t, h, "/v1/jobs/"+strings.Repeat("f", 32)+"/result", "owner")
+	if missing.Code != http.StatusNotFound || !strings.Contains(missing.Body.String(), `"code":"job_not_found"`) {
+		t.Fatalf("missing result = %d: %s", missing.Code, missing.Body.String())
+	}
+}
+
+func TestJobResultAPIOmitsLegacyRawResult(t *testing.T) {
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	job, err := s.CreateJob("synthetic-private-input")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, ok, err := s.LeaseNext("worker")
+	if err != nil || !ok {
+		t.Fatalf("lease = %#v, %v, %v", lease, ok, err)
+	}
+	const private = "synthetic-private-raw-result"
+	if _, err := s.Complete(job.ID, lease.AttemptID, private); err != nil {
+		t.Fatal(err)
+	}
+
+	res := debugRequest(t, NewHandler(s, nil, "owner"), "/v1/jobs/"+job.ID+"/result", "owner")
+	if res.Code != http.StatusOK {
+		t.Fatalf("GET result = %d: %s", res.Code, res.Body.String())
+	}
+	if strings.Contains(res.Body.String(), private) || strings.Contains(res.Body.String(), "synthetic-private-input") {
+		t.Fatalf("result exposed legacy private data: %s", res.Body.String())
+	}
+	var value any
+	if err := json.Unmarshal(res.Body.Bytes(), &value); err != nil {
+		t.Fatal(err)
+	}
+	assertNoDebugSensitiveKeys(t, value)
+	var got struct {
+		Job      map[string]json.RawMessage   `json:"job"`
+		Attempts []map[string]json.RawMessage `json:"attempts"`
+		Timeline []map[string]json.RawMessage `json:"timeline"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Job["id"]) != `"`+job.ID+`"` || string(got.Job["status"]) != `"succeeded"` || got.Job["created_at"] == nil || got.Job["updated_at"] == nil {
+		t.Fatalf("safe job identity/status/timestamps = %v", got.Job)
+	}
+	if len(got.Attempts) != 1 || string(got.Attempts[0]["id"]) != `"`+lease.AttemptID+`"` || string(got.Attempts[0]["ordinal"]) != "1" || got.Attempts[0]["leased_at"] == nil || got.Attempts[0]["deadline_at"] == nil || got.Attempts[0]["completed_at"] == nil || got.Attempts[0]["evidence"] == nil {
+		t.Fatalf("safe ordered attempt/evidence = %v", got.Attempts)
+	}
+	if len(got.Timeline) == 0 || got.Timeline[0]["type"] == nil || got.Timeline[0]["at"] == nil {
+		t.Fatalf("safe projected timeline = %v", got.Timeline)
+	}
+}
+
+func TestEventsAPIExposesOnlyStableSafeFields(t *testing.T) {
+	databasePath := filepath.Join(secureTempDir(t), "forge.db")
+	s, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	job, err := s.CreateJob("input")
+	if err != nil {
+		t.Fatal(err)
+	}
+	private := "synthetic-private-detail"
+	at := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	raw, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO events(job_id,kind,detail,at) VALUES(?,?,?,?)`, job.ID, "synthetic", private, at.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want, err := s.Events(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res := debugRequest(t, NewHandler(s, nil, "owner"), "/v1/jobs/"+job.ID+"/events", "owner")
+	if res.Code != http.StatusOK {
+		t.Fatalf("GET events = %d: %s", res.Code, res.Body.String())
+	}
+	if strings.Contains(res.Body.String(), private) || strings.Contains(res.Body.String(), `"detail"`) {
+		t.Fatalf("events API exposed private detail: %s", res.Body.String())
+	}
+	var fields []map[string]json.RawMessage
+	if err := json.Unmarshal(res.Body.Bytes(), &fields); err != nil {
+		t.Fatal(err)
+	}
+	for i, event := range fields {
+		if len(event) != 4 || event["id"] == nil || event["job_id"] == nil || event["kind"] == nil || event["at"] == nil {
+			t.Fatalf("event %d fields = %v, want only id, job_id, kind, at", i, event)
+		}
+	}
+	var got []struct {
+		ID    int64     `json:"id"`
+		JobID string    `json:"job_id"`
+		Kind  string    `json:"kind"`
+		At    time.Time `json:"at"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("events count = %d, want %d", len(got), len(want))
+	}
+	for i := range got {
+		if got[i].ID != want[i].ID || got[i].JobID != want[i].JobID || got[i].Kind != want[i].Kind || !got[i].At.Equal(want[i].At) {
+			t.Fatalf("event %d = %#v, want %#v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestHealthReadinessStatusAndOwnerNoStore(t *testing.T) {
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	job, err := s.CreateJob("private input")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(s, nil, "owner")
+	for path, want := range map[string]string{"/healthz": `{"status":"ok"}`, "/readyz": `{"status":"ready"}`} {
+		res := httptest.NewRecorder()
+		h.ServeHTTP(res, httptest.NewRequest(http.MethodGet, path, nil))
+		if res.Code != http.StatusOK || strings.TrimSpace(res.Body.String()) != want || strings.Contains(res.Body.String(), "private") {
+			t.Fatalf("%s = %d %q", path, res.Code, res.Body.String())
+		}
+	}
+	for _, path := range []string{"/v1/jobs/" + job.ID + "/status", "/v1/jobs/" + job.ID} {
+		unauthorized := debugRequest(t, h, path, "")
+		if unauthorized.Code != http.StatusUnauthorized || unauthorized.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("unauthorized %s = %d cache=%q", path, unauthorized.Code, unauthorized.Header().Get("Cache-Control"))
+		}
+	}
+	res := debugRequest(t, h, "/v1/jobs/"+job.ID+"/status", "owner")
+	if res.Code != http.StatusOK || res.Header().Get("Cache-Control") != "no-store" || strings.Contains(res.Body.String(), "private input") || !strings.Contains(res.Body.String(), `"status":"pending"`) {
+		t.Fatalf("status = %d cache=%q %s", res.Code, res.Header().Get("Cache-Control"), res.Body.String())
+	}
+}
+
+func TestJobSubmissionAndLookupUseSafeProjection(t *testing.T) {
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	h := NewHandler(s, nil, "owner")
+
+	submit := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(`{"input":"synthetic-private-input"}`))
+	submit.Header.Set("Authorization", "Bearer owner")
+	submitResult := httptest.NewRecorder()
+	h.ServeHTTP(submitResult, submit)
+	if submitResult.Code != http.StatusCreated {
+		t.Fatalf("submit = %d: %s", submitResult.Code, submitResult.Body.String())
+	}
+	var submitted map[string]any
+	if err := json.Unmarshal(submitResult.Body.Bytes(), &submitted); err != nil {
+		t.Fatal(err)
+	}
+	assertNoDebugSensitiveKeys(t, submitted)
+	allowed := map[string]bool{"id": true, "status": true, "attempt_id": true, "worker_id": true, "repository_id": true, "worker_pool": true, "policy_version": true, "candidate_sha": true, "failure_code": true, "created_at": true, "updated_at": true}
+	for key := range submitted {
+		if !allowed[key] {
+			t.Fatalf("submission exposed field %q: %s", key, submitResult.Body.String())
+		}
+	}
+	id, _ := submitted["id"].(string)
+	lease, ok, err := s.LeaseNext("worker")
+	if err != nil || !ok || lease.JobID != id {
+		t.Fatalf("lease = %#v, %v, %v", lease, ok, err)
+	}
+	if _, err := s.Complete(id, lease.AttemptID, "synthetic-private-result"); err != nil {
+		t.Fatal(err)
+	}
+
+	lookup := debugRequest(t, h, "/v1/jobs/"+id, "owner")
+	if lookup.Code != http.StatusOK || lookup.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("lookup = %d cache=%q: %s", lookup.Code, lookup.Header().Get("Cache-Control"), lookup.Body.String())
+	}
+	var lookedUp map[string]any
+	if err := json.Unmarshal(lookup.Body.Bytes(), &lookedUp); err != nil {
+		t.Fatal(err)
+	}
+	assertNoDebugSensitiveKeys(t, lookedUp)
+	for key := range lookedUp {
+		if !allowed[key] {
+			t.Fatalf("lookup exposed field %q: %s", key, lookup.Body.String())
+		}
+	}
+	for _, private := range []string{"synthetic-private-input", "synthetic-private-result"} {
+		if strings.Contains(submitResult.Body.String(), private) || strings.Contains(lookup.Body.String(), private) {
+			t.Fatalf("job API exposed %q", private)
+		}
+	}
+}
+
+func TestJobResultRejectsActiveJob(t *testing.T) {
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	job, err := s.CreateJob("private")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := debugRequest(t, NewHandler(s, nil, "owner"), "/v1/jobs/"+job.ID+"/result", "owner")
+	if res.Code != http.StatusConflict || !strings.Contains(res.Body.String(), `"code":"job_not_terminal"`) || strings.Contains(res.Body.String(), "private") {
+		t.Fatalf("active result = %d: %s", res.Code, res.Body.String())
+	}
+}
+
+func TestJobResultAPIBoundsEncodedResponse(t *testing.T) {
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	job, err := s.CreateJob("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, ok, err := s.LeaseNext(strings.Repeat("w", protocol.MaxWorkerMessageBytes))
+	if err != nil || !ok {
+		t.Fatalf("lease = %#v, %v, %v", lease, ok, err)
+	}
+	if _, err := s.Complete(job.ID, lease.AttemptID, "private raw result"); err != nil {
+		t.Fatal(err)
+	}
+	res := debugRequest(t, NewHandler(s, nil, "owner"), "/v1/jobs/"+job.ID+"/result", "owner")
+	if res.Code != http.StatusRequestEntityTooLarge || !strings.Contains(res.Body.String(), `"code":"result_too_large"`) || res.Body.Len() > 256 {
+		t.Fatalf("oversized result = %d, %d bytes: %s", res.Code, res.Body.Len(), res.Body.String())
 	}
 }
 
