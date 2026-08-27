@@ -5,27 +5,83 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"agent-forge/internal/gate"
 	"agent-forge/internal/store"
 )
 
-func main() {
-	if err := run(); err != nil {
-		log.Fatal(err)
+const shutdownTimeout = 10 * time.Second
+
+func newHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       time.Minute,
+		MaxHeaderBytes:    1 << 20,
 	}
 }
 
-func run() error {
-	configPath := flag.String("config", "", "Gate JSON config path")
-	flag.Parse()
-	if *configPath == "" || flag.NArg() != 0 {
+func shutdown(server *http.Server) error {
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	return server.Shutdown(ctx)
+}
+
+func main() {
+	logger := newJSONLogger(os.Stderr)
+	if err := run(os.Args[1:], logger); err != nil {
+		writeStartupError(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func newJSONLogger(output io.Writer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(output, nil))
+}
+
+type startupErrorCode string
+
+const (
+	codeStartupFailed       startupErrorCode = "startup_failed"
+	codeInvalidDatabase     startupErrorCode = "invalid_database_location"
+	codeInsecureDatabase    startupErrorCode = "insecure_database"
+	codeUnsupportedDatabase startupErrorCode = "unsupported_database"
+	codeDatabaseOpenFailed  startupErrorCode = "database_open_failed"
+	codeAlreadyOwned        startupErrorCode = "already_owned"
+)
+
+func writeStartupError(output io.Writer, err error) {
+	code := codeStartupFailed
+	for target, value := range map[error]startupErrorCode{
+		store.ErrInvalidDatabaseLocation: codeInvalidDatabase,
+		store.ErrInsecureDatabase:        codeInsecureDatabase,
+		store.ErrUnsupportedDatabase:     codeUnsupportedDatabase,
+		store.ErrDatabaseOpen:            codeDatabaseOpenFailed,
+		store.ErrAlreadyOwned:            codeAlreadyOwned,
+	} {
+		if errors.Is(err, target) {
+			code = value
+		}
+	}
+	newJSONLogger(output).Error("gate lifecycle", "component", "gate", "event", "startup_failed", "failure_code", code)
+}
+
+func run(args []string, logger *slog.Logger) error {
+	logger.Info("gate lifecycle", "component", "gate", "event", "startup")
+	flags := flag.NewFlagSet("forge-gate", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	configPath := flags.String("config", "", "Gate JSON config path")
+	if flags.Parse(args) != nil || *configPath == "" || flags.NArg() != 0 {
 		return errors.New("-config is required")
 	}
 	config, err := gate.LoadConfig(*configPath)
@@ -35,6 +91,7 @@ func run() error {
 	options := gate.DefaultOptions()
 	options.RecoveryInterval = config.RecoveryInterval
 	options.LeasePollInterval = config.LeasePollInterval
+	options.Logger = logger
 	s, err := store.Open(config.Database)
 	if err != nil {
 		return err
@@ -56,13 +113,13 @@ func run() error {
 		<-recoveryErr
 		return err
 	}
-	server := &http.Server{Handler: handler}
+	server := newHTTPServer(handler)
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.Serve(listener) }()
-	log.Printf("forge-gate listening on %s", config.Listen)
+	logger.Info("gate lifecycle", "component", "gate", "event", "listening")
 	select {
 	case err := <-recoveryErr:
-		_ = server.Shutdown(context.Background())
+		_ = shutdown(server)
 		if errors.Is(err, context.Canceled) {
 			return nil
 		}
@@ -75,7 +132,7 @@ func run() error {
 		}
 		return err
 	case <-ctx.Done():
-		err := server.Shutdown(context.Background())
+		err := shutdown(server)
 		<-recoveryErr
 		return err
 	}

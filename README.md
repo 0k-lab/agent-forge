@@ -23,6 +23,7 @@ go build -o bin/forge-gate ./cmd/forge-gate
 go build -o bin/forge-worker ./cmd/forge-worker
 go build -o bin/forge-ref-plugin ./cmd/forge-ref-plugin
 go build -o bin/forge-codex-plugin ./cmd/forge-codex-plugin
+go build -o bin/forge ./cmd/forge
 ```
 
 ## Run
@@ -65,20 +66,23 @@ Gate requires trusted, non-symlink path ancestors and checks that the immediate 
 
 `:memory:`, `file::memory:?cache=private`, `file::memory:?cache=shared`, named or empty `file:` memory DSNs with `mode=memory`, relative or absolute plain paths, and validated `file:` paths are supported. File DSNs allow only absent `mode` or `mode=rwc` and optional cache value `private` or `shared`; all other or duplicate parameters are rejected. On non-Unix systems memory databases work, but file-backed storage returns an unsupported-storage error.
 
-The private owned parent prevents mutation by other UIDs, and atomic `O_EXCL` creation protects the absent final target. This preflight is not a custom-VFS, race-free defense against a malicious process running as the same UID; the runtime and same-UID processes must be trusted. These filesystem controls are permissions, not encryption.
+If only the immediate database parent is missing, Gate creates it as exact mode `0700`, verifies that it is a non-symlink directory owned by the effective UID, and then creates the database. Gate never creates multiple missing directory levels. An existing parent must already be private and effective-UID owned; Gate never chmods, removes, or replaces an existing insecure or wrong-owner object. The private owned parent prevents mutation by other UIDs, and atomic `O_EXCL` creation protects the absent final target. This preflight is not a custom-VFS, race-free defense against a malicious process running as the same UID; the runtime and same-UID processes must be trusted. These filesystem controls are permissions, not encryption.
 
-Submit and inspect:
+Set the CLI connection values once, then submit and inspect without putting the owner token in argv:
 
 ```sh
-JOB_JSON=$(curl -sS -X POST http://127.0.0.1:18080/v1/jobs \
-  -H 'Authorization: Bearer fake-owner-token' \
-  -H 'Content-Type: application/json' -d '{"input":"hello agent forge"}')
+export FORGE_GATE_URL=http://127.0.0.1:18080
+export FORGE_OWNER_TOKEN=fake-owner-token
+JOB_JSON=$(printf '%s\n' '{"input":"hello agent forge"}' | ./bin/forge submit -file -)
 echo "$JOB_JSON"
 JOB_ID=$(printf '%s' "$JOB_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
-curl -sS -H 'Authorization: Bearer fake-owner-token' "http://127.0.0.1:18080/v1/jobs/$JOB_ID"
-curl -sS -H 'Authorization: Bearer fake-owner-token' "http://127.0.0.1:18080/v1/jobs/$JOB_ID/events"
-curl -sS -H 'Authorization: Bearer fake-owner-token' "http://127.0.0.1:18080/v1/workers/worker-1"
+./bin/forge status "$JOB_ID"
+./bin/forge events "$JOB_ID"
+./bin/forge wait -timeout 10m -poll 1s "$JOB_ID"
+./bin/forge result "$JOB_ID"
 ```
+
+`forge` has exactly five subcommands: `submit`, `wait`, `status`, `events`, and `result`. Each accepts `-url` (default `FORGE_GATE_URL`) and `-token-env` (default `FORGE_OWNER_TOKEN`); the token value is read only from that environment variable. `submit -file task.json -wait` submits one strict JSON object and prints the terminal aggregate. `wait` and `result` print the same bounded aggregate containing the authoritative job, ordered attempts, ordered events, and evidence nested under each attempt.
 
 ## Attempt evidence
 
@@ -86,11 +90,10 @@ Coding Workers bind bounded evidence to the exact current `(job, attempt, authen
 
 Evidence uses closed preparation, plugin, workspace-validation, scoped-check, candidate-commit, and cleanup phase/reason values. Scoped checks include the authoritative task check index, exit status when valid, duration, and argument count/order represented only by one fixed `[REDACTED]` placeholder per task argument. Any non-empty Worker output becomes exactly `[REDACTED]`; empty output remains empty, while `output_redacted` and bounded-capture `output_truncated` report what happened. Store rejects every other non-empty output, so the API and canonical payload hash contain only the fixed marker and structured safe fields. A batch and an attempt allow at most 34 records, with 96 KiB per batch and 64 KiB total stored output per attempt. Empty batches, unknown fields, mixed-purpose messages, oversized payloads, conflicting replays, expired leases, terminal attempts, and superseded attempts fail closed.
 
-After a successful candidate commit, all scoped-check records name that exact candidate SHA; failed pre-commit checks remain base-bound. Evidence survives Gate restart on the still-leased attempt, while expiry/retry fencing prevents a prior attempt from appending later. Only the owner API exposes it:
+After a successful candidate commit, all scoped-check records name that exact candidate SHA; failed pre-commit checks remain base-bound. Evidence survives Gate restart on the still-leased attempt, while expiry/retry fencing prevents a prior attempt from appending later. Only the owner API exposes it. The supported CLI nests evidence under each attempt, so callers do not construct attempt URLs:
 
 ```sh
-curl -sS -H 'Authorization: Bearer fake-owner-token' \
-  "http://127.0.0.1:18080/v1/jobs/$JOB_ID/attempts/$ATTEMPT_ID/evidence"
+./bin/forge result "$JOB_ID"
 ```
 
 The read-only debug viewer intentionally does not render evidence output.

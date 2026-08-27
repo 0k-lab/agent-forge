@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -49,10 +50,11 @@ type Options struct {
 	RecoveryInterval  time.Duration
 	LeasePollInterval time.Duration
 	Now               func() time.Time
+	Logger            *slog.Logger
 }
 
 func DefaultOptions() Options {
-	return Options{Policy: store.DefaultRecoveryPolicy(), RecoveryInterval: time.Second, LeasePollInterval: 100 * time.Millisecond, Now: time.Now}
+	return Options{Policy: store.DefaultRecoveryPolicy(), RecoveryInterval: time.Second, LeasePollInterval: 100 * time.Millisecond, Now: time.Now, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 }
 
 func (o Options) Validate() error {
@@ -233,6 +235,9 @@ func NewConfiguredHandler(s *store.Store, config Config, options Options) (http.
 	if err := s.MarkWorkersDisconnected(options.Now().UTC()); err != nil {
 		return nil, errors.New("worker startup state failed")
 	}
+	if err := s.SweepExpiredPolicies(options.Now().UTC()); err != nil {
+		return nil, errors.New("job recovery failed")
+	}
 	cursorKey := s.DebugCursorKey(config.ownerToken)
 	config.ownerToken = ""
 	x := newServerWithOwner(s, nil, config.ownerDigest, true, cursorKey, options)
@@ -245,13 +250,28 @@ func newServer(s *store.Store, tokens map[string]string, ownerToken string, opti
 }
 
 func newServerWithOwner(s *store.Store, tokens map[string]string, ownerDigest [sha256.Size]byte, ownerConfigured bool, cursorKey [sha256.Size]byte, options Options) *server {
+	if options.Logger == nil {
+		options.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	return &server{store: s, tokens: tokens, ownerDigest: ownerDigest, ownerConfigured: ownerConfigured, cursor: newDebugCursorCodec(cursorKey), options: options, sessions: map[string]workerSession{}}
+}
+
+func (x *server) log(event string, fields ...any) {
+	x.options.Logger.Info("gate lifecycle", append([]any{"component", "gate", "event", event}, fields...)...)
 }
 
 func (x *server) routes() http.Handler {
 	m := http.NewServeMux()
+	m.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	m.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+	})
 	m.HandleFunc("POST /v1/jobs", x.ownerAuth(x.submit))
 	m.HandleFunc("GET /v1/jobs/{id}", x.ownerAuth(x.getJob))
+	m.HandleFunc("GET /v1/jobs/{id}/status", x.ownerAuth(x.getJobStatus))
+	m.HandleFunc("GET /v1/jobs/{id}/result", x.ownerAuth(x.getResult))
 	m.HandleFunc("GET /v1/jobs/{id}/events", x.ownerAuth(x.getEvents))
 	m.HandleFunc("GET /v1/jobs/{id}/attempts/{attempt_id}/evidence", x.ownerAuth(x.getAttemptEvidence))
 	m.HandleFunc("GET /v1/workers/{id}", x.ownerAuth(x.getWorker))
@@ -279,6 +299,7 @@ func getOnly(next http.HandlerFunc) http.HandlerFunc {
 
 func (x *server) ownerAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		digest := sha256.Sum256([]byte(bearerToken(r)))
 		if subtle.ConstantTimeCompare(digest[:], x.ownerDigest[:]) != 1 || !x.ownerConfigured {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -454,7 +475,8 @@ func (x *server) submit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err)
 		return
 	}
-	writeJSON(w, 201, j)
+	x.log("job_submitted", "job_id", j.ID, "status", j.Status)
+	writeJSON(w, 201, publicJob(j))
 }
 
 func (x *server) submitConfigured(w http.ResponseWriter, r *http.Request) {
@@ -483,7 +505,8 @@ func (x *server) submitConfigured(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "request failed"})
 			return
 		}
-		writeJSON(w, http.StatusCreated, job)
+		x.log("job_submitted", "job_id", job.ID, "status", job.Status)
+		writeJSON(w, http.StatusCreated, publicJob(job))
 		return
 	}
 	var repository *RepositoryRegistration
@@ -508,7 +531,8 @@ func (x *server) submitConfigured(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "request failed"})
 		return
 	}
-	writeJSON(w, http.StatusCreated, job)
+	x.log("job_submitted", "job_id", job.ID, "status", job.Status)
+	writeJSON(w, http.StatusCreated, publicJob(job))
 }
 
 func validateTask(task protocol.CodingTask) error {
@@ -541,15 +565,237 @@ func (x *server) getJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, err)
 		return
 	}
-	writeJSON(w, 200, j)
+	writeJSON(w, 200, publicJob(j))
 }
+
+func (x *server) getJobStatus(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validJobID(id) {
+		writeResultError(w, http.StatusNotFound, CodeJobNotFound, "not found")
+		return
+	}
+	job, err := x.store.DebugJob(r.Context(), id)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeResultError(w, http.StatusNotFound, CodeJobNotFound, "not found")
+		return
+	}
+	if err != nil {
+		writeResultError(w, http.StatusInternalServerError, CodeRequestFailed, "request failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
+}
+
+type ErrorCode string
+
+const (
+	CodeJobNotFound    ErrorCode = "job_not_found"
+	CodeJobNotTerminal ErrorCode = "job_not_terminal"
+	CodeRequestFailed  ErrorCode = "request_failed"
+	CodeResultTooLarge ErrorCode = "result_too_large"
+)
+
+type APIError struct {
+	Code    ErrorCode `json:"code"`
+	Message string    `json:"message"`
+}
+
+type safeEvidence struct {
+	EvidenceID      string `json:"evidence_id"`
+	Phase           string `json:"phase"`
+	Reason          string `json:"reason"`
+	CheckIndex      *int   `json:"check_index,omitempty"`
+	ExitCode        *int   `json:"exit_code,omitempty"`
+	DurationMS      int64  `json:"duration_ms"`
+	OutputRedacted  bool   `json:"output_redacted,omitempty"`
+	OutputTruncated bool   `json:"output_truncated,omitempty"`
+	BaseSHA         string `json:"base_sha"`
+	CandidateSHA    string `json:"candidate_sha,omitempty"`
+	ArgvRedacted    bool   `json:"argv_redacted,omitempty"`
+}
+
+type safeAttempt struct {
+	ID                 string         `json:"id"`
+	Ordinal            int            `json:"ordinal"`
+	Status             string         `json:"status"`
+	FailureDisposition string         `json:"failure_disposition,omitempty"`
+	FailureCode        string         `json:"failure_code,omitempty"`
+	CandidateSHA       string         `json:"candidate_sha,omitempty"`
+	LeasedAt           time.Time      `json:"leased_at"`
+	DeadlineAt         time.Time      `json:"deadline_at"`
+	CompletedAt        time.Time      `json:"completed_at,omitempty"`
+	Evidence           []safeEvidence `json:"evidence"`
+}
+
+type safeResultJob struct {
+	ID           string    `json:"id"`
+	Kind         string    `json:"kind"`
+	Status       string    `json:"status"`
+	AttemptID    string    `json:"attempt_id,omitempty"`
+	WorkerID     string    `json:"worker_id,omitempty"`
+	BaseSHA      string    `json:"base_sha,omitempty"`
+	CandidateSHA string    `json:"candidate_sha,omitempty"`
+	FailureCode  string    `json:"failure_code,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+type publicJobResponse struct {
+	ID            string    `json:"id"`
+	Status        string    `json:"status"`
+	AttemptID     string    `json:"attempt_id,omitempty"`
+	WorkerID      string    `json:"worker_id,omitempty"`
+	RepositoryID  string    `json:"repository_id,omitempty"`
+	WorkerPool    string    `json:"worker_pool,omitempty"`
+	PolicyVersion int       `json:"policy_version,omitempty"`
+	CandidateSHA  string    `json:"candidate_sha,omitempty"`
+	FailureCode   string    `json:"failure_code,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+func publicJob(job store.Job) publicJobResponse {
+	response := publicJobResponse{
+		ID:            job.ID,
+		Status:        job.Status,
+		AttemptID:     job.AttemptID,
+		WorkerID:      job.WorkerID,
+		WorkerPool:    job.WorkerPool,
+		PolicyVersion: job.PolicyVersion,
+		CandidateSHA:  job.CandidateSHA,
+		FailureCode:   safeFailureCode(job.Error),
+		CreatedAt:     job.CreatedAt,
+		UpdatedAt:     job.UpdatedAt,
+	}
+	if job.Task != nil {
+		response.RepositoryID = job.Task.RepositoryID
+	}
+	return response
+}
+
+type jobResult struct {
+	Job      safeResultJob      `json:"job"`
+	Attempts []safeAttempt      `json:"attempts"`
+	Timeline []store.DebugEvent `json:"timeline"`
+}
+
+const (
+	maxResultAttempts = 100
+	maxResultEvents   = 100
+)
+
+func (x *server) getResult(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validJobID(id) {
+		writeResultError(w, http.StatusNotFound, CodeJobNotFound, "not found")
+		return
+	}
+	job, err := x.store.Job(id)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeResultError(w, http.StatusNotFound, CodeJobNotFound, "not found")
+		return
+	}
+	if err != nil {
+		writeResultError(w, http.StatusInternalServerError, CodeRequestFailed, "request failed")
+		return
+	}
+	if job.Status != "succeeded" && job.Status != "failed" {
+		writeResultError(w, http.StatusConflict, CodeJobNotTerminal, "job is not terminal")
+		return
+	}
+	attempts, err := x.store.Attempts(id)
+	if err != nil || len(attempts) > maxResultAttempts {
+		writeResultError(w, http.StatusInternalServerError, CodeRequestFailed, "request failed")
+		return
+	}
+	debugJob, err := x.store.DebugJob(r.Context(), id)
+	if err != nil {
+		writeResultError(w, http.StatusInternalServerError, CodeRequestFailed, "request failed")
+		return
+	}
+	result := jobResult{Job: safeResultJob{ID: debugJob.ID, Kind: debugJob.Kind, Status: debugJob.Status, AttemptID: debugJob.AttemptID, WorkerID: debugJob.WorkerID, BaseSHA: debugJob.BaseSHA, CandidateSHA: debugJob.CandidateSHA, FailureCode: safeFailureCode(job.Error), CreatedAt: debugJob.CreatedAt, UpdatedAt: debugJob.UpdatedAt}, Attempts: make([]safeAttempt, 0, len(attempts))}
+	for _, attempt := range attempts {
+		evidence, err := x.store.AttemptEvidence(id, attempt.ID)
+		if err != nil {
+			writeResultError(w, http.StatusInternalServerError, CodeRequestFailed, "request failed")
+			return
+		}
+		safe := safeAttempt{ID: attempt.ID, Ordinal: attempt.Ordinal, Status: attempt.Status, FailureDisposition: attempt.FailureDisposition, FailureCode: safeFailureCode(attempt.FailureCode), CandidateSHA: attempt.CandidateSHA, LeasedAt: attempt.LeasedAt, DeadlineAt: attempt.DeadlineAt, CompletedAt: attempt.CompletedAt, Evidence: make([]safeEvidence, 0, len(evidence))}
+		for _, record := range evidence {
+			safe.Evidence = append(safe.Evidence, safeEvidence{EvidenceID: record.EvidenceID, Phase: record.Phase, Reason: record.Reason, CheckIndex: record.CheckIndex, ExitCode: record.ExitCode, DurationMS: record.DurationMS, OutputRedacted: record.OutputRedacted, OutputTruncated: record.OutputTruncated, BaseSHA: record.BaseSHA, CandidateSHA: record.CandidateSHA, ArgvRedacted: record.ArgvRedacted})
+		}
+		result.Attempts = append(result.Attempts, safe)
+	}
+	timeline, err := x.store.DebugJobTimeline(r.Context(), id, maxResultEvents, nil)
+	if err != nil || timeline.NextPosition != nil {
+		writeResultError(w, http.StatusInternalServerError, CodeRequestFailed, "request failed")
+		return
+	}
+	result.Timeline = make([]store.DebugEvent, 0, len(timeline.Events))
+	for _, event := range timeline.Events {
+		switch event.Type {
+		case "submitted", "leased", "lease_expired", "retryable_failed", "retry_scheduled", "failed", "succeeded":
+		default:
+			continue
+		}
+		if event.AttemptID != "" && !validJobID(event.AttemptID) {
+			event.AttemptID = ""
+		}
+		result.Timeline = append(result.Timeline, event)
+	}
+	body, err := json.Marshal(result)
+	if err != nil || len(body)+1 > protocol.MaxWorkerMessageBytes {
+		writeResultError(w, http.StatusRequestEntityTooLarge, CodeResultTooLarge, "result exceeds limit")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(append(body, '\n'))
+}
+
+func safeFailureCode(code string) string {
+	switch code {
+	case protocol.FailureInvalidTask, protocol.FailureScopedTest, protocol.FailureExecution, "max_attempts_exceeded":
+		return code
+	}
+	return ""
+}
+
+func writeResultError(w http.ResponseWriter, status int, code ErrorCode, message string) {
+	writeJSON(w, status, map[string]APIError{"error": {Code: code, Message: message}})
+}
+
+func validJobID(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	for i := range len(id) {
+		if id[i] < '0' || id[i] > '9' && (id[i] < 'a' || id[i] > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+type eventResponse struct {
+	ID    int64     `json:"id"`
+	JobID string    `json:"job_id"`
+	Kind  string    `json:"kind"`
+	At    time.Time `json:"at"`
+}
+
 func (x *server) getEvents(w http.ResponseWriter, r *http.Request) {
-	e, err := x.store.Events(r.PathValue("id"))
+	events, err := x.store.Events(r.PathValue("id"))
 	if err != nil {
 		writeErr(w, 500, err)
 		return
 	}
-	writeJSON(w, 200, e)
+	response := make([]eventResponse, len(events))
+	for i, event := range events {
+		response[i] = eventResponse{ID: event.ID, JobID: event.JobID, Kind: event.Kind, At: event.At}
+	}
+	writeJSON(w, 200, response)
 }
 func (x *server) getAttemptEvidence(w http.ResponseWriter, r *http.Request) {
 	records, err := x.store.AttemptEvidence(r.PathValue("id"), r.PathValue("attempt_id"))
@@ -637,13 +883,18 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 			}
 			x.mu.Unlock()
 			_ = x.store.ReleaseWorkerSlot(effectiveID, generation, x.options.Now().UTC())
+			x.log("worker_disconnected", "worker_id", effectiveID)
 		}()
 	} else {
 		if err = x.store.SetWorkerConnected(workerID, true); err != nil {
 			return
 		}
-		defer x.store.SetWorkerConnected(workerID, false)
+		defer func() {
+			_ = x.store.SetWorkerConnected(workerID, false)
+			x.log("worker_disconnected", "worker_id", workerID)
+		}()
 	}
+	x.log("worker_connected", "worker_id", effectiveID)
 	incoming := make(chan protocol.Message, 1)
 	readErr := make(chan error, 1)
 	go func() {
@@ -711,6 +962,7 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 					reject()
 					return
 				}
+				x.log("evidence_bound", "job_id", m.JobID, "attempt_id", m.AttemptID, "worker_id", effectiveID)
 				if wsjson.Write(ctx, c, protocol.Message{Type: protocol.MessageAck, JobID: m.JobID, AttemptID: m.AttemptID}) != nil {
 					return
 				}
@@ -721,6 +973,7 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			at := x.options.Now().UTC()
+			var terminalJob store.Job
 			var resultErr error
 			if m.Error != "" {
 				disposition, ok := failureDisposition(m.Error)
@@ -729,29 +982,40 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if x.config != nil {
-					_, resultErr = x.store.FailLeaseAt(m.JobID, m.AttemptID, effectiveID, generation, m.Error, disposition, at)
+					terminalJob, resultErr = x.store.FailLeaseAt(m.JobID, m.AttemptID, effectiveID, generation, m.Error, disposition, at)
 				} else {
-					_, resultErr = x.store.FailAt(m.JobID, m.AttemptID, m.Error, disposition, at, x.options.Policy)
+					terminalJob, resultErr = x.store.FailAt(m.JobID, m.AttemptID, m.Error, disposition, at, x.options.Policy)
 				}
 			} else if m.Disposition != "" {
 				reject()
 				return
 			} else if m.CandidateSHA != "" {
 				if x.config != nil {
-					_, resultErr = x.store.CompleteCandidateLeaseAt(m.JobID, m.AttemptID, effectiveID, generation, m.CandidateSHA, at)
+					terminalJob, resultErr = x.store.CompleteCandidateLeaseAt(m.JobID, m.AttemptID, effectiveID, generation, m.CandidateSHA, at)
 				} else {
-					_, resultErr = x.store.CompleteCandidateAt(m.JobID, m.AttemptID, m.CandidateSHA, at)
+					terminalJob, resultErr = x.store.CompleteCandidateAt(m.JobID, m.AttemptID, m.CandidateSHA, at)
 				}
 			} else {
 				if x.config != nil {
-					_, resultErr = x.store.CompleteLeaseAt(m.JobID, m.AttemptID, effectiveID, generation, m.Result, at)
+					terminalJob, resultErr = x.store.CompleteLeaseAt(m.JobID, m.AttemptID, effectiveID, generation, m.Result, at)
 				} else {
-					_, resultErr = x.store.CompleteAt(m.JobID, m.AttemptID, m.Result, at)
+					terminalJob, resultErr = x.store.CompleteAt(m.JobID, m.AttemptID, m.Result, at)
 				}
 			}
 			if resultErr != nil {
 				reject()
 				return
+			}
+			if m.Error != "" {
+				event := "terminal_failure"
+				if terminalJob.Status == "retry_wait" {
+					event = "attempt_retry"
+				}
+				x.log(event, "job_id", m.JobID, "attempt_id", m.AttemptID, "worker_id", effectiveID, "status", terminalJob.Status, "failure_code", m.Error)
+			} else if m.CandidateSHA != "" {
+				x.log("terminal_candidate", "job_id", m.JobID, "attempt_id", m.AttemptID, "worker_id", effectiveID, "status", terminalJob.Status, "candidate_sha", m.CandidateSHA)
+			} else {
+				x.log("terminal_success", "job_id", m.JobID, "attempt_id", m.AttemptID, "worker_id", effectiveID, "status", terminalJob.Status)
 			}
 			if wsjson.Write(ctx, c, protocol.Message{Type: protocol.MessageAck, JobID: m.JobID, AttemptID: m.AttemptID}) != nil {
 				return
@@ -783,6 +1047,7 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 			if err := wsjson.Write(ctx, c, m); err != nil {
 				return
 			}
+			x.log("attempt_leased", "job_id", lease.JobID, "attempt_id", lease.AttemptID, "worker_id", effectiveID, "status", "leased")
 			active = &lease
 		}
 	}

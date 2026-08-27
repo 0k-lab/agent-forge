@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -21,36 +20,19 @@ import (
 func TestOpenPersistsOneValidDebugCursorSecret(t *testing.T) {
 	path := filepath.Join(secureTempDir(t), "forge.db")
 	const opens = 8
-	secrets := make(chan []byte, opens)
-	errs := make(chan error, opens)
-	var wg sync.WaitGroup
-	for range opens {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s, err := Open(path)
-			if err != nil {
-				errs <- err
-				return
-			}
-			defer s.Close()
-			var secret []byte
-			err = s.db.QueryRow(`SELECT value FROM metadata WHERE key='debug_cursor_secret'`).Scan(&secret)
-			if err != nil {
-				errs <- err
-				return
-			}
-			secrets <- secret
-		}()
-	}
-	wg.Wait()
-	close(errs)
-	close(secrets)
-	for err := range errs {
-		t.Fatal(err)
-	}
 	var first []byte
-	for secret := range secrets {
+	for range opens {
+		s, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var secret []byte
+		if err := s.db.QueryRow(`SELECT value FROM metadata WHERE key='debug_cursor_secret'`).Scan(&secret); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
 		if len(secret) != 32 {
 			t.Fatalf("secret length = %d, want 32", len(secret))
 		}

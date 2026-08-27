@@ -57,12 +57,16 @@ func TestConfiguredSubmissionResolvesRepositoryPolicyAndPool(t *testing.T) {
 	if response.StatusCode != http.StatusCreated {
 		t.Fatalf("submit status = %d", response.StatusCode)
 	}
-	var job store.Job
+	var job struct {
+		RepositoryID  string `json:"repository_id"`
+		WorkerPool    string `json:"worker_pool"`
+		PolicyVersion int    `json:"policy_version"`
+	}
 	if err := json.NewDecoder(response.Body).Decode(&job); err != nil {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	if job.WorkerPool != "coding" || job.PolicyVersion != 1 || job.Task == nil || job.Task.RepositoryID != "agent-forge" || job.Task.Repository != "" {
+	if job.WorkerPool != "coding" || job.PolicyVersion != 1 || job.RepositoryID != "agent-forge" {
 		t.Fatalf("resolved job = %#v", job)
 	}
 
