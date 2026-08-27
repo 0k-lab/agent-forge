@@ -134,7 +134,6 @@ func run(args []string, getenv func(string) string, stdin io.Reader, stdout, std
 
 type submission struct {
 	Input             string     `json:"input,omitempty"`
-	RepositoryURL     string     `json:"repository_url,omitempty"`
 	RepositoryID      string     `json:"repository_id,omitempty"`
 	Repository        string     `json:"repository,omitempty"`
 	BaseSHA           string     `json:"base_sha,omitempty"`

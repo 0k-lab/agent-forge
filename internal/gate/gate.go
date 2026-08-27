@@ -525,6 +525,24 @@ func (x *server) submitConfigured(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
 		return
 	}
+	if repository.RepositoryURL != "" {
+		prepared, err := provisionPublicRepository(r.Context(), *x.config, *repository, task.BaseSHA)
+		if err != nil {
+			var preparation preparationError
+			if errors.As(err, &preparation) {
+				status := http.StatusUnprocessableEntity
+				if preparation.retryable {
+					status = http.StatusBadGateway
+				}
+				writeJSON(w, status, map[string]any{"error": "repository preparation failed", "phase": protocol.EvidencePhasePreparation, "reason": preparation.reason, "retryable": preparation.retryable})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "request failed"})
+			return
+		}
+		task.Repository = prepared
+		x.log("repository_prepared", "repository_id", repository.ID, "base_sha", task.BaseSHA)
+	}
 	policy := x.config.resolvedPolicy(repository.WorkerPool, repository.Execution, repository.ID, repository.DefaultBranch)
 	job, err := x.store.CreateCodingJobWithPolicy(task, policy)
 	if err != nil {
@@ -540,7 +558,7 @@ func validateTask(task protocol.CodingTask) error {
 		if !filepath.IsAbs(task.Repository) || len(task.Repository) > 4096 {
 			return errors.New("repository must be an absolute path")
 		}
-	} else if task.Repository != "" || !configID.MatchString(task.RepositoryID) {
+	} else if task.Repository != "" && (!filepath.IsAbs(task.Repository) || len(task.Repository) > 4096) || !configID.MatchString(task.RepositoryID) {
 		return errors.New("invalid repository ID")
 	}
 	if err := protocol.ValidateBaseSHA(task.BaseSHA); err != nil {

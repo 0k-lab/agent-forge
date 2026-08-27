@@ -117,13 +117,13 @@ func TestAttemptEvidenceJSONContractIsStructuredAndClosed(t *testing.T) {
 
 func TestCodingEvidenceReasonTaxonomyIsClosed(t *testing.T) {
 	want := []string{
-		EvidenceReasonInvalidTask, EvidenceReasonInvalidRepository, EvidenceReasonRuntimeSetupFailed, EvidenceReasonWorktreeSetupFailed,
+		EvidenceReasonInvalidTask, EvidenceReasonInvalidRepository, EvidenceReasonSourcePolicyInvalid, EvidenceReasonRepositoryStateUnsafe, EvidenceReasonCloneFailed, EvidenceReasonFetchFailed, EvidenceReasonBaseUnavailable, EvidenceReasonRuntimeSetupFailed, EvidenceReasonWorktreeSetupFailed,
 		EvidenceReasonPluginStartFailed, EvidenceReasonPluginProtocolFailed, EvidenceReasonPluginReportedFailure,
 		EvidenceReasonNoChanges, EvidenceReasonInvalidWorkspaceChange,
 		EvidenceReasonScopedCheckPassed, EvidenceReasonScopedCheckFailed, EvidenceReasonScopedCheckTimeout,
 		EvidenceReasonCandidateCommitFailed, EvidenceReasonCleanupFailed,
 	}
-	if strings.Join(want, ",") != "invalid_task,invalid_repository,runtime_setup_failed,worktree_setup_failed,plugin_start_failed,plugin_protocol_failed,plugin_reported_failure,no_changes,invalid_workspace_change,scoped_check_passed,scoped_check_failed,scoped_check_timeout,candidate_commit_failed,cleanup_failed" {
+	if strings.Join(want, ",") != "invalid_task,invalid_repository,source_policy_invalid,repository_state_unsafe,clone_failed,fetch_failed,base_unavailable,runtime_setup_failed,worktree_setup_failed,plugin_start_failed,plugin_protocol_failed,plugin_reported_failure,no_changes,invalid_workspace_change,scoped_check_passed,scoped_check_failed,scoped_check_timeout,candidate_commit_failed,cleanup_failed" {
 		t.Fatalf("evidence reason taxonomy changed: %v", want)
 	}
 }
