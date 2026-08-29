@@ -113,7 +113,7 @@ while :; do
 	sleep 0.02
 done
 ATTEMPT_ID=$(printf '%s' "$JOB" | python3 -c 'import json,sys; print(json.load(sys.stdin)["attempt_id"])')
-printf '%s' "$JOB" | python3 -c 'import json,sys; j=json.load(sys.stdin); assert j["status"]=="failed" and j["error"]=="scoped_test_failed" and j.get("candidate_sha","")==""'
+printf '%s' "$JOB" | python3 -c 'import json,sys; j=json.load(sys.stdin); assert j["status"]=="failed" and j["failure_code"]=="scoped_test_failed" and j.get("candidate_sha","")==""'
 [ "$(git -C "$REPO" worktree list --porcelain | grep -c '^worktree ')" -eq 1 ]
 
 kill "$WORKER_PID"
@@ -156,7 +156,7 @@ while :; do
 	sleep 0.02
 done
 PLUGIN_ATTEMPT_ID=$(printf '%s' "$PLUGIN_JOB" | python3 -c 'import json,sys; print(json.load(sys.stdin)["attempt_id"])')
-printf '%s' "$PLUGIN_JOB" | python3 -c 'import json,sys; j=json.load(sys.stdin); assert j["status"]=="failed" and j["error"]=="max_attempts_exceeded" and j.get("candidate_sha","")==""'
+printf '%s' "$PLUGIN_JOB" | python3 -c 'import json,sys; j=json.load(sys.stdin); assert j["status"]=="failed" and j["failure_code"]=="max_attempts_exceeded" and j.get("candidate_sha","")==""'
 [ "$(git -C "$REPO" worktree list --porcelain | grep -c '^worktree ')" -eq 1 ]
 
 kill "$WORKER_PID"
