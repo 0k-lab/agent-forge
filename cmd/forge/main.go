@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"agent-forge/internal/buildinfo"
 	"agent-forge/internal/configjson"
 	"agent-forge/internal/protocol"
 )
@@ -60,6 +61,9 @@ type commandOptions struct {
 }
 
 func run(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) error {
+	if requested, err := buildinfo.WriteIfRequested(args, stdout, "forge"); requested {
+		return err
+	}
 	if len(args) == 0 || getenv == nil {
 		return fail(CodeInvalidUsage)
 	}

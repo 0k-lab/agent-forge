@@ -7,10 +7,17 @@ import (
 	"os"
 	"strings"
 
+	"agent-forge/internal/buildinfo"
 	"agent-forge/internal/pluginprotocol"
 )
 
 func main() {
+	if requested, err := buildinfo.WriteIfRequested(os.Args[1:], os.Stdout, "forge-ref-plugin"); requested {
+		if err != nil {
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)

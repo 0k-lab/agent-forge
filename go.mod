@@ -2,6 +2,8 @@ module agent-forge
 
 go 1.24.0
 
+toolchain go1.24.4
+
 require (
 	github.com/coder/websocket v1.8.13
 	golang.org/x/sys v0.36.0

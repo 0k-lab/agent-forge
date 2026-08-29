@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"agent-forge/internal/buildinfo"
 	"agent-forge/internal/gate"
 	"agent-forge/internal/store"
 )
@@ -38,6 +39,12 @@ func shutdown(server *http.Server) error {
 }
 
 func main() {
+	if requested, err := buildinfo.WriteIfRequested(os.Args[1:], os.Stdout, "forge-gate"); requested {
+		if err != nil {
+			os.Exit(1)
+		}
+		return
+	}
 	logger := newJSONLogger(os.Stderr)
 	if err := run(os.Args[1:], logger); err != nil {
 		writeStartupError(os.Stderr, err)

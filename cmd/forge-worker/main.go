@@ -1,6 +1,7 @@
 package main
 
 import (
+	"agent-forge/internal/buildinfo"
 	"agent-forge/internal/worker"
 	"context"
 	"errors"
@@ -12,6 +13,12 @@ import (
 )
 
 func main() {
+	if requested, err := buildinfo.WriteIfRequested(os.Args[1:], os.Stdout, "forge-worker"); requested {
+		if err != nil {
+			os.Exit(1)
+		}
+		return
+	}
 	configPath := flag.String("config", "", "Worker JSON config path")
 	flag.Parse()
 	if *configPath == "" || flag.NArg() != 0 {
