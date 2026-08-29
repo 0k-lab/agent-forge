@@ -12,12 +12,19 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"agent-forge/internal/buildinfo"
 	"agent-forge/internal/configjson"
 	"agent-forge/internal/pluginprotocol"
 	"agent-forge/internal/processtree"
 )
 
 func main() {
+	if requested, err := buildinfo.WriteIfRequested(os.Args[1:], os.Stdout, "forge-codex-plugin"); requested {
+		if err != nil {
+			os.Exit(1)
+		}
+		return
+	}
 	if err := serve(os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)

@@ -27,6 +27,25 @@ go build -o bin/forge ./cmd/forge
 go build -o bin/forge-github ./cmd/forge-github
 ```
 
+## Release artifacts
+
+Build the release matrix from an exact semantic version and full commit SHA on Linux with GNU tar and Python 3:
+
+```sh
+scripts/build-release.sh v0.1.0 "$(git rev-parse HEAD)" dist
+sha256sum -c dist/SHA256SUMS
+```
+
+The builder requires a clean Git checkout whose exact `HEAD` equals the supplied commit, then compiles from a fresh `git archive` of that commit rather than from mutable or ignored working-tree files. It uses the pinned Go toolchain, disables CGO, automatic VCS metadata, and ambient Go experiments (`GOFIPS140=off`), trims source paths, removes the Go build ID, normalizes tar metadata and gzip headers, and embeds that verified version and commit in every binary. Rebuilding the same source with the same inputs produces byte-identical archives and `SHA256SUMS`. The destination must not already exist; the completed temporary directory is published with Linux `renameat2(RENAME_NOREPLACE)` on the same filesystem, so publication also fails if any file, directory, or symlink appears after preflight. The builder never recursively deletes or replaces an existing output.
+
+The canonical matrix is:
+
+- Gate and CLI archives for `linux/amd64` and `linux/arm64`.
+- Worker archives for `linux/amd64`, `linux/arm64`, `darwin/amd64`, and `darwin/arm64`.
+- Each Worker archive contains `forge-worker`, `forge-codex-plugin`, and `forge-ref-plugin`.
+
+Every archive contains a `VERSION` file, and each runtime binary supports `--version`. CI runs `scripts/release-artifacts-e2e.sh` and uploads the verified bundles as short-lived workflow artifacts. GitHub Release publication remains disabled until the same tag pipeline also produces the SBOM and GitHub artifact attestation required by issue #43.
+
 ## Run
 
 Gate and Worker accept only `-config`. Config files name secret environment variables; secret values never enter config, SQLite, leases, evidence, or logs.
