@@ -82,6 +82,139 @@ func TestConfiguredSubmissionResolvesRepositoryPolicyAndPool(t *testing.T) {
 	}
 }
 
+func TestConfiguredSubmissionRoundTripsSourceReference(t *testing.T) {
+	_, _, server := configuredGate(t)
+	base := strings.Repeat("a", 40)
+	request := `{"repository_id":"agent-forge","base_sha":"` + base + `","instruction":"change","source_ref":"development-board/PVTI_opaque@ready-v3"}`
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/jobs", strings.NewReader(request))
+	req.Header.Set("Authorization", "Bearer owner")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("submit status = %d", response.StatusCode)
+	}
+	var submitted struct {
+		ID        string `json:"id"`
+		SourceRef string `json:"source_ref"`
+		BaseSHA   string `json:"base_sha"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&submitted); err != nil {
+		t.Fatal(err)
+	}
+	if submitted.SourceRef != "development-board/PVTI_opaque@ready-v3" || submitted.BaseSHA != base {
+		t.Fatalf("submitted = %#v", submitted)
+	}
+
+	req, _ = http.NewRequest(http.MethodGet, server.URL+"/v1/jobs/"+submitted.ID, nil)
+	req.Header.Set("Authorization", "Bearer owner")
+	response, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("get status = %d", response.StatusCode)
+	}
+	var fetched struct {
+		SourceRef string `json:"source_ref"`
+		BaseSHA   string `json:"base_sha"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&fetched); err != nil {
+		t.Fatal(err)
+	}
+	if fetched.SourceRef != submitted.SourceRef || fetched.BaseSHA != base {
+		t.Fatalf("fetched = %#v, submitted %#v", fetched, submitted)
+	}
+}
+
+func TestSourceReferenceDoesNotEnterWorkerLeaseMessage(t *testing.T) {
+	_, _, server := configuredGate(t)
+	request := `{"repository_id":"agent-forge","base_sha":"` + strings.Repeat("a", 40) + `","instruction":"change","source_ref":"recognizable-source-secret"}`
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/jobs", strings.NewReader(request))
+	req.Header.Set("Authorization", "Bearer owner")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("submit status = %d", response.StatusCode)
+	}
+
+	header := http.Header{"Authorization": []string{"Bearer coding-token"}}
+	conn, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http")+"/v1/workers/connect?worker_id=worker-2&slot=0", &websocket.DialOptions{HTTPHeader: header})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	lease := readMessage(t, conn)
+	body, err := json.Marshal(lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "source_ref") || strings.Contains(string(body), "recognizable-source-secret") {
+		t.Fatalf("worker message exposed source reference: %s", body)
+	}
+}
+
+func TestConfiguredSubmissionRejectsInvalidSourceReference(t *testing.T) {
+	prefix := []byte(`{"repository_id":"agent-forge","base_sha":"` + strings.Repeat("a", 40) + `","instruction":"change","source_ref":"`)
+	invalidUTF8 := append(append([]byte{}, prefix...), 0xff)
+	invalidUTF8 = append(invalidUTF8, []byte(`"}`)...)
+	for name, body := range map[string][]byte{
+		"control":        []byte(`{"repository_id":"agent-forge","base_sha":"` + strings.Repeat("a", 40) + `","instruction":"change","source_ref":"item\nsecret"}`),
+		"too long":       []byte(`{"repository_id":"agent-forge","base_sha":"` + strings.Repeat("a", 40) + `","instruction":"change","source_ref":"` + strings.Repeat("x", 513) + `"}`),
+		"null":           []byte(`{"repository_id":"agent-forge","base_sha":"` + strings.Repeat("a", 40) + `","instruction":"change","source_ref":null}`),
+		"invalid UTF-8":  invalidUTF8,
+		"lone surrogate": []byte(`{"repository_id":"agent-forge","base_sha":"` + strings.Repeat("a", 40) + `","instruction":"change","source_ref":"\ud800"}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, _, server := configuredGate(t)
+			req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/jobs", bytes.NewReader(body))
+			req.Header.Set("Authorization", "Bearer owner")
+			response, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusBadRequest {
+				t.Fatalf("invalid source status = %d", response.StatusCode)
+			}
+			page, err := s.RecentDebugJobs(context.Background(), 10, nil)
+			if err != nil || len(page.Items) != 0 {
+				t.Fatalf("invalid source mutated Jobs: %#v, %v", page.Items, err)
+			}
+		})
+	}
+}
+
+func TestConfiguredGenericSubmissionRoundTripsSourceReference(t *testing.T) {
+	_, _, server := configuredGate(t)
+	request := `{"input":"work","source_ref":"opaque-item"}`
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/jobs", strings.NewReader(request))
+	req.Header.Set("Authorization", "Bearer owner")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("submit status = %d", response.StatusCode)
+	}
+	var job struct {
+		SourceRef string `json:"source_ref"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&job); err != nil {
+		t.Fatal(err)
+	}
+	if job.SourceRef != "opaque-item" {
+		t.Fatalf("source ref = %q", job.SourceRef)
+	}
+}
+
 func TestConfiguredSubmissionAcceptsOmittedOrEmptyScopedChecks(t *testing.T) {
 	_, _, server := configuredGate(t)
 	for name, tests := range map[string]string{"omitted": "", "empty": `,"tests":[]`} {

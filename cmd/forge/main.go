@@ -133,14 +133,15 @@ func run(args []string, getenv func(string) string, stdin io.Reader, stdout, std
 }
 
 type submission struct {
-	Input             string     `json:"input,omitempty"`
-	RepositoryID      string     `json:"repository_id,omitempty"`
-	Repository        string     `json:"repository,omitempty"`
-	BaseSHA           string     `json:"base_sha,omitempty"`
-	Instruction       string     `json:"instruction,omitempty"`
-	Tests             [][]string `json:"tests,omitempty"`
-	CommitAuthorName  string     `json:"commit_author_name,omitempty"`
-	CommitAuthorEmail string     `json:"commit_author_email,omitempty"`
+	Input             string            `json:"input,omitempty"`
+	RepositoryID      string            `json:"repository_id,omitempty"`
+	Repository        string            `json:"repository,omitempty"`
+	BaseSHA           string            `json:"base_sha,omitempty"`
+	Instruction       string            `json:"instruction,omitempty"`
+	Tests             [][]string        `json:"tests,omitempty"`
+	CommitAuthorName  string            `json:"commit_author_name,omitempty"`
+	CommitAuthorEmail string            `json:"commit_author_email,omitempty"`
+	SourceRef         configjson.String `json:"source_ref,omitempty"`
 }
 
 func readTask(name string, stdin io.Reader) ([]byte, error) {

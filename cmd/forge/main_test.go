@@ -83,6 +83,46 @@ func TestSubmitForwardsRepositoryIDExactly(t *testing.T) {
 	}
 }
 
+func TestSubmitForwardsSourceReferenceExactly(t *testing.T) {
+	want := `{"input":"work","source_ref":"development-board/PVTI_opaque@ready-v3"}`
+	useHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if string(body) != want {
+			t.Fatalf("body = %s", body)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"0123456789abcdef0123456789abcdef","status":"pending"}`))
+	}))
+	if err := run([]string{"submit"}, env(map[string]string{"FORGE_GATE_URL": "http://gate.test", "FORGE_OWNER_TOKEN": "token"}), strings.NewReader(want), io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSubmitRejectsMalformedUnicodeSourceBeforeRequest(t *testing.T) {
+	var requests atomic.Int32
+	useHandler(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests.Add(1)
+	}))
+	invalidUTF8 := append([]byte(`{"input":"work","source_ref":"`), 0xff)
+	invalidUTF8 = append(invalidUTF8, []byte(`"}`)...)
+	for name, body := range map[string][]byte{
+		"invalid UTF-8":  invalidUTF8,
+		"lone surrogate": []byte(`{"input":"work","source_ref":"\ud800"}`),
+		"null":           []byte(`{"input":"work","source_ref":null}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := run([]string{"submit"}, env(map[string]string{"FORGE_GATE_URL": "http://gate.test", "FORGE_OWNER_TOKEN": "token"}), bytes.NewReader(body), io.Discard, io.Discard)
+			var cliErr *CLIError
+			if !errors.As(err, &cliErr) || cliErr.Code != CodeInvalidInput {
+				t.Fatalf("error = %#v", err)
+			}
+		})
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("malformed task reached Gate: %d requests", requests.Load())
+	}
+}
+
 func TestWaitPrintsTerminalAggregateAndFailsForFailedOrTimeout(t *testing.T) {
 	id := "0123456789abcdef0123456789abcdef"
 	for _, status := range []string{"succeeded", "failed", "pending"} {
