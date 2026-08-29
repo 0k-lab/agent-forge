@@ -100,7 +100,7 @@ func (s *Store) FailLeaseAt(jobID, attemptID, slot, generation, code string, dis
 		if status != "retryable_failed" || storedCode != code {
 			return Job{}, errors.New("result is immutable")
 		}
-		return scanJob(tx.QueryRow(`SELECT id,input,task_json,status,attempt_id,worker_id,result,candidate_sha,error_text,created_at,updated_at,worker_pool,policy_version FROM jobs WHERE id=?`, jobID))
+		return scanJob(tx.QueryRow(`SELECT id,input,task_json,status,attempt_id,worker_id,result,candidate_sha,error_text,created_at,updated_at,worker_pool,policy_version,source_ref FROM jobs WHERE id=?`, jobID))
 	}
 	if at.UnixNano() >= deadline {
 		return Job{}, errors.New("attempt lease expired")

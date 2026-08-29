@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"agent-forge/internal/protocol"
 	_ "modernc.org/sqlite"
@@ -77,8 +79,16 @@ type Job struct {
 	Error         string               `json:"error,omitempty"`
 	WorkerPool    string               `json:"worker_pool,omitempty"`
 	PolicyVersion int                  `json:"policy_version,omitempty"`
+	SourceRef     string               `json:"source_ref,omitempty"`
 	CreatedAt     time.Time            `json:"created_at"`
 	UpdatedAt     time.Time            `json:"updated_at"`
+}
+
+func ValidateSourceRef(source string) error {
+	if len(source) > 512 || !utf8.ValidString(source) || strings.IndexFunc(source, unicode.IsControl) >= 0 {
+		return errors.New("invalid source reference")
+	}
+	return nil
 }
 
 type Lease struct {
@@ -223,11 +233,28 @@ func (s *Store) CreateJob(input string) (Job, error) {
 	return s.createJob(input, nil)
 }
 
+func (s *Store) CreateJobWithSource(input string, source string) (Job, error) {
+	if err := ValidateSourceRef(source); err != nil {
+		return Job{}, err
+	}
+	return s.createJobWithPolicyAndSource(input, nil, nil, source)
+}
+
 func (s *Store) CreateCodingJob(task protocol.CodingTask) (Job, error) {
 	if err := protocol.ValidateBaseSHA(task.BaseSHA); err != nil {
 		return Job{}, err
 	}
 	return s.createJob("", &task)
+}
+
+func (s *Store) CreateCodingJobWithSource(task protocol.CodingTask, source string) (Job, error) {
+	if err := protocol.ValidateBaseSHA(task.BaseSHA); err != nil {
+		return Job{}, err
+	}
+	if err := ValidateSourceRef(source); err != nil {
+		return Job{}, err
+	}
+	return s.createJobWithPolicyAndSource("", &task, nil, source)
 }
 
 func (s *Store) CreateJobWithPolicy(input string, policy ResolvedPolicy) (Job, error) {
@@ -237,6 +264,16 @@ func (s *Store) CreateJobWithPolicy(input string, policy ResolvedPolicy) (Job, e
 	return s.createJobWithPolicy(input, nil, &policy)
 }
 
+func (s *Store) CreateJobWithPolicyAndSource(input string, policy ResolvedPolicy, source string) (Job, error) {
+	if policy.Execution.RepositoryID != "" {
+		return Job{}, errors.New("invalid non-coding policy")
+	}
+	if err := ValidateSourceRef(source); err != nil {
+		return Job{}, err
+	}
+	return s.createJobWithPolicyAndSource(input, nil, &policy, source)
+}
+
 func (s *Store) CreateCodingJobWithPolicy(task protocol.CodingTask, policy ResolvedPolicy) (Job, error) {
 	if err := validateStoredTask(task, policy); err != nil {
 		return Job{}, err
@@ -244,12 +281,26 @@ func (s *Store) CreateCodingJobWithPolicy(task protocol.CodingTask, policy Resol
 	return s.createJobWithPolicy("", &task, &policy)
 }
 
+func (s *Store) CreateCodingJobWithPolicyAndSource(task protocol.CodingTask, policy ResolvedPolicy, source string) (Job, error) {
+	if err := validateStoredTask(task, policy); err != nil {
+		return Job{}, err
+	}
+	if err := ValidateSourceRef(source); err != nil {
+		return Job{}, err
+	}
+	return s.createJobWithPolicyAndSource("", &task, &policy, source)
+}
+
 func (s *Store) createJob(input string, task *protocol.CodingTask) (Job, error) {
 	return s.createJobWithPolicy(input, task, nil)
 }
 
 func (s *Store) createJobWithPolicy(input string, task *protocol.CodingTask, policy *ResolvedPolicy) (Job, error) {
-	j := Job{ID: newID(), Input: input, Task: task, Status: "pending", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	return s.createJobWithPolicyAndSource(input, task, policy, "")
+}
+
+func (s *Store) createJobWithPolicyAndSource(input string, task *protocol.CodingTask, policy *ResolvedPolicy, source string) (Job, error) {
+	j := Job{ID: newID(), Input: input, Task: task, SourceRef: source, Status: "pending", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	taskJSON := ""
 	if task != nil {
 		body, err := json.Marshal(task)
@@ -275,7 +326,7 @@ func (s *Store) createJobWithPolicy(input string, task *protocol.CodingTask, pol
 	}
 	defer tx.Rollback()
 	stamp := j.CreatedAt.Format(time.RFC3339Nano)
-	if _, err = tx.Exec(`INSERT INTO jobs(id,input,task_json,status,created_at,updated_at,worker_pool,policy_version,resolved_policy) VALUES(?,?,?,?,?,?,?,?,?)`, j.ID, j.Input, taskJSON, j.Status, stamp, stamp, workerPool, policyVersion, policyBytes); err != nil {
+	if _, err = tx.Exec(`INSERT INTO jobs(id,input,task_json,status,created_at,updated_at,worker_pool,policy_version,resolved_policy,source_ref) VALUES(?,?,?,?,?,?,?,?,?,?)`, j.ID, j.Input, taskJSON, j.Status, stamp, stamp, workerPool, policyVersion, policyBytes, source); err != nil {
 		return Job{}, err
 	}
 	if _, err = tx.Exec(`INSERT INTO events(job_id,kind,detail,at) VALUES(?,?,?,?)`, j.ID, "submitted", "job accepted", stamp); err != nil {
@@ -801,7 +852,7 @@ func (s *Store) terminalOwnedState(jobID, attemptID, attemptStatus, result, cand
 			return Job{}, err
 		}
 	}
-	j, err := scanJob(tx.QueryRow(`SELECT id,input,task_json,status,attempt_id,worker_id,result,candidate_sha,error_text,created_at,updated_at,worker_pool,policy_version FROM jobs WHERE id=?`, jobID))
+	j, err := scanJob(tx.QueryRow(`SELECT id,input,task_json,status,attempt_id,worker_id,result,candidate_sha,error_text,created_at,updated_at,worker_pool,policy_version,source_ref FROM jobs WHERE id=?`, jobID))
 	if err != nil {
 		return Job{}, err
 	}
@@ -935,7 +986,7 @@ func scanJob(r scanner) (Job, error) {
 	var taskJSON, c, u string
 	var pool sql.NullString
 	var policyVersion sql.NullInt64
-	err := r.Scan(&j.ID, &j.Input, &taskJSON, &j.Status, &j.AttemptID, &j.WorkerID, &j.Result, &j.CandidateSHA, &j.Error, &c, &u, &pool, &policyVersion)
+	err := r.Scan(&j.ID, &j.Input, &taskJSON, &j.Status, &j.AttemptID, &j.WorkerID, &j.Result, &j.CandidateSHA, &j.Error, &c, &u, &pool, &policyVersion, &j.SourceRef)
 	if err != nil {
 		return j, err
 	}
@@ -946,6 +997,9 @@ func scanJob(r scanner) (Job, error) {
 			return j, err
 		}
 	}
+	if ValidateSourceRef(j.SourceRef) != nil {
+		return j, errors.New("corrupt source reference")
+	}
 	j.CreatedAt, err = time.Parse(time.RFC3339Nano, c)
 	if err != nil {
 		return j, err
@@ -954,7 +1008,7 @@ func scanJob(r scanner) (Job, error) {
 	return j, err
 }
 func (s *Store) Job(id string) (Job, error) {
-	return scanJob(s.db.QueryRow(`SELECT id,input,task_json,status,attempt_id,worker_id,result,candidate_sha,error_text,created_at,updated_at,worker_pool,policy_version FROM jobs WHERE id=?`, id))
+	return scanJob(s.db.QueryRow(`SELECT id,input,task_json,status,attempt_id,worker_id,result,candidate_sha,error_text,created_at,updated_at,worker_pool,policy_version,source_ref FROM jobs WHERE id=?`, id))
 }
 func (s *Store) Events(id string) ([]Event, error) {
 	rows, err := s.db.Query(`SELECT id,job_id,kind,detail,at FROM events WHERE job_id=? ORDER BY id`, id)

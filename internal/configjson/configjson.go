@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"unicode/utf8"
 )
 
 const MaxBytes = 1 << 20
@@ -15,6 +16,20 @@ var (
 	ErrDuplicate = errors.New("invalid config: duplicate field")
 	ErrRead      = errors.New("invalid config: read")
 )
+
+type String string
+
+func (value *String) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(data, []byte("null")) {
+		return ErrSyntax
+	}
+	var decoded string
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return ErrSyntax
+	}
+	*value = String(decoded)
+	return nil
+}
 
 func ReadFile(path string) ([]byte, error) {
 	file, err := os.Open(path)
@@ -37,7 +52,7 @@ func read(reader io.Reader) ([]byte, error) {
 }
 
 func Decode(data []byte, value any) error {
-	if len(data) == 0 || len(data) > MaxBytes {
+	if len(data) == 0 || len(data) > MaxBytes || !validUnicodeJSON(data) {
 		return ErrSyntax
 	}
 	if err := rejectDuplicates(data); err != nil {
@@ -52,6 +67,70 @@ func Decode(data []byte, value any) error {
 		return ErrSyntax
 	}
 	return nil
+}
+
+func validUnicodeJSON(data []byte) bool {
+	if !utf8.Valid(data) {
+		return false
+	}
+	inString := false
+	for i := 0; i < len(data); i++ {
+		switch data[i] {
+		case '"':
+			inString = !inString
+		case '\\':
+			if !inString {
+				continue
+			}
+			i++
+			if i >= len(data) {
+				return false
+			}
+			if data[i] != 'u' {
+				continue
+			}
+			if i+4 >= len(data) {
+				return false
+			}
+			first, ok := hex4(data[i+1 : i+5])
+			if !ok {
+				return false
+			}
+			i += 4
+			switch {
+			case first >= 0xd800 && first <= 0xdbff:
+				if i+6 >= len(data) || data[i+1] != '\\' || data[i+2] != 'u' {
+					return false
+				}
+				second, ok := hex4(data[i+3 : i+7])
+				if !ok || second < 0xdc00 || second > 0xdfff {
+					return false
+				}
+				i += 6
+			case first >= 0xdc00 && first <= 0xdfff:
+				return false
+			}
+		}
+	}
+	return !inString
+}
+
+func hex4(data []byte) (uint16, bool) {
+	var value uint16
+	for _, char := range data {
+		value <<= 4
+		switch {
+		case char >= '0' && char <= '9':
+			value |= uint16(char - '0')
+		case char >= 'a' && char <= 'f':
+			value |= uint16(char-'a') + 10
+		case char >= 'A' && char <= 'F':
+			value |= uint16(char-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return value, true
 }
 
 func rejectDuplicates(data []byte) error {

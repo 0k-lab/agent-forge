@@ -468,24 +468,38 @@ func (x *server) submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Input string `json:"input"`
+		Input     string            `json:"input"`
+		SourceRef configjson.String `json:"source_ref"`
 		protocol.CodingTask
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in); err != nil {
-		writeErr(w, 400, err)
+	body, decodeErr := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if decodeErr != nil || configjson.Decode(body, &in) != nil {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid request"))
+		return
+	}
+	if store.ValidateSourceRef(string(in.SourceRef)) != nil {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid request"))
 		return
 	}
 	var j store.Job
 	var err error
 	coding := in.Repository != "" || in.BaseSHA != "" || in.Instruction != "" || in.Tests != nil
 	if !coding {
-		j, err = x.store.CreateJob(in.Input)
+		if in.SourceRef == "" {
+			j, err = x.store.CreateJob(in.Input)
+		} else {
+			j, err = x.store.CreateJobWithSource(in.Input, string(in.SourceRef))
+		}
 	} else {
 		if err = validateTask(in.CodingTask); err != nil {
 			writeErr(w, 400, err)
 			return
 		}
-		j, err = x.store.CreateCodingJob(in.CodingTask)
+		if in.SourceRef == "" {
+			j, err = x.store.CreateCodingJob(in.CodingTask)
+		} else {
+			j, err = x.store.CreateCodingJobWithSource(in.CodingTask, string(in.SourceRef))
+		}
 	}
 	if err != nil {
 		writeErr(w, 500, err)
@@ -497,16 +511,21 @@ func (x *server) submit(w http.ResponseWriter, r *http.Request) {
 
 func (x *server) submitConfigured(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Input             string     `json:"input"`
-		RepositoryID      string     `json:"repository_id"`
-		BaseSHA           string     `json:"base_sha"`
-		Instruction       string     `json:"instruction"`
-		Tests             [][]string `json:"tests"`
-		CommitAuthorName  string     `json:"commit_author_name"`
-		CommitAuthorEmail string     `json:"commit_author_email"`
+		Input             string            `json:"input"`
+		RepositoryID      string            `json:"repository_id"`
+		BaseSHA           string            `json:"base_sha"`
+		Instruction       string            `json:"instruction"`
+		Tests             [][]string        `json:"tests"`
+		CommitAuthorName  string            `json:"commit_author_name"`
+		CommitAuthorEmail string            `json:"commit_author_email"`
+		SourceRef         configjson.String `json:"source_ref"`
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 	if err != nil || configjson.Decode(body, &in) != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+		return
+	}
+	if store.ValidateSourceRef(string(in.SourceRef)) != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
 		return
 	}
@@ -516,7 +535,12 @@ func (x *server) submitConfigured(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		policy := x.config.resolvedPolicy(x.config.DefaultPool, x.config.DefaultExecution, "", "")
-		job, err := x.store.CreateJobWithPolicy(in.Input, policy)
+		var job store.Job
+		if in.SourceRef == "" {
+			job, err = x.store.CreateJobWithPolicy(in.Input, policy)
+		} else {
+			job, err = x.store.CreateJobWithPolicyAndSource(in.Input, policy, string(in.SourceRef))
+		}
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "request failed"})
 			return
@@ -560,7 +584,12 @@ func (x *server) submitConfigured(w http.ResponseWriter, r *http.Request) {
 		x.log("repository_prepared", "repository_id", repository.ID, "base_sha", task.BaseSHA)
 	}
 	policy := x.config.resolvedPolicy(repository.WorkerPool, repository.Execution, repository.ID, repository.DefaultBranch)
-	job, err := x.store.CreateCodingJobWithPolicy(task, policy)
+	var job store.Job
+	if in.SourceRef == "" {
+		job, err = x.store.CreateCodingJobWithPolicy(task, policy)
+	} else {
+		job, err = x.store.CreateCodingJobWithPolicyAndSource(task, policy, string(in.SourceRef))
+	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "request failed"})
 		return
@@ -692,8 +721,10 @@ type publicJobResponse struct {
 	AttemptID     string        `json:"attempt_id,omitempty"`
 	WorkerID      string        `json:"worker_id,omitempty"`
 	RepositoryID  string        `json:"repository_id,omitempty"`
+	BaseSHA       string        `json:"base_sha,omitempty"`
 	WorkerPool    string        `json:"worker_pool,omitempty"`
 	PolicyVersion int           `json:"policy_version,omitempty"`
+	SourceRef     string        `json:"source_ref,omitempty"`
 	CandidateSHA  string        `json:"candidate_sha,omitempty"`
 	FailureCode   string        `json:"failure_code,omitempty"`
 	CreatedAt     time.Time     `json:"created_at"`
@@ -709,6 +740,7 @@ func (x *server) publicJob(job store.Job) publicJobResponse {
 		WorkerID:      job.WorkerID,
 		WorkerPool:    job.WorkerPool,
 		PolicyVersion: job.PolicyVersion,
+		SourceRef:     job.SourceRef,
 		CandidateSHA:  job.CandidateSHA,
 		FailureCode:   safeFailureCode(job.Error),
 		CreatedAt:     job.CreatedAt,
@@ -717,6 +749,7 @@ func (x *server) publicJob(job store.Job) publicJobResponse {
 	}
 	if job.Task != nil {
 		response.RepositoryID = job.Task.RepositoryID
+		response.BaseSHA = job.Task.BaseSHA
 	}
 	return response
 }

@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 func migrate(db *sql.DB) error {
 	var version int
@@ -107,6 +107,8 @@ CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value BLOB NOT NULL);
 			max_attempts INTEGER NOT NULL, retry_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);
 		CREATE INDEX IF NOT EXISTS deliveries_ready ON deliveries(phase,retry_at,updated_at,job_id);`)
 		return err
+	case 5:
+		return addColumn(tx, "jobs", "source_ref", `TEXT NOT NULL DEFAULT ''`)
 	default:
 		return errors.New("unsupported database schema")
 	}

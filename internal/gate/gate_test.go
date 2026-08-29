@@ -47,7 +47,7 @@ func TestLifecycleLoggerEmitsOnlyAllowlistedFields(t *testing.T) {
 	x := newServer(s, map[string]string{"worker-secret": "worker-1"}, "owner-secret", options)
 	h := x.routes()
 	base := strings.Repeat("a", 40)
-	req := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(`{"repository":"/private/repo","base_sha":"`+base+`","instruction":"private instruction"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(`{"repository":"/private/repo","base_sha":"`+base+`","instruction":"private instruction","source_ref":"recognizable-source-secret"}`))
 	req.Header.Set("Authorization", "Bearer owner-secret")
 	res := httptest.NewRecorder()
 	h.ServeHTTP(res, req)
@@ -70,7 +70,7 @@ func TestLifecycleLoggerEmitsOnlyAllowlistedFields(t *testing.T) {
 			t.Fatalf("missing event %q in %s", event, body)
 		}
 	}
-	for _, secret := range []string{"owner-secret", "worker-secret", "private instruction", "/private/repo", "job accepted", protocol.EvidenceReasonPluginFailed} {
+	for _, secret := range []string{"owner-secret", "worker-secret", "private instruction", "/private/repo", "recognizable-source-secret", "job accepted", protocol.EvidenceReasonPluginFailed} {
 		if strings.Contains(body, secret) {
 			t.Fatalf("logs exposed %q: %s", secret, body)
 		}
@@ -1223,7 +1223,7 @@ func TestJobSubmissionAndLookupUseSafeProjection(t *testing.T) {
 	defer s.Close()
 	h := NewHandler(s, nil, "owner")
 
-	submit := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(`{"input":"synthetic-private-input"}`))
+	submit := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(`{"repository":"/private/repo","base_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","instruction":"synthetic-private-input","source_ref":"opaque-safe-source"}`))
 	submit.Header.Set("Authorization", "Bearer owner")
 	submitResult := httptest.NewRecorder()
 	h.ServeHTTP(submitResult, submit)
@@ -1235,18 +1235,21 @@ func TestJobSubmissionAndLookupUseSafeProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertNoDebugSensitiveKeys(t, submitted)
-	allowed := map[string]bool{"id": true, "status": true, "attempt_id": true, "worker_id": true, "repository_id": true, "worker_pool": true, "policy_version": true, "candidate_sha": true, "failure_code": true, "created_at": true, "updated_at": true}
+	allowed := map[string]bool{"id": true, "status": true, "attempt_id": true, "worker_id": true, "repository_id": true, "base_sha": true, "source_ref": true, "worker_pool": true, "policy_version": true, "candidate_sha": true, "failure_code": true, "created_at": true, "updated_at": true}
 	for key := range submitted {
 		if !allowed[key] {
 			t.Fatalf("submission exposed field %q: %s", key, submitResult.Body.String())
 		}
+	}
+	if submitted["base_sha"] != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" || submitted["source_ref"] != "opaque-safe-source" {
+		t.Fatalf("safe identity fields = %#v", submitted)
 	}
 	id, _ := submitted["id"].(string)
 	lease, ok, err := s.LeaseNext("worker")
 	if err != nil || !ok || lease.JobID != id {
 		t.Fatalf("lease = %#v, %v, %v", lease, ok, err)
 	}
-	if _, err := s.Complete(id, lease.AttemptID, "synthetic-private-result"); err != nil {
+	if _, err := s.CompleteCandidate(id, lease.AttemptID, strings.Repeat("b", 40)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1264,10 +1267,76 @@ func TestJobSubmissionAndLookupUseSafeProjection(t *testing.T) {
 			t.Fatalf("lookup exposed field %q: %s", key, lookup.Body.String())
 		}
 	}
-	for _, private := range []string{"synthetic-private-input", "synthetic-private-result"} {
+	for _, private := range []string{"synthetic-private-input", "synthetic-private-result", "/private/repo"} {
 		if strings.Contains(submitResult.Body.String(), private) || strings.Contains(lookup.Body.String(), private) {
 			t.Fatalf("job API exposed %q", private)
 		}
+	}
+}
+
+func TestCompatibilitySubmissionRoundTripsSourceReference(t *testing.T) {
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	h := NewHandler(s, nil, "owner")
+
+	submit := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(`{"input":"work","source_ref":"opaque-item"}`))
+	submit.Header.Set("Authorization", "Bearer owner")
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, submit)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("submit = %d: %s", response.Code, response.Body.String())
+	}
+	var job struct {
+		ID        string `json:"id"`
+		SourceRef string `json:"source_ref"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &job); err != nil {
+		t.Fatal(err)
+	}
+	if job.SourceRef != "opaque-item" {
+		t.Fatalf("source ref = %q", job.SourceRef)
+	}
+
+	lookup := debugRequest(t, h, "/v1/jobs/"+job.ID, "owner")
+	if lookup.Code != http.StatusOK || !strings.Contains(lookup.Body.String(), `"source_ref":"opaque-item"`) {
+		t.Fatalf("lookup = %d: %s", lookup.Code, lookup.Body.String())
+	}
+}
+
+func TestCompatibilitySubmissionRejectsStructuredOrUnknownSourceFields(t *testing.T) {
+	invalidUTF8 := append([]byte(`{"input":"work","source_ref":"`), 0xff)
+	invalidUTF8 = append(invalidUTF8, []byte(`"}`)...)
+	for name, body := range map[string][]byte{
+		"structured source": []byte(`{"input":"work","source_ref":{"provider":"github","item":"item"}}`),
+		"unknown field":     []byte(`{"input":"work","source_ref":"opaque","source_provider":"github"}`),
+		"control":           []byte(`{"input":"work","source_ref":"item\nsecret"}`),
+		"too long":          []byte(`{"input":"work","source_ref":"` + strings.Repeat("x", 513) + `"}`),
+		"null":              []byte(`{"input":"work","source_ref":null}`),
+		"invalid UTF-8":     invalidUTF8,
+		"lone surrogate":    []byte(`{"input":"work","source_ref":"\ud800"}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			h := NewHandler(s, nil, "owner")
+			submit := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewReader(body))
+			submit.Header.Set("Authorization", "Bearer owner")
+			response := httptest.NewRecorder()
+			h.ServeHTTP(response, submit)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("invalid source status = %d: %s", response.Code, response.Body.String())
+			}
+			page, err := s.RecentDebugJobs(context.Background(), 10, nil)
+			if err != nil || len(page.Items) != 0 {
+				t.Fatalf("invalid source mutated Jobs: %#v, %v", page.Items, err)
+			}
+		})
 	}
 }
 
