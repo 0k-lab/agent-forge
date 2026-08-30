@@ -9,6 +9,9 @@ import (
 
 const schemaVersion = 5
 
+// SchemaVersion is the current on-disk SQLite schema supported by Gate.
+func SchemaVersion() int { return schemaVersion }
+
 func migrate(db *sql.DB) error {
 	var version int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version < 0 || version > schemaVersion {

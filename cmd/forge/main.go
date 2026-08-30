@@ -154,12 +154,14 @@ func runInstall(args []string) error {
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	var o linuxinstall.Options
+	o.InstallerVersion, o.InstallerCommit = buildinfo.Version, buildinfo.Commit
 	fs.StringVar(&o.Version, "version", "", "exact release version")
 	fs.StringVar(&o.Commit, "commit", "", "full release commit")
 	fs.StringVar(&o.AssetDir, "asset-dir", "", "absolute offline release asset directory")
 	fs.StringVar(&o.SHA256SUMSSHA256, "sha256sums-sha256", "", "trusted SHA256SUMS digest")
 	fs.BoolVar(&o.EnableNow, "enable-now", false, "enable and start services after installation")
 	fs.BoolVar(&o.RunAsRoot, "run-as-root", false, "run Gate and Worker as root")
+	fs.BoolVar(&o.Upgrade, "upgrade", false, "upgrade an existing installation to a newer exact release")
 	o.Account = linuxinstall.HostAccountManager{}
 	o.Services = linuxinstall.HostServiceManager{}
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || effectiveUID() != 0 || !regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`).MatchString(o.Version) || !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(o.Commit) || !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(o.SHA256SUMSSHA256) || !strings.HasPrefix(o.AssetDir, "/") {

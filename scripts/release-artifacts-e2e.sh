@@ -3,12 +3,13 @@ set -eu
 export LC_ALL=C
 unset GOFIPS140 TAR_OPTIONS GZIP POSIXLY_CORRECT
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-VERSION=v0.0.0
+VERSION=${2:-v0.0.0}
 COMMIT=${1:-}
 case "$COMMIT" in
   [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
-  *) echo "usage: $0 <40-lowercase-hex-commit>" >&2; exit 2 ;;
+  *) echo "usage: $0 <40-lowercase-hex-commit> [vMAJOR.MINOR.PATCH]" >&2; exit 2 ;;
 esac
+printf '%s\n' "$VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || exit 2
 SECOND=$(mktemp -d)
 SECOND_OUT="$SECOND/out"
 EXTRACT=$(mktemp -d)
@@ -142,14 +143,14 @@ fi
 [ "$(sha256sum "$DIST/SHA256SUMS")" = "$MANIFEST_BEFORE" ]
 GOFIPS140=latest TAR_OPTIONS=--exclude=VERSION GZIP=-1 POSIXLY_CORRECT=1 "$BUILDER" "$VERSION" "$COMMIT" "$SECOND_OUT"
 
-EXPECTED='agent-forge-cli_v0.0.0_linux_amd64.tar.gz
-agent-forge-cli_v0.0.0_linux_arm64.tar.gz
-agent-forge-gate_v0.0.0_linux_amd64.tar.gz
-agent-forge-gate_v0.0.0_linux_arm64.tar.gz
-agent-forge-worker_v0.0.0_darwin_amd64.tar.gz
-agent-forge-worker_v0.0.0_darwin_arm64.tar.gz
-agent-forge-worker_v0.0.0_linux_amd64.tar.gz
-agent-forge-worker_v0.0.0_linux_arm64.tar.gz'
+EXPECTED="agent-forge-cli_${VERSION}_linux_amd64.tar.gz
+agent-forge-cli_${VERSION}_linux_arm64.tar.gz
+agent-forge-gate_${VERSION}_linux_amd64.tar.gz
+agent-forge-gate_${VERSION}_linux_arm64.tar.gz
+agent-forge-worker_${VERSION}_darwin_amd64.tar.gz
+agent-forge-worker_${VERSION}_darwin_arm64.tar.gz
+agent-forge-worker_${VERSION}_linux_amd64.tar.gz
+agent-forge-worker_${VERSION}_linux_arm64.tar.gz"
 ACTUAL=$(sed 's/^.*  //' "$DIST/SHA256SUMS")
 [ "$ACTUAL" = "$EXPECTED" ] || { echo "unexpected release matrix" >&2; printf '%s\n' "$ACTUAL" >&2; exit 1; }
 (

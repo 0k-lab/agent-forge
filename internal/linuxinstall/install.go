@@ -32,7 +32,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const prefix = "/opt/agent-forge"
+const (
+	prefix                 = "/opt/agent-forge"
+	storeSchemaVersion     = 5
+	legacyInstallerVersion = "v0.1.3"
+	legacyInstallerCommit  = "dfa09f5fd82a01b79c977cae20299db79ede9bdc"
+)
 
 var (
 	versionRE = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
@@ -63,7 +68,8 @@ type OwnershipManager interface {
 
 type Options struct {
 	Version, Commit, AssetDir, SHA256SUMSSHA256 string
-	EnableNow, RunAsRoot                        bool
+	InstallerVersion, InstallerCommit           string
+	EnableNow, RunAsRoot, Upgrade               bool
 	Root, Arch                                  string
 	Account                                     AccountManager
 	Services                                    ServiceManager
@@ -89,18 +95,19 @@ func FailureStage(err error) (string, bool) {
 }
 
 type receipt struct {
-	Version           string                    `json:"version"`
-	Commit            string                    `json:"commit"`
-	Architecture      string                    `json:"architecture"`
-	ArchiveSHA256     map[string]string         `json:"archive_sha256"`
-	OwnerTokenSHA256  string                    `json:"owner_token_sha256"`
-	WorkerTokenSHA256 string                    `json:"worker_token_sha256"`
-	RunAsRoot         bool                      `json:"run_as_root"`
-	AccountUID        int                       `json:"account_uid"`
-	AccountGID        int                       `json:"account_gid"`
-	Files             map[string]string         `json:"files"`
-	Modes             map[string]uint32         `json:"modes"`
-	Directories       map[string]directoryState `json:"directories"`
+	Version            string                    `json:"version"`
+	Commit             string                    `json:"commit"`
+	Architecture       string                    `json:"architecture"`
+	ArchiveSHA256      map[string]string         `json:"archive_sha256"`
+	OwnerTokenSHA256   string                    `json:"owner_token_sha256"`
+	WorkerTokenSHA256  string                    `json:"worker_token_sha256"`
+	RunAsRoot          bool                      `json:"run_as_root"`
+	AccountUID         int                       `json:"account_uid"`
+	AccountGID         int                       `json:"account_gid"`
+	StoreSchemaVersion int                       `json:"store_schema_version"`
+	Files              map[string]string         `json:"files"`
+	Modes              map[string]uint32         `json:"modes"`
+	Directories        map[string]directoryState `json:"directories"`
 }
 
 type directoryState struct {
@@ -143,7 +150,22 @@ func Install(o Options) (retErr error) {
 
 	failureStage = "existing"
 	installPath := rooted(o.Root, prefix)
-	existing, err := existingInstall(installPath, o, archives)
+	if o.Upgrade {
+		if o.Root == "" {
+			if err := requireTrustedAncestor("/opt"); err != nil {
+				return err
+			}
+			if err := requireTrustedAncestor("/etc/systemd/system"); err != nil {
+				return err
+			}
+		}
+		lock, lockErr := acquireUpgradeLock(o.Root)
+		if lockErr != nil {
+			return &installStageError{stage: "host", err: lockErr}
+		}
+		defer lock.Close()
+	}
+	existing, err := inspectExistingInstall(installPath, o)
 	if err != nil {
 		return err
 	}
@@ -164,7 +186,30 @@ func Install(o Options) (retErr error) {
 		if err := validateLinks(o.Root); err != nil {
 			return err
 		}
-		return nil
+		if sameRelease(existing, o, archives) {
+			if o.Upgrade {
+				return errors.New("upgrade target is not newer than installed release")
+			}
+			return nil
+		}
+		if !o.Upgrade {
+			return errors.New("different release requires explicit upgrade")
+		}
+		if o.Root == "" {
+			if err := requireTrustedAncestor("/opt"); err != nil {
+				return err
+			}
+			if err := requireTrustedAncestor("/etc/systemd/system"); err != nil {
+				return err
+			}
+		}
+		if compareVersions(o.Version, existing.Version) <= 0 {
+			return errors.New("requested release is not newer than installed release")
+		}
+		return upgradeInstall(o, installPath, existing, archives)
+	}
+	if o.Upgrade {
+		return errors.New("upgrade requires an existing installation")
 	}
 	failureStage = "host"
 	if o.Root == "" {
@@ -280,7 +325,7 @@ func Install(o Options) (retErr error) {
 	if err = writeExclusive(filepath.Join(stage, "systemd/agent-forge-worker.service"), []byte(workerUnit), 0o644); err != nil {
 		return err
 	}
-	r := receipt{Version: o.Version, Commit: o.Commit, Architecture: o.Arch, ArchiveSHA256: map[string]string{}, OwnerTokenSHA256: hashString(ownerToken), WorkerTokenSHA256: hashString(workerToken), RunAsRoot: o.RunAsRoot, AccountUID: uid, AccountGID: gid}
+	r := receipt{Version: o.Version, Commit: o.Commit, Architecture: o.Arch, ArchiveSHA256: map[string]string{}, OwnerTokenSHA256: hashString(ownerToken), WorkerTokenSHA256: hashString(workerToken), RunAsRoot: o.RunAsRoot, AccountUID: uid, AccountGID: gid, StoreSchemaVersion: storeSchemaVersion}
 	for _, a := range archives {
 		r.ArchiveSHA256[a.name] = a.digest
 	}
@@ -326,6 +371,9 @@ func validate(o *Options) error {
 	}
 	if o.Root != "" && !filepath.IsAbs(o.Root) {
 		return errors.New("test root must be absolute")
+	}
+	if o.Upgrade && (o.InstallerVersion != o.Version || o.InstallerCommit != o.Commit) {
+		return errors.New("upgrade requires the exact target forge CLI")
 	}
 	if o.Arch == "" {
 		o.Arch = runtime.GOARCH
@@ -790,7 +838,7 @@ func validateLinks(root string) error {
 	}
 	return nil
 }
-func existingInstall(p string, o Options, a []verifiedArchive) (*receipt, error) {
+func inspectExistingInstall(p string, o Options) (*receipt, error) {
 	st, e := os.Lstat(p)
 	if os.IsNotExist(e) {
 		return nil, nil
@@ -808,17 +856,29 @@ func existingInstall(p string, o Options, a []verifiedArchive) (*receipt, error)
 		return nil, errors.New("existing install has no valid receipt")
 	}
 	var r receipt
-	if configjson.Decode(body, &r) != nil || r.Version != o.Version || r.Commit != o.Commit || r.Architecture != o.Arch || r.RunAsRoot != o.RunAsRoot || !digestRE.MatchString(r.OwnerTokenSHA256) || !digestRE.MatchString(r.WorkerTokenSHA256) {
+	if configjson.Decode(body, &r) != nil || !versionRE.MatchString(r.Version) || !commitRE.MatchString(r.Commit) || r.Architecture != o.Arch || r.RunAsRoot != o.RunAsRoot || !digestRE.MatchString(r.OwnerTokenSHA256) || !digestRE.MatchString(r.WorkerTokenSHA256) {
 		return nil, errors.New("existing install receipt mismatch")
+	}
+	var rawReceipt map[string]json.RawMessage
+	if json.Unmarshal(body, &rawReceipt) != nil {
+		return nil, errors.New("existing install receipt mismatch")
+	}
+	_, schemaMarkerPresent := rawReceipt["store_schema_version"]
+	if !schemaMarkerPresent && r.Version == legacyInstallerVersion && r.Commit == legacyInstallerCommit {
+		r.StoreSchemaVersion = storeSchemaVersion
+	}
+	if !schemaMarkerPresent && (r.Version != legacyInstallerVersion || r.Commit != legacyInstallerCommit) || r.StoreSchemaVersion != storeSchemaVersion {
+		return nil, errors.New("existing store schema is not upgrade-compatible")
 	}
 	if r.AccountUID < 0 || r.AccountGID < 0 || o.RunAsRoot && (r.AccountUID != 0 || r.AccountGID != 0) || !o.RunAsRoot && (r.AccountUID <= 0 || r.AccountGID <= 0) {
 		return nil, errors.New("existing account receipt mismatch")
 	}
-	if len(r.ArchiveSHA256) != len(a) || len(r.Files) != len(immutableFiles()) || len(r.Modes) != len(immutableFiles()) {
+	if len(r.ArchiveSHA256) != 3 || len(r.Files) != len(immutableFiles()) || len(r.Modes) != len(immutableFiles()) {
 		return nil, errors.New("existing receipt key set mismatch")
 	}
-	for _, x := range a {
-		if r.ArchiveSHA256[x.name] != x.digest {
+	for _, role := range []string{"cli", "gate", "worker"} {
+		name := fmt.Sprintf("agent-forge-%s_%s_linux_%s.tar.gz", role, r.Version, r.Architecture)
+		if !digestRE.MatchString(r.ArchiveSHA256[name]) {
 			return nil, errors.New("existing archive receipt mismatch")
 		}
 	}
@@ -867,6 +927,38 @@ func existingInstall(p string, o Options, a []verifiedArchive) (*receipt, error)
 		return nil, errors.New("existing secret receipt mismatch")
 	}
 	return &r, nil
+}
+
+func sameRelease(r *receipt, o Options, archives []verifiedArchive) bool {
+	if r.Version != o.Version || r.Commit != o.Commit || len(r.ArchiveSHA256) != len(archives) {
+		return false
+	}
+	for _, archive := range archives {
+		if r.ArchiveSHA256[archive.name] != archive.digest {
+			return false
+		}
+	}
+	return true
+}
+
+func compareVersions(a, b string) int {
+	aParts := strings.Split(strings.TrimPrefix(a, "v"), ".")
+	bParts := strings.Split(strings.TrimPrefix(b, "v"), ".")
+	for i := 0; i < 3; i++ {
+		if len(aParts[i]) < len(bParts[i]) {
+			return -1
+		}
+		if len(aParts[i]) > len(bParts[i]) {
+			return 1
+		}
+		if aParts[i] < bParts[i] {
+			return -1
+		}
+		if aParts[i] > bParts[i] {
+			return 1
+		}
+	}
+	return 0
 }
 
 func readExactSecrets(name string, gate bool) (map[string]string, error) {
