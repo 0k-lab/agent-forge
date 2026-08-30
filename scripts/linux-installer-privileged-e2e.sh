@@ -491,6 +491,25 @@ if [ -n "$OLD_VERSION" ]; then
   assert_active agent-forge-worker.service
   STAGE=upgrade-authenticated-readiness
   wait_worker
+  if ! /opt/agent-forge/bin/forge doctor >"$TMP/doctor-output" 2>&1; then
+    echo "installed candidate doctor failed" >&2
+    exit 1
+  fi
+  cmp "$TMP/doctor-output" /dev/stdin <<'EOF' || { echo "installed candidate doctor output mismatch" >&2; exit 1; }
+PASS receipt
+PASS cli-identity
+PASS trusted-paths
+PASS immutable-paths
+PASS mutable-paths
+PASS gate-enabled
+PASS gate-active
+PASS worker-enabled
+PASS worker-active
+PASS gate-readiness
+PASS worker-readiness
+PASS store-schema
+RESULT healthy
+EOF
   STAGE=upgrade-token-exposure
   assert_tokens_not_exposed
   snapshot_upgrade_preserved_state "$UPGRADE_AFTER"

@@ -225,6 +225,7 @@ func ownershipKey(name string) string {
 
 type fakeServices struct {
 	calls                [][]string
+	gateReleases         []string
 	ready                int
 	failAt               string
 	failOnce             bool
@@ -252,11 +253,12 @@ func (f *fakeServices) Run(argv ...string) error {
 	return nil
 }
 
-func (f *fakeServices) GateReady(ownerToken string) error {
+func (f *fakeServices) GateReady(ownerToken, version, commit string) error {
 	if ownerToken == "" {
 		return fmt.Errorf("empty owner token")
 	}
 	f.calls = append(f.calls, []string{"gate-ready"})
+	f.gateReleases = append(f.gateReleases, version+" "+commit)
 	if f.fails("gate-ready") {
 		return errors.New("injected Gate readiness failure")
 	}
@@ -763,6 +765,10 @@ func TestUpgradeReadinessFailureRollsBackExactInstalledRelease(t *testing.T) {
 	}
 	if services.ready < 3 {
 		t.Fatalf("old release readiness was not re-proved: ready=%d calls=%v", services.ready, services.calls)
+	}
+	wantReleases := []string{newVersion + " " + newCommit, testVersion + " " + testCommit}
+	if strings.Join(services.gateReleases, "|") != strings.Join(wantReleases, "|") {
+		t.Fatalf("Gate readiness releases=%v, want %v", services.gateReleases, wantReleases)
 	}
 }
 

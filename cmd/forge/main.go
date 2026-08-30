@@ -32,6 +32,7 @@ const (
 	CodeHTTPFailure   ErrorCode = "http_failure"
 	CodeTimeout       ErrorCode = "timeout"
 	CodeJobFailed     ErrorCode = "job_failed"
+	CodeUnhealthy     ErrorCode = "unhealthy"
 )
 
 type CLIError struct {
@@ -45,18 +46,34 @@ func fail(code ErrorCode) error { return &CLIError{Code: code} }
 
 func main() {
 	if err := run(os.Args[1:], os.Getenv, os.Stdin, os.Stdout, os.Stderr); err != nil {
-		code := CodeHTTPFailure
-		var cliErr *CLIError
-		if errors.As(err, &cliErr) {
-			code = cliErr.Code
-		}
-		failure := map[string]any{"component": "forge", "event": "client_failed", "failure_code": code}
-		if cliErr != nil && cliErr.InstallStage != "" {
-			failure["install_stage"] = cliErr.InstallStage
-		}
-		_ = json.NewEncoder(os.Stderr).Encode(failure)
-		os.Exit(1)
+		os.Exit(reportFailure(os.Stderr, err))
 	}
+}
+
+func reportFailure(stderr io.Writer, err error) int {
+	status := exitStatus(err)
+	code := CodeHTTPFailure
+	var cliErr *CLIError
+	if errors.As(err, &cliErr) {
+		code = cliErr.Code
+	}
+	if code == CodeUnhealthy {
+		return status
+	}
+	failure := map[string]any{"component": "forge", "event": "client_failed", "failure_code": code}
+	if cliErr != nil && cliErr.InstallStage != "" {
+		failure["install_stage"] = cliErr.InstallStage
+	}
+	_ = json.NewEncoder(stderr).Encode(failure)
+	return status
+}
+
+func exitStatus(err error) int {
+	var cliErr *CLIError
+	if errors.As(err, &cliErr) && cliErr.Code == CodeUnhealthy {
+		return 2
+	}
+	return 1
 }
 
 type commandOptions struct {
@@ -69,6 +86,7 @@ type commandOptions struct {
 }
 
 var installLinux = linuxinstall.Install
+var doctorLinux = linuxinstall.Doctor
 var effectiveUID = os.Geteuid
 
 func run(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -81,6 +99,9 @@ func run(args []string, getenv func(string) string, stdin io.Reader, stdout, std
 	name := args[0]
 	if name == "install" {
 		return runInstall(args[1:])
+	}
+	if name == "doctor" {
+		return runDoctor(args[1:], stdout)
 	}
 	if name != "submit" && name != "wait" && name != "status" && name != "events" && name != "result" {
 		return fail(CodeInvalidUsage)
@@ -148,6 +169,26 @@ func run(args []string, getenv func(string) string, stdin io.Reader, stdout, std
 		}
 		return printJSON(stdout, response)
 	}
+}
+
+func runDoctor(args []string, stdout io.Writer) error {
+	if len(args) != 0 || effectiveUID() != 0 {
+		return fail(CodeInvalidUsage)
+	}
+	report := doctorLinux(linuxinstall.DoctorOptions{Services: linuxinstall.HostServiceManager{}, Ownership: linuxinstall.HostOwnershipManager{}, Account: linuxinstall.HostAccountManager{}})
+	for _, check := range report.Checks {
+		status := "FAIL"
+		if check.OK {
+			status = "PASS"
+		}
+		fmt.Fprintf(stdout, "%s %s\n", status, check.ID)
+	}
+	if !report.Healthy() {
+		fmt.Fprintln(stdout, "RESULT unhealthy")
+		return fail(CodeUnhealthy)
+	}
+	fmt.Fprintln(stdout, "RESULT healthy")
+	return nil
 }
 
 func runInstall(args []string) error {

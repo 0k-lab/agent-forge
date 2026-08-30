@@ -20,6 +20,7 @@ func TestGateReadyRequiresStrictOwnerBoundProof(t *testing.T) {
 	t.Cleanup(func() { gateBaseURL, readinessWindow = oldURL, oldWindow })
 	readinessWindow = 20 * time.Millisecond
 	owner := "owner-secret"
+	version, commit := "v1.2.3", "0123456789abcdef0123456789abcdef01234567"
 	for _, tc := range []struct {
 		name  string
 		serve func(http.ResponseWriter, *http.Request)
@@ -29,9 +30,16 @@ func TestGateReadyRequiresStrictOwnerBoundProof(t *testing.T) {
 			challenge := r.URL.Query().Get("challenge")
 			digest := sha256.Sum256([]byte(owner))
 			mac := hmac.New(sha256.New, digest[:])
-			_, _ = mac.Write([]byte("agent-forge/install-ready/v1\x00" + challenge))
-			fmt.Fprintf(w, `{"proof":%q,"status":"ready"}`+"\n", base64.RawURLEncoding.EncodeToString(mac.Sum(nil)))
+			_, _ = mac.Write([]byte("agent-forge/install-ready/v2\x00" + challenge + "\x00" + version + "\x00" + commit))
+			fmt.Fprintf(w, `{"commit":%q,"proof":%q,"status":"ready","version":%q}`+"\n", commit, base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), version)
 		}, true},
+		{"wrong release", func(w http.ResponseWriter, r *http.Request) {
+			challenge := r.URL.Query().Get("challenge")
+			digest := sha256.Sum256([]byte(owner))
+			mac := hmac.New(sha256.New, digest[:])
+			_, _ = mac.Write([]byte("agent-forge/install-ready/v2\x00" + challenge + "\x00v9.9.9\x00" + commit))
+			fmt.Fprintf(w, `{"commit":%q,"proof":%q,"status":"ready","version":"v9.9.9"}`, commit, base64.RawURLEncoding.EncodeToString(mac.Sum(nil)))
+		}, false},
 		{"spoof", func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`{"proof":"wrong","status":"ready"}`))
 		}, false},
@@ -45,11 +53,54 @@ func TestGateReadyRequiresStrictOwnerBoundProof(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(tc.serve))
 			defer server.Close()
 			gateBaseURL = server.URL
-			err := (HostServiceManager{}).GateReady(owner)
+			err := (HostServiceManager{}).GateReady(owner, version, commit)
 			if (err == nil) != tc.ok {
 				t.Fatalf("ok=%v err=%v", tc.ok, err)
 			}
 		})
+	}
+}
+
+func TestGateReadyAcceptsCanonicalLegacyV1Proof(t *testing.T) {
+	oldURL, oldWindow := gateBaseURL, readinessWindow
+	t.Cleanup(func() { gateBaseURL, readinessWindow = oldURL, oldWindow })
+	readinessWindow = 20 * time.Millisecond
+	owner := "owner-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		challenge := r.URL.Query().Get("challenge")
+		digest := sha256.Sum256([]byte(owner))
+		mac := hmac.New(sha256.New, digest[:])
+		_, _ = mac.Write([]byte("agent-forge/install-ready/v1\x00" + challenge))
+		fmt.Fprintf(w, `{"proof":%q,"status":"ready"}`+"\n", base64.RawURLEncoding.EncodeToString(mac.Sum(nil)))
+	}))
+	defer server.Close()
+	gateBaseURL = server.URL
+	if err := (HostServiceManager{}).GateReady(owner, legacyInstallerVersion, legacyInstallerCommit); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGateReadyRejectsLegacyV1ProofForOtherIdentity(t *testing.T) {
+	oldURL, oldWindow := gateBaseURL, readinessWindow
+	t.Cleanup(func() { gateBaseURL, readinessWindow = oldURL, oldWindow })
+	readinessWindow = 20 * time.Millisecond
+	owner := "owner-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		challenge := r.URL.Query().Get("challenge")
+		digest := sha256.Sum256([]byte(owner))
+		mac := hmac.New(sha256.New, digest[:])
+		_, _ = mac.Write([]byte("agent-forge/install-ready/v1\x00" + challenge))
+		fmt.Fprintf(w, `{"proof":%q,"status":"ready"}`+"\n", base64.RawURLEncoding.EncodeToString(mac.Sum(nil)))
+	}))
+	defer server.Close()
+	gateBaseURL = server.URL
+	for _, identity := range []struct{ version, commit string }{
+		{"v0.1.4", legacyInstallerCommit},
+		{legacyInstallerVersion, "0123456789abcdef0123456789abcdef01234567"},
+	} {
+		if err := (HostServiceManager{}).GateReady(owner, identity.version, identity.commit); err == nil {
+			t.Fatalf("accepted legacy v1 proof for %s %s", identity.version, identity.commit)
+		}
 	}
 }
 

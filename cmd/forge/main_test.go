@@ -56,6 +56,36 @@ func TestInstallCommandPreservesOnlyCoarseFailureStage(t *testing.T) {
 	}
 }
 
+func TestDoctorCommandRequiresRootAndReportsDistinctUnhealthyResult(t *testing.T) {
+	previousDoctor := doctorLinux
+	previousUID := effectiveUID
+	t.Cleanup(func() { doctorLinux = previousDoctor; effectiveUID = previousUID })
+
+	doctorLinux = func(linuxinstall.DoctorOptions) linuxinstall.DoctorReport {
+		return linuxinstall.DoctorReport{Checks: []linuxinstall.DoctorCheck{{ID: "receipt", OK: false}}}
+	}
+	effectiveUID = func() int { return 0 }
+	var out bytes.Buffer
+	err := run([]string{"doctor"}, env(nil), nil, &out, io.Discard)
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr.Code != CodeUnhealthy || out.String() != "FAIL receipt\nRESULT unhealthy\n" || exitStatus(err) != 2 {
+		t.Fatalf("error=%#v output=%q exit=%d", err, out.String(), exitStatus(err))
+	}
+
+	effectiveUID = func() int { return 1000 }
+	if err := run([]string{"doctor"}, env(nil), nil, io.Discard, io.Discard); exitStatus(err) != 1 {
+		t.Fatalf("non-root exit=%d, want usage exit 1", exitStatus(err))
+	}
+}
+
+func TestDoctorUnhealthyDoesNotAppendGenericFailureOutput(t *testing.T) {
+	var stderr bytes.Buffer
+	err := fail(CodeUnhealthy)
+	if status := reportFailure(&stderr, err); status != 2 || stderr.Len() != 0 {
+		t.Fatalf("status=%d stderr=%q", status, stderr.String())
+	}
+}
+
 func TestSubmitReadsStrictTaskAndUsesEnvironmentCredential(t *testing.T) {
 	var requests atomic.Int32
 	useHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

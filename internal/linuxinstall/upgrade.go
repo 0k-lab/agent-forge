@@ -152,7 +152,9 @@ func upgradeInstall(o Options, installPath string, previous *receipt, archives [
 			}
 		}
 		if stopped {
-			if err := activate(o, ownerToken); err != nil {
+			previousOptions := o
+			previousOptions.Version, previousOptions.Commit = previous.Version, previous.Commit
+			if err := activate(previousOptions, ownerToken); err != nil {
 				rollbackErrors = append(rollbackErrors, errors.New("old release readiness rollback failed"))
 			}
 		}

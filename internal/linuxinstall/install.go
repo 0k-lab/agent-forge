@@ -58,7 +58,7 @@ type accountValidator interface {
 }
 type ServiceManager interface {
 	Run(argv ...string) error
-	GateReady(ownerToken string) error
+	GateReady(ownerToken, version, commit string) error
 	WorkerReady(ownerToken string) error
 }
 type OwnershipManager interface {
@@ -756,6 +756,11 @@ func ownedBy(manager OwnershipManager, name string, uid, gid uint32) bool {
 	gotUID, gotGID, err := manager.Owner(name)
 	return err == nil && gotUID == int(uid) && gotGID == int(gid)
 }
+
+func singlyLinked(info fs.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Nlink == 1
+}
 func mkdirPathNoSymlinks(root, p string, mode fs.FileMode) error {
 	cur := root
 	if cur == "" {
@@ -828,7 +833,7 @@ func validateLinks(root string) error {
 			target = rooted(root, target)
 		}
 		info, err := os.Lstat(link)
-		if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		if err != nil || info.Mode()&os.ModeSymlink == 0 || !singlyLinked(info) {
 			return errors.New("existing unit link missing")
 		}
 		got, err := os.Readlink(link)
@@ -848,7 +853,7 @@ func inspectExistingInstall(p string, o Options) (*receipt, error) {
 	}
 	receiptPath := filepath.Join(p, "install-receipt.json")
 	receiptInfo, receiptStatErr := os.Lstat(receiptPath)
-	if receiptStatErr != nil || !receiptInfo.Mode().IsRegular() || receiptInfo.Mode().Perm() != 0o400 || !ownedBy(o.Ownership, receiptPath, 0, 0) {
+	if receiptStatErr != nil || !receiptInfo.Mode().IsRegular() || !singlyLinked(receiptInfo) || receiptInfo.Mode().Perm() != 0o400 || !ownedBy(o.Ownership, receiptPath, 0, 0) {
 		return nil, errors.New("existing install receipt metadata mismatch")
 	}
 	body, e := readNoFollow(receiptPath, 1<<20)
@@ -910,7 +915,7 @@ func inspectExistingInstall(p string, o Options) (*receipt, error) {
 		if !r.RunAsRoot && (name == "etc/gate.json" || name == "etc/worker.json") {
 			gid = uint32(r.AccountGID)
 		}
-		if statErr != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || r.Modes[name] != wantMode || uint32(info.Mode().Perm()) != wantMode || !ownedBy(o.Ownership, filepath.Join(p, name), uid, gid) {
+		if statErr != nil || !info.Mode().IsRegular() || !singlyLinked(info) || info.Mode()&os.ModeSymlink != 0 || r.Modes[name] != wantMode || uint32(info.Mode().Perm()) != wantMode || !ownedBy(o.Ownership, filepath.Join(p, name), uid, gid) {
 			return nil, errors.New("existing immutable object mismatch")
 		}
 		fileBody, readErr := os.ReadFile(filepath.Join(p, name))
@@ -999,7 +1004,7 @@ func activate(o Options, ownerToken string) error {
 	if e := o.Services.Run("enable", "--now", "agent-forge-gate.service"); e != nil {
 		return e
 	}
-	if e := o.Services.GateReady(ownerToken); e != nil {
+	if e := o.Services.GateReady(ownerToken, o.Version, o.Commit); e != nil {
 		return e
 	}
 	if e := o.Services.Run("enable", "--now", "agent-forge-worker.service"); e != nil {
