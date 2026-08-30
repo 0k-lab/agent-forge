@@ -21,11 +21,11 @@ func TestInstallCommandRequiresOfflineTrustInputsAndExplicitRootMode(t *testing.
 	effectiveUID = func() int { return 0 }
 	var got linuxinstall.Options
 	installLinux = func(o linuxinstall.Options) error { got = o; return nil }
-	args := []string{"install", "--version", "v1.2.3", "--commit", "0123456789abcdef0123456789abcdef01234567", "--asset-dir", "/offline/assets", "--sha256sums-sha256", strings.Repeat("a", 64), "--run-as-root"}
+	args := []string{"install", "--version", "v1.2.3", "--commit", "0123456789abcdef0123456789abcdef01234567", "--asset-dir", "/offline/assets", "--sha256sums-sha256", strings.Repeat("a", 64), "--run-as-root", "--enable-now", "--upgrade"}
 	if err := run(args, env(nil), nil, io.Discard, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	if got.Version != "v1.2.3" || got.AssetDir != "/offline/assets" || !got.RunAsRoot || got.Account == nil || got.Services == nil {
+	if got.Version != "v1.2.3" || got.AssetDir != "/offline/assets" || !got.RunAsRoot || !got.EnableNow || !got.Upgrade || got.Account == nil || got.Services == nil {
 		t.Fatalf("installer options = %#v", got)
 	}
 	effectiveUID = func() int { return 1000 }

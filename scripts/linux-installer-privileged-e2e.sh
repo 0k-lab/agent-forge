@@ -75,6 +75,18 @@ case "${RUNNER_TEMP:-}" in /*) [ -d "$RUNNER_TEMP" ] && [ ! -L "$RUNNER_TEMP" ] 
   echo "invalid Linux asset directory" >&2
   exit 1
 }
+OLD_VERSION=${AGENT_FORGE_UPGRADE_FROM_VERSION:-}
+OLD_COMMIT=${AGENT_FORGE_UPGRADE_FROM_COMMIT:-}
+OLD_ASSET_DIR=${AGENT_FORGE_UPGRADE_FROM_ASSET_DIR:-}
+if [ -n "$OLD_VERSION$OLD_COMMIT$OLD_ASSET_DIR" ]; then
+  printf '%s\n' "$OLD_VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || usage
+  printf '%s\n' "$OLD_COMMIT" | grep -Eq '^[0-9a-f]{40}$' || usage
+  case "$OLD_ASSET_DIR" in /*) ;; *) usage ;; esac
+  [ -d "$OLD_ASSET_DIR" ] && [ ! -L "$OLD_ASSET_DIR" ] && [ -f "$OLD_ASSET_DIR/SHA256SUMS" ] && [ ! -L "$OLD_ASSET_DIR/SHA256SUMS" ] || {
+    echo "invalid old Linux asset directory" >&2
+    exit 1
+  }
+fi
 
 for tool in chmod cmp getent grep id journalctl mkfifo mktemp readlink rm sha256sum stat systemctl tar tr uname python3; do
   command -v "$tool" >/dev/null 2>&1 || { echo "missing required tool: $tool" >&2; exit 1; }
@@ -165,18 +177,47 @@ BOOTSTRAP="$TMP/agent-forge-cli_${VERSION}_linux_${ARCH}/forge"
 [ -x "$BOOTSTRAP" ] && [ ! -L "$BOOTSTRAP" ] || { echo "invalid bootstrap forge" >&2; exit 1; }
 [ "$("$BOOTSTRAP" --version)" = "forge $VERSION $COMMIT" ] || { echo "bootstrap identity mismatch" >&2; exit 1; }
 
-install_exact() {
+OLD_BOOTSTRAP=
+OLD_ANCHOR=
+if [ -n "$OLD_VERSION" ]; then
+  OLD_CLI_ARCHIVE="agent-forge-cli_${OLD_VERSION}_linux_${ARCH}.tar.gz"
+  [ -f "$OLD_ASSET_DIR/$OLD_CLI_ARCHIVE" ] && [ ! -L "$OLD_ASSET_DIR/$OLD_CLI_ARCHIVE" ] || { echo "missing old CLI archive" >&2; exit 1; }
+  (
+    cd "$OLD_ASSET_DIR"
+    sha256sum -c SHA256SUMS >/dev/null
+  )
+  OLD_ANCHOR=$(sha256sum "$OLD_ASSET_DIR/SHA256SUMS")
+  OLD_ANCHOR=${OLD_ANCHOR%% *}
+  tar --extract --gzip --file "$OLD_ASSET_DIR/$OLD_CLI_ARCHIVE" --directory "$TMP" --no-same-owner --no-same-permissions
+  OLD_BOOTSTRAP="$TMP/agent-forge-cli_${OLD_VERSION}_linux_${ARCH}/forge"
+  [ -x "$OLD_BOOTSTRAP" ] && [ ! -L "$OLD_BOOTSTRAP" ] || { echo "invalid old bootstrap forge" >&2; exit 1; }
+  [ "$("$OLD_BOOTSTRAP" --version)" = "forge $OLD_VERSION $OLD_COMMIT" ] || { echo "old bootstrap identity mismatch" >&2; exit 1; }
+fi
+
+install_release() {
+  release_bootstrap=$1 release_version=$2 release_commit=$3 release_assets=$4 release_anchor=$5 release_mode=$6
   install_log="$TMP/install.log"
   install_pipe="$TMP/install.pipe"
   /usr/bin/rm -f "$install_log" "$install_pipe"
   /usr/bin/mkfifo "$install_pipe"
   /usr/bin/python3 "$DIAGNOSTICS" capture "$install_pipe" "$install_log" &
   capture_pid=$!
-  if "$BOOTSTRAP" install \
-    --version "$VERSION" \
-    --commit "$COMMIT" \
-    --asset-dir "$ASSET_DIR" \
-    --sha256sums-sha256 "$ANCHOR" \
+  if [ "$release_mode" = upgrade ]; then
+    if "$release_bootstrap" install \
+      --version "$release_version" \
+      --commit "$release_commit" \
+      --asset-dir "$release_assets" \
+      --sha256sums-sha256 "$release_anchor" \
+      --enable-now --upgrade >"$install_pipe" 2>&1; then
+      install_rc=0
+    else
+      install_rc=$?
+    fi
+  elif "$release_bootstrap" install \
+    --version "$release_version" \
+    --commit "$release_commit" \
+    --asset-dir "$release_assets" \
+    --sha256sums-sha256 "$release_anchor" \
     --enable-now >"$install_pipe" 2>&1; then
     install_rc=0
   else
@@ -351,8 +392,39 @@ snapshot_validation_only_state() {
   } >"$output"
 }
 
+snapshot_upgrade_preserved_state() {
+  output=$1
+  {
+    for path in \
+      /opt/agent-forge/etc/gate.json \
+      /opt/agent-forge/etc/worker.json \
+      /opt/agent-forge/secrets/gate.env \
+      /opt/agent-forge/secrets/worker.env; do
+      stat -c '%n:%i:%s:%a:%u:%g:%y' "$path"
+      sha256sum "$path"
+    done
+    for path in \
+      /opt/agent-forge/var \
+      /opt/agent-forge/var/gate \
+      /opt/agent-forge/var/gate/state \
+      /opt/agent-forge/var/repositories \
+      /opt/agent-forge/var/worker \
+      /opt/agent-forge/var/worker/worktrees \
+      /opt/agent-forge/var/worker/runtime; do
+      stat -c '%n:%i:%a:%u:%g' "$path"
+    done
+    if [ -e /opt/agent-forge/var/gate/state/forge.db ]; then
+      stat -c '%n:%i:%a:%u:%g' /opt/agent-forge/var/gate/state/forge.db
+    fi
+  } >"$output"
+}
+
 STAGE=initial-install
-install_exact
+if [ -n "$OLD_VERSION" ]; then
+  install_release "$OLD_BOOTSTRAP" "$OLD_VERSION" "$OLD_COMMIT" "$OLD_ASSET_DIR" "$OLD_ANCHOR" clean
+else
+  install_release "$BOOTSTRAP" "$VERSION" "$COMMIT" "$ASSET_DIR" "$ANCHOR" clean
+fi
 
 STAGE=account-and-filesystem-contract
 PASSWD=$(getent passwd agent-forge)
@@ -407,11 +479,29 @@ wait_worker
 STAGE=initial-token-exposure
 assert_tokens_not_exposed
 
+if [ -n "$OLD_VERSION" ]; then
+  UPGRADE_BEFORE="$TMP/upgrade-before"
+  UPGRADE_AFTER="$TMP/upgrade-after"
+  snapshot_upgrade_preserved_state "$UPGRADE_BEFORE"
+  STAGE=exact-upgrade
+  install_release "$BOOTSTRAP" "$VERSION" "$COMMIT" "$ASSET_DIR" "$ANCHOR" upgrade
+  STAGE=upgrade-installed-identity
+  [ "$(/opt/agent-forge/bin/forge --version)" = "forge $VERSION $COMMIT" ]
+  assert_active agent-forge-gate.service
+  assert_active agent-forge-worker.service
+  STAGE=upgrade-authenticated-readiness
+  wait_worker
+  STAGE=upgrade-token-exposure
+  assert_tokens_not_exposed
+  snapshot_upgrade_preserved_state "$UPGRADE_AFTER"
+  cmp "$UPGRADE_BEFORE" "$UPGRADE_AFTER" || { echo "upgrade changed preserved state" >&2; exit 1; }
+fi
+
 BEFORE="$TMP/before"
 AFTER="$TMP/after"
 snapshot_validation_only_state "$BEFORE"
 STAGE=validation-only-rerun
-install_exact
+install_release "$BOOTSTRAP" "$VERSION" "$COMMIT" "$ASSET_DIR" "$ANCHOR" validate
 snapshot_validation_only_state "$AFTER"
 cmp "$BEFORE" "$AFTER" || { echo "same-version rerun mutated installation or service state" >&2; exit 1; }
 

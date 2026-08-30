@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"agent-forge/internal/gate"
+	"agent-forge/internal/store"
 	"agent-forge/internal/worker"
 )
 
@@ -25,6 +26,94 @@ const (
 	testVersion = "v1.2.3"
 	testCommit  = "0123456789abcdef0123456789abcdef01234567"
 )
+
+func TestStoreSchemaMarkerMatchesGate(t *testing.T) {
+	if storeSchemaVersion != store.SchemaVersion() {
+		t.Fatalf("installer schema=%d gate schema=%d", storeSchemaVersion, store.SchemaVersion())
+	}
+}
+
+func TestCompareVersionsSupportsUnboundedCanonicalComponents(t *testing.T) {
+	tests := []struct {
+		a, b string
+		want int
+	}{
+		{"v1.2.3", "v1.2.3", 0},
+		{"v2.0.0", "v1.999.999", 1},
+		{"v1.3.0", "v1.2.999", 1},
+		{"v1.2.4", "v1.2.3", 1},
+		{"v1.2.3", "v1.2.4", -1},
+		{"v999999999999999999999999999999.0.0", "v999999999999999999999999999998.999.999", 1},
+	}
+	for _, test := range tests {
+		if got := compareVersions(test.a, test.b); got != test.want {
+			t.Fatalf("compareVersions(%q,%q)=%d want %d", test.a, test.b, got, test.want)
+		}
+	}
+}
+
+func TestUpgradeLockIsExclusiveAndMetadataBound(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "opt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	first, err := acquireUpgradeLock(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if _, err := acquireUpgradeLock(root); err == nil {
+		t.Fatal("concurrent upgrade lock unexpectedly succeeded")
+	}
+	info, err := os.Lstat(filepath.Join(root, "opt/.agent-forge.install.lock"))
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		t.Fatalf("lock metadata=%v err=%v", info, err)
+	}
+}
+
+func TestUpgradeLockRejectsUnsafeObjects(t *testing.T) {
+	for _, kind := range []string{"mode", "symlink", "hardlink"} {
+		t.Run(kind, func(t *testing.T) {
+			root := t.TempDir()
+			opt := filepath.Join(root, "opt")
+			if err := os.MkdirAll(opt, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			lock := filepath.Join(opt, ".agent-forge.install.lock")
+			switch kind {
+			case "mode":
+				if err := os.WriteFile(lock, nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				if err := os.Symlink("target", lock); err != nil {
+					t.Fatal(err)
+				}
+			case "hardlink":
+				if err := os.WriteFile(lock, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Link(lock, filepath.Join(opt, "other")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := acquireUpgradeLock(root); err == nil {
+				t.Fatalf("accepted unsafe %s lock", kind)
+			}
+		})
+	}
+}
+
+func TestUpgradeRequiresExactTargetCLIIdentity(t *testing.T) {
+	o := Options{
+		Version: "v1.2.4", Commit: "4444444444444444444444444444444444444444",
+		InstallerVersion: "v1.2.3", InstallerCommit: testCommit,
+		AssetDir: "/offline", SHA256SUMSSHA256: strings.Repeat("a", 64), Upgrade: true,
+	}
+	if err := validate(&o); err == nil {
+		t.Fatal("accepted upgrade from non-target forge CLI")
+	}
+}
 
 func TestInstallFailureStageIsCoarseAndStable(t *testing.T) {
 	tests := []struct {
@@ -135,14 +224,29 @@ func ownershipKey(name string) string {
 }
 
 type fakeServices struct {
-	calls  [][]string
-	ready  int
-	failAt string
+	calls                [][]string
+	ready                int
+	failAt               string
+	failOnce             bool
+	workerReadyCalls     int
+	blockWorkerReadyCall int
+	workerReadyEntered   chan struct{}
+	workerReadyRelease   chan struct{}
+}
+
+func (f *fakeServices) fails(name string) bool {
+	if f.failAt != name {
+		return false
+	}
+	if f.failOnce {
+		f.failAt = ""
+	}
+	return true
 }
 
 func (f *fakeServices) Run(argv ...string) error {
 	f.calls = append(f.calls, append([]string(nil), argv...))
-	if strings.Join(argv, " ") == f.failAt {
+	if f.fails(strings.Join(argv, " ")) {
 		return errors.New("injected service failure")
 	}
 	return nil
@@ -153,7 +257,7 @@ func (f *fakeServices) GateReady(ownerToken string) error {
 		return fmt.Errorf("empty owner token")
 	}
 	f.calls = append(f.calls, []string{"gate-ready"})
-	if f.failAt == "gate-ready" {
+	if f.fails("gate-ready") {
 		return errors.New("injected Gate readiness failure")
 	}
 	f.ready++
@@ -165,8 +269,13 @@ func (f *fakeServices) WorkerReady(ownerToken string) error {
 		return fmt.Errorf("empty owner token")
 	}
 	f.calls = append(f.calls, []string{"worker-ready"})
-	if f.failAt == "worker-ready" {
+	f.workerReadyCalls++
+	if f.fails("worker-ready") {
 		return errors.New("injected Worker readiness failure")
+	}
+	if f.workerReadyCalls == f.blockWorkerReadyCall {
+		close(f.workerReadyEntered)
+		<-f.workerReadyRelease
 	}
 	f.ready++
 	return nil
@@ -457,6 +566,372 @@ func TestBinaryIdentityBoundsOutputAndKillsForkedProcessGroup(t *testing.T) {
 	}
 }
 
+func preparedUpgrade(t *testing.T, services *fakeServices) (Options, string, map[string][]byte) {
+	t.Helper()
+	root := t.TempDir()
+	account := &fakeAccount{}
+	ownership := newFakeOwnership()
+	oldAssets, oldAnchor := releaseFixture(t, nil)
+	old := Options{Version: testVersion, Commit: testCommit, AssetDir: oldAssets, SHA256SUMSSHA256: oldAnchor, Root: root, Arch: "amd64", Account: account, Ownership: ownership, Random: strings.NewReader(strings.Repeat("a", 32) + strings.Repeat("b", 32))}
+	if err := Install(old); err != nil {
+		t.Fatal(err)
+	}
+	installPath := rooted(root, prefix)
+	before := map[string][]byte{}
+	for _, name := range append(append([]string(nil), immutableFiles()...), "install-receipt.json") {
+		body, err := os.ReadFile(filepath.Join(installPath, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		before[name] = body
+	}
+	newVersion := "v1.2.4"
+	newCommit := "89abcdef0123456789abcdef0123456789abcdef"
+	newAssets, newAnchor := releaseFixtureFor(t, newVersion, newCommit, nil)
+	return Options{Version: newVersion, Commit: newCommit, InstallerVersion: newVersion, InstallerCommit: newCommit, AssetDir: newAssets, SHA256SUMSSHA256: newAnchor, Root: root, Arch: "amd64", Account: account, Ownership: ownership, EnableNow: true, Upgrade: true, Services: services}, installPath, before
+}
+
+func assertInstalledBytes(t *testing.T, installPath string, want map[string][]byte) {
+	t.Helper()
+	for name, body := range want {
+		got, err := os.ReadFile(filepath.Join(installPath, name))
+		if err != nil || !bytes.Equal(got, body) {
+			t.Fatalf("installed object %s differs", name)
+		}
+	}
+}
+
+func TestLegacyV013ReceiptBootstrapsSchemaNeutralUpgrade(t *testing.T) {
+	root := t.TempDir()
+	account := &fakeAccount{}
+	ownership := newFakeOwnership()
+	oldAssets, oldAnchor := releaseFixtureFor(t, legacyInstallerVersion, legacyInstallerCommit, nil)
+	old := Options{Version: legacyInstallerVersion, Commit: legacyInstallerCommit, AssetDir: oldAssets, SHA256SUMSSHA256: oldAnchor, Root: root, Arch: "amd64", Account: account, Ownership: ownership, Random: strings.NewReader(strings.Repeat("a", 32) + strings.Repeat("b", 32))}
+	if err := Install(old); err != nil {
+		t.Fatal(err)
+	}
+	receiptPath := filepath.Join(rooted(root, prefix), "install-receipt.json")
+	var legacy map[string]any
+	if err := json.Unmarshal([]byte(read(t, receiptPath)), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	writeLegacy := func() {
+		t.Helper()
+		body, _ := json.MarshalIndent(legacy, "", "  ")
+		body = append(body, '\n')
+		if err := os.Chmod(receiptPath, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(receiptPath, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(receiptPath, 0o400); err != nil {
+			t.Fatal(err)
+		}
+	}
+	newAssets, newAnchor := releaseFixtureFor(t, "v0.1.4", "4444444444444444444444444444444444444444", nil)
+	upgrade := Options{Version: "v0.1.4", Commit: "4444444444444444444444444444444444444444", InstallerVersion: "v0.1.4", InstallerCommit: "4444444444444444444444444444444444444444", AssetDir: newAssets, SHA256SUMSSHA256: newAnchor, Root: root, Arch: "amd64", Account: account, Ownership: ownership, EnableNow: true, Upgrade: true, Services: &fakeServices{}}
+	legacy["store_schema_version"] = float64(0)
+	writeLegacy()
+	if err := Install(upgrade); err == nil {
+		t.Fatal("accepted explicit zero schema marker through legacy bridge")
+	}
+	delete(legacy, "store_schema_version")
+	writeLegacy()
+	if err := Install(upgrade); err != nil {
+		t.Fatalf("legacy upgrade: %v", err)
+	}
+	var got receipt
+	if err := json.Unmarshal([]byte(read(t, receiptPath)), &got); err != nil || got.StoreSchemaVersion != storeSchemaVersion {
+		t.Fatalf("upgraded receipt=%#v err=%v", got, err)
+	}
+}
+
+func TestUpgradePreservesConfigSecretsAndStateWhileReplacingExactBinaries(t *testing.T) {
+	root := t.TempDir()
+	account := &fakeAccount{}
+	ownership := newFakeOwnership()
+	oldAssets, oldAnchor := releaseFixture(t, nil)
+	old := Options{Version: testVersion, Commit: testCommit, AssetDir: oldAssets, SHA256SUMSSHA256: oldAnchor, Root: root, Arch: "amd64", Account: account, Ownership: ownership, Random: strings.NewReader(strings.Repeat("a", 32) + strings.Repeat("b", 32))}
+	if err := Install(old); err != nil {
+		t.Fatal(err)
+	}
+	installPath := rooted(root, prefix)
+	statePath := filepath.Join(installPath, "var/gate/state/forge.db")
+	if err := os.WriteFile(statePath, []byte("operator-state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{
+		"var/gate/state/forge.db-wal": "wal", "var/gate/state/forge.db-shm": "shm", "var/gate/state/forge.db-journal": "journal",
+		"var/repositories/repository": "repository", "var/worker/worktrees/worktree": "worktree", "var/worker/runtime/runtime": "runtime",
+	} {
+		if err := os.WriteFile(filepath.Join(installPath, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	preserved := map[string][]byte{}
+	for _, name := range []string{"etc/gate.json", "etc/worker.json", "secrets/gate.env", "secrets/worker.env", "var/gate/state/forge.db", "var/gate/state/forge.db-wal", "var/gate/state/forge.db-shm", "var/gate/state/forge.db-journal", "var/repositories/repository", "var/worker/worktrees/worktree", "var/worker/runtime/runtime"} {
+		body, err := os.ReadFile(filepath.Join(installPath, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		preserved[name] = body
+	}
+
+	newVersion := "v1.2.4"
+	newCommit := "89abcdef0123456789abcdef0123456789abcdef"
+	newAssets, newAnchor := releaseFixtureFor(t, newVersion, newCommit, nil)
+	services := &fakeServices{}
+	upgrade := Options{Version: newVersion, Commit: newCommit, InstallerVersion: newVersion, InstallerCommit: newCommit, AssetDir: newAssets, SHA256SUMSSHA256: newAnchor, Root: root, Arch: "amd64", Account: account, Ownership: ownership, EnableNow: true, Upgrade: true, Services: services}
+	oldMask := syscall.Umask(0o077)
+	upgradeErr := Install(upgrade)
+	syscall.Umask(oldMask)
+	if upgradeErr != nil {
+		t.Fatalf("upgrade: %v", upgradeErr)
+	}
+	gotCalls := make([]string, len(services.calls))
+	for i := range services.calls {
+		gotCalls[i] = strings.Join(services.calls[i], " ")
+	}
+	wantCalls := []string{"stop agent-forge-worker.service", "stop agent-forge-gate.service", "daemon-reload", "enable --now agent-forge-gate.service", "gate-ready", "enable --now agent-forge-worker.service", "worker-ready"}
+	if strings.Join(gotCalls, "|") != strings.Join(wantCalls, "|") {
+		t.Fatalf("upgrade service order = %v", gotCalls)
+	}
+	for name, want := range preserved {
+		got, err := os.ReadFile(filepath.Join(installPath, name))
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("upgrade changed preserved path %s", name)
+		}
+	}
+	for _, name := range []string{"bin/forge", "bin/forge-gate", "bin/forge-worker", "bin/forge-codex-plugin", "bin/forge-ref-plugin"} {
+		body := read(t, filepath.Join(installPath, name))
+		if !strings.Contains(body, newVersion) || !strings.Contains(body, newCommit) {
+			t.Fatalf("binary %s was not upgraded", name)
+		}
+	}
+	var gotReceipt receipt
+	if err := json.Unmarshal([]byte(read(t, filepath.Join(installPath, "install-receipt.json"))), &gotReceipt); err != nil || gotReceipt.Version != newVersion || gotReceipt.Commit != newCommit {
+		t.Fatalf("upgraded receipt = %#v, %v", gotReceipt, err)
+	}
+	validationServices := &fakeServices{}
+	same := upgrade
+	same.Upgrade = false
+	same.Services = validationServices
+	if err := Install(same); err != nil || len(validationServices.calls) != 0 {
+		t.Fatalf("post-upgrade validation-only rerun: err=%v calls=%v", err, validationServices.calls)
+	}
+}
+
+func TestUpgradeReadinessFailureRollsBackExactInstalledRelease(t *testing.T) {
+	root := t.TempDir()
+	account := &fakeAccount{}
+	ownership := newFakeOwnership()
+	oldAssets, oldAnchor := releaseFixture(t, nil)
+	old := Options{Version: testVersion, Commit: testCommit, AssetDir: oldAssets, SHA256SUMSSHA256: oldAnchor, Root: root, Arch: "amd64", Account: account, Ownership: ownership, Random: strings.NewReader(strings.Repeat("a", 32) + strings.Repeat("b", 32))}
+	if err := Install(old); err != nil {
+		t.Fatal(err)
+	}
+	installPath := rooted(root, prefix)
+	statePath := filepath.Join(installPath, "var/gate/state/forge.db")
+	if err := os.WriteFile(statePath, []byte("operator-state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := map[string][]byte{}
+	for _, name := range append(append([]string(nil), immutableFiles()...), "install-receipt.json", "var/gate/state/forge.db") {
+		body, err := os.ReadFile(filepath.Join(installPath, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		before[name] = body
+	}
+
+	newVersion := "v1.2.4"
+	newCommit := "89abcdef0123456789abcdef0123456789abcdef"
+	newAssets, newAnchor := releaseFixtureFor(t, newVersion, newCommit, nil)
+	services := &fakeServices{failAt: "worker-ready", failOnce: true}
+	upgrade := Options{Version: newVersion, Commit: newCommit, InstallerVersion: newVersion, InstallerCommit: newCommit, AssetDir: newAssets, SHA256SUMSSHA256: newAnchor, Root: root, Arch: "amd64", Account: account, Ownership: ownership, EnableNow: true, Upgrade: true, Services: services}
+	err := Install(upgrade)
+	stage, ok := FailureStage(err)
+	if err == nil || !ok || stage != "activation" {
+		t.Fatalf("upgrade error = %v, stage=%q, ok=%v", err, stage, ok)
+	}
+	for name, want := range before {
+		got, readErr := os.ReadFile(filepath.Join(installPath, name))
+		if readErr != nil || !bytes.Equal(got, want) {
+			t.Fatalf("rollback did not restore %s", name)
+		}
+	}
+	if services.ready < 3 {
+		t.Fatalf("old release readiness was not re-proved: ready=%d calls=%v", services.ready, services.calls)
+	}
+}
+
+func TestUpgradeLockIsHeldThroughRollbackRecovery(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	services := &fakeServices{
+		failAt: "worker-ready", failOnce: true,
+		blockWorkerReadyCall: 2, workerReadyEntered: entered, workerReadyRelease: release,
+	}
+	upgrade, _, _ := preparedUpgrade(t, services)
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- Install(upgrade) }()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("rollback recovery did not reach old Worker readiness")
+	}
+	second := upgrade
+	second.Services = &fakeServices{}
+	if err := Install(second); err == nil || !strings.Contains(err.Error(), "another installer transaction is active") {
+		close(release)
+		t.Fatalf("concurrent upgrade error=%v", err)
+	}
+	close(release)
+	select {
+	case err := <-firstDone:
+		if err == nil || !strings.Contains(err.Error(), "injected Worker readiness failure") {
+			t.Fatalf("first upgrade error=%v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("rollback recovery did not finish")
+	}
+	lock, err := acquireUpgradeLock(upgrade.Root)
+	if err != nil {
+		t.Fatalf("lock remained held after rollback cleanup: %v", err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpgradePublicationFailuresRestoreExactInstalledRelease(t *testing.T) {
+	for _, name := range upgradeObjects {
+		for _, phase := range []string{"current-to-backup", "candidate-to-current"} {
+			t.Run(strings.ReplaceAll(name+"/"+phase, "/", "_"), func(t *testing.T) {
+				services := &fakeServices{}
+				upgrade, installPath, before := preparedUpgrade(t, services)
+				previousRename := renameUpgrade
+				t.Cleanup(func() { renameUpgrade = previousRename })
+				failed := false
+				current := filepath.Join(installPath, name)
+				renameUpgrade = func(from, to string) error {
+					match := phase == "current-to-backup" && from == current && strings.Contains(to, ".agent-forge.rollback-") || phase == "candidate-to-current" && strings.Contains(from, ".agent-forge.upgrade-") && to == current
+					if match && !failed {
+						failed = true
+						return errors.New("injected publication rename failure")
+					}
+					return os.Rename(from, to)
+				}
+				err := Install(upgrade)
+				stage, ok := FailureStage(err)
+				if err == nil || !ok || stage != "publication" || !failed {
+					t.Fatalf("error=%v stage=%q failed=%v", err, stage, failed)
+				}
+				assertInstalledBytes(t, installPath, before)
+				if services.ready < 2 {
+					t.Fatalf("old release was not re-proved: %v", services.calls)
+				}
+			})
+		}
+	}
+}
+
+func TestUpgradeServiceFailuresRestoreAndReproveOldRelease(t *testing.T) {
+	for _, failAt := range []string{"stop agent-forge-worker.service", "stop agent-forge-gate.service", "daemon-reload", "enable --now agent-forge-gate.service", "gate-ready", "enable --now agent-forge-worker.service", "worker-ready"} {
+		t.Run(strings.ReplaceAll(failAt, " ", "_"), func(t *testing.T) {
+			services := &fakeServices{failAt: failAt, failOnce: true}
+			upgrade, installPath, before := preparedUpgrade(t, services)
+			err := Install(upgrade)
+			stage, ok := FailureStage(err)
+			if err == nil || !ok || stage != "activation" {
+				t.Fatalf("error=%v stage=%q", err, stage)
+			}
+			assertInstalledBytes(t, installPath, before)
+			if services.ready < 2 {
+				t.Fatalf("old release was not re-proved: %v", services.calls)
+			}
+		})
+	}
+}
+
+func TestUpgradeRollbackRenameFailureRetainsRecoveryMaterial(t *testing.T) {
+	for _, phase := range []string{"current-to-stage", "backup-to-current"} {
+		t.Run(phase, func(t *testing.T) {
+			services := &fakeServices{failAt: "worker-ready", failOnce: true}
+			upgrade, installPath, _ := preparedUpgrade(t, services)
+			previousRename := renameUpgrade
+			t.Cleanup(func() { renameUpgrade = previousRename })
+			current := filepath.Join(installPath, "bin/forge")
+			failed := false
+			renameUpgrade = func(from, to string) error {
+				match := phase == "current-to-stage" && from == current && strings.Contains(to, ".agent-forge.upgrade-") || phase == "backup-to-current" && strings.Contains(from, ".agent-forge.rollback-") && to == current
+				if match && !failed {
+					failed = true
+					return errors.New("injected rollback rename failure")
+				}
+				return os.Rename(from, to)
+			}
+			if err := Install(upgrade); err == nil || !failed {
+				t.Fatalf("rollback failure not surfaced: %v", err)
+			}
+			parent := filepath.Dir(installPath)
+			stages, _ := filepath.Glob(filepath.Join(parent, ".agent-forge.upgrade-*"))
+			backups, _ := filepath.Glob(filepath.Join(parent, ".agent-forge.rollback-*"))
+			if len(stages) != 1 || len(backups) != 1 {
+				t.Fatalf("recovery material missing: stages=%v backups=%v", stages, backups)
+			}
+		})
+	}
+}
+
+func TestUpgradeRejectsDowngradeAndMissingReadinessWithoutMutation(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		version   string
+		commit    string
+		enableNow bool
+		upgrade   bool
+		wantStage string
+	}{
+		{name: "missing explicit upgrade", version: "v1.2.4", commit: "1111111111111111111111111111111111111111", enableNow: true, wantStage: "existing"},
+		{name: "downgrade", version: "v1.2.2", commit: "2222222222222222222222222222222222222222", enableNow: true, upgrade: true, wantStage: "existing"},
+		{name: "missing readiness", version: "v1.2.4", commit: "3333333333333333333333333333333333333333", upgrade: true, wantStage: "activation"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			account := &fakeAccount{}
+			ownership := newFakeOwnership()
+			assets, anchor := releaseFixture(t, nil)
+			old := Options{Version: testVersion, Commit: testCommit, AssetDir: assets, SHA256SUMSSHA256: anchor, Root: root, Arch: "amd64", Account: account, Ownership: ownership, Random: strings.NewReader(strings.Repeat("a", 32) + strings.Repeat("b", 32))}
+			if err := Install(old); err != nil {
+				t.Fatal(err)
+			}
+			installPath := rooted(root, prefix)
+			before := map[string][]byte{}
+			for _, name := range append(append([]string(nil), immutableFiles()...), "install-receipt.json") {
+				body, err := os.ReadFile(filepath.Join(installPath, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				before[name] = body
+			}
+			newAssets, newAnchor := releaseFixtureFor(t, test.version, test.commit, nil)
+			err := Install(Options{Version: test.version, Commit: test.commit, InstallerVersion: test.version, InstallerCommit: test.commit, AssetDir: newAssets, SHA256SUMSSHA256: newAnchor, Root: root, Arch: "amd64", Account: account, Ownership: ownership, EnableNow: test.enableNow, Upgrade: test.upgrade, Services: &fakeServices{}})
+			stage, ok := FailureStage(err)
+			if err == nil || !ok || stage != test.wantStage {
+				t.Fatalf("error=%v stage=%q ok=%v", err, stage, ok)
+			}
+			for name, want := range before {
+				got, readErr := os.ReadFile(filepath.Join(installPath, name))
+				if readErr != nil || !bytes.Equal(got, want) {
+					t.Fatalf("rejected upgrade changed %s", name)
+				}
+			}
+		})
+	}
+}
+
 func TestSameVersionRerunRejectsTamperedImmutableFileWithoutRewrite(t *testing.T) {
 	assets, anchor := releaseFixture(t, nil)
 	root := t.TempDir()
@@ -675,6 +1150,10 @@ func hostileTarGzip(t *testing.T, _ string, headers []tar.Header) []byte {
 }
 
 func releaseFixture(t *testing.T, mutate func(map[string][]byte)) (string, string) {
+	return releaseFixtureFor(t, testVersion, testCommit, mutate)
+}
+
+func releaseFixtureFor(t *testing.T, version, commit string, mutate func(map[string][]byte)) (string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	files := map[string][]byte{}
@@ -683,8 +1162,8 @@ func releaseFixture(t *testing.T, mutate func(map[string][]byte)) (string, strin
 		{"gate", "linux", "amd64"}, {"gate", "linux", "arm64"},
 		{"worker", "linux", "amd64"}, {"worker", "linux", "arm64"},
 	} {
-		name := fmt.Sprintf("agent-forge-%s_%s_%s_%s.tar.gz", roleArch.role, testVersion, roleArch.os, roleArch.arch)
-		files[name] = archive(t, strings.TrimSuffix(name, ".tar.gz"), roleArch.role)
+		name := fmt.Sprintf("agent-forge-%s_%s_%s_%s.tar.gz", roleArch.role, version, roleArch.os, roleArch.arch)
+		files[name] = archiveForIdentity(t, strings.TrimSuffix(name, ".tar.gz"), roleArch.role, version, commit, version, commit)
 	}
 	if mutate != nil {
 		mutate(files)
