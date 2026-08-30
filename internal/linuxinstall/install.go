@@ -71,6 +71,23 @@ type Options struct {
 	Random                                      io.Reader
 }
 
+type installStageError struct {
+	stage string
+	err   error
+}
+
+func (e *installStageError) Error() string { return e.err.Error() }
+func (e *installStageError) Unwrap() error { return e.err }
+
+// FailureStage returns a coarse, secret-free installer stage suitable for diagnostics.
+func FailureStage(err error) (string, bool) {
+	var stageErr *installStageError
+	if !errors.As(err, &stageErr) {
+		return "", false
+	}
+	return stageErr.stage, true
+}
+
 type receipt struct {
 	Version           string                    `json:"version"`
 	Commit            string                    `json:"commit"`
@@ -98,9 +115,18 @@ type verifiedArchive struct {
 }
 
 func Install(o Options) (retErr error) {
+	failureStage := "validate"
+	defer func() {
+		if retErr != nil {
+			if _, ok := FailureStage(retErr); !ok {
+				retErr = &installStageError{stage: failureStage, err: retErr}
+			}
+		}
+	}()
 	if err := validate(&o); err != nil {
 		return err
 	}
+	failureStage = "assets"
 	archives, err := verifyAssets(o)
 	if err != nil {
 		return err
@@ -110,10 +136,12 @@ func Install(o Options) (retErr error) {
 			_ = os.Remove(a.file)
 		}
 	}()
+	failureStage = "archives"
 	if err := validateArchives(archives, o.Version, o.Commit); err != nil {
 		return err
 	}
 
+	failureStage = "existing"
 	installPath := rooted(o.Root, prefix)
 	existing, err := existingInstall(installPath, o, archives)
 	if err != nil {
@@ -138,6 +166,7 @@ func Install(o Options) (retErr error) {
 		}
 		return nil
 	}
+	failureStage = "host"
 	if o.Root == "" {
 		if err := requireTrustedAncestor("/opt"); err != nil {
 			return err
@@ -150,6 +179,7 @@ func Install(o Options) (retErr error) {
 	uid, gid := 0, 0
 	var accountState AccountState
 	accountPublished := false
+	failureStage = "account"
 	if !o.RunAsRoot {
 		if o.Account == nil {
 			return errors.New("dedicated account manager is required")
@@ -167,6 +197,7 @@ func Install(o Options) (retErr error) {
 			}
 		}()
 	}
+	failureStage = "staging"
 	parent := filepath.Dir(installPath)
 	if err := mkdirPathNoSymlinks(o.Root, filepath.Dir(prefix), 0o755); err != nil {
 		return err
@@ -276,6 +307,7 @@ func Install(o Options) (retErr error) {
 	if err = os.Chmod(stage, 0o755); err != nil {
 		return err
 	}
+	failureStage = "publication"
 	if err = unix.Renameat2(unix.AT_FDCWD, stage, unix.AT_FDCWD, installPath, unix.RENAME_NOREPLACE); err != nil {
 		return fmt.Errorf("publish without replacement: %w", err)
 	}
@@ -284,6 +316,7 @@ func Install(o Options) (retErr error) {
 	if err = ensureLinks(o.Root); err != nil {
 		return err
 	}
+	failureStage = "activation"
 	return activate(o, ownerToken)
 }
 

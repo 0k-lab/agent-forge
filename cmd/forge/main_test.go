@@ -43,6 +43,19 @@ func TestInstallCommandRequiresOfflineTrustInputsAndExplicitRootMode(t *testing.
 	}
 }
 
+func TestInstallCommandPreservesOnlyCoarseFailureStage(t *testing.T) {
+	previous := installLinux
+	previousUID := effectiveUID
+	t.Cleanup(func() { installLinux = previous; effectiveUID = previousUID })
+	effectiveUID = func() int { return 0 }
+	installLinux = func(linuxinstall.Options) error { return linuxinstall.Install(linuxinstall.Options{}) }
+	err := runInstall([]string{"--version", "v1.2.3", "--commit", "0123456789abcdef0123456789abcdef01234567", "--asset-dir", "/offline/assets", "--sha256sums-sha256", strings.Repeat("a", 64)})
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr.Code != CodeInvalidInput || cliErr.InstallStage != "validate" {
+		t.Fatalf("error = %#v", err)
+	}
+}
+
 func TestSubmitReadsStrictTaskAndUsesEnvironmentCredential(t *testing.T) {
 	var requests atomic.Int32
 	useHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

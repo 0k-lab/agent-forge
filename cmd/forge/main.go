@@ -34,7 +34,10 @@ const (
 	CodeJobFailed     ErrorCode = "job_failed"
 )
 
-type CLIError struct{ Code ErrorCode }
+type CLIError struct {
+	Code         ErrorCode
+	InstallStage string
+}
 
 func (e *CLIError) Error() string { return string(e.Code) }
 
@@ -47,7 +50,11 @@ func main() {
 		if errors.As(err, &cliErr) {
 			code = cliErr.Code
 		}
-		_ = json.NewEncoder(os.Stderr).Encode(map[string]any{"component": "forge", "event": "client_failed", "failure_code": code})
+		failure := map[string]any{"component": "forge", "event": "client_failed", "failure_code": code}
+		if cliErr != nil && cliErr.InstallStage != "" {
+			failure["install_stage"] = cliErr.InstallStage
+		}
+		_ = json.NewEncoder(os.Stderr).Encode(failure)
 		os.Exit(1)
 	}
 }
@@ -159,7 +166,8 @@ func runInstall(args []string) error {
 		return fail(CodeInvalidUsage)
 	}
 	if err := installLinux(o); err != nil {
-		return fail(CodeInvalidInput)
+		stage, _ := linuxinstall.FailureStage(err)
+		return &CLIError{Code: CodeInvalidInput, InstallStage: stage}
 	}
 	return nil
 }
