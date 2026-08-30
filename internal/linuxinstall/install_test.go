@@ -26,6 +26,41 @@ const (
 	testCommit  = "0123456789abcdef0123456789abcdef01234567"
 )
 
+func TestInstallFailureStageIsCoarseAndStable(t *testing.T) {
+	tests := []struct {
+		name string
+		o    Options
+		want string
+	}{
+		{name: "validate", o: Options{}, want: "validate"},
+		{name: "assets", o: Options{Version: testVersion, Commit: testCommit, AssetDir: filepath.Join(t.TempDir(), "missing"), SHA256SUMSSHA256: strings.Repeat("a", 64)}, want: "assets"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stage, ok := FailureStage(Install(tt.o))
+			if !ok || stage != tt.want {
+				t.Fatalf("FailureStage = %q, %v; want %q, true", stage, ok, tt.want)
+			}
+		})
+	}
+}
+
+func TestInstallFailureStageWrapperPreservesEveryAllowedStageAndCause(t *testing.T) {
+	for _, stage := range []string{"validate", "assets", "archives", "existing", "host", "account", "staging", "publication", "activation"} {
+		t.Run(stage, func(t *testing.T) {
+			cause := errors.New("internal detail")
+			err := error(&installStageError{stage: stage, err: cause})
+			got, ok := FailureStage(err)
+			if !ok || got != stage || !errors.Is(err, cause) || err.Error() != cause.Error() {
+				t.Fatalf("stage=%q ok=%v errors.Is=%v error=%q", got, ok, errors.Is(err, cause), err.Error())
+			}
+		})
+	}
+	if stage, ok := FailureStage(errors.New("plain")); ok || stage != "" {
+		t.Fatalf("plain error classified as %q, %v", stage, ok)
+	}
+}
+
 type fakeAccount struct {
 	calls, validations, rollbacks int
 	uid, gid                      int
@@ -164,8 +199,12 @@ func TestActivationFailuresPreserveValidStagedInstall(t *testing.T) {
 			ownership := newFakeOwnership()
 			services := &fakeServices{failAt: point}
 			o := Options{Version: testVersion, Commit: testCommit, AssetDir: assets, SHA256SUMSSHA256: anchor, Root: root, Arch: "amd64", Account: account, Ownership: ownership, Services: services, EnableNow: true, Random: strings.NewReader(strings.Repeat("a", 32) + strings.Repeat("b", 32))}
-			if err := Install(o); err == nil {
+			err := Install(o)
+			if err == nil {
 				t.Fatal("activation failure was not propagated")
+			}
+			if stage, ok := FailureStage(err); !ok || stage != "activation" {
+				t.Fatalf("activation failure stage = %q, %v", stage, ok)
 			}
 			secret := rooted(root, prefix+"/secrets/gate.env")
 			before, err := os.ReadFile(secret)
@@ -201,11 +240,17 @@ func TestFreshAccountRollsBackOnPrepublicationFailure(t *testing.T) {
 	if err == nil || created.rollbacks != 1 {
 		t.Fatalf("err=%v rollbacks=%d", err, created.rollbacks)
 	}
+	if stage, ok := FailureStage(err); !ok || stage != "staging" {
+		t.Fatalf("prepublication failure stage = %q, %v", stage, ok)
+	}
 	account2 := &fakeAccount{uid: 12346, gid: 12346}
 	created2 := &createdFakeAccount{fakeAccount: account2, rollbackErr: errors.New("injected rollback failure")}
 	err = Install(Options{Version: testVersion, Commit: testCommit, AssetDir: assets, SHA256SUMSSHA256: anchor, Root: t.TempDir(), Arch: "amd64", Account: created2, Ownership: failingOwnership{newFakeOwnership()}, Random: strings.NewReader(strings.Repeat("c", 32) + strings.Repeat("d", 32))})
 	if err == nil || !strings.Contains(err.Error(), "rollback failed") || created2.rollbacks != 1 {
 		t.Fatalf("rollback failure not surfaced: err=%v rollbacks=%d", err, created2.rollbacks)
+	}
+	if stage, ok := FailureStage(err); !ok || stage != "staging" {
+		t.Fatalf("rollback failure stage = %q, %v", stage, ok)
 	}
 }
 
@@ -541,8 +586,12 @@ func TestSameVersionRerunStrictlyValidatesReceipt(t *testing.T) {
 			}
 			receiptPath := rooted(root, prefix+"/install-receipt.json")
 			tc.mutate(receiptPath)
-			if err := Install(o); err == nil {
+			err := Install(o)
+			if err == nil {
 				t.Fatal("accepted tampered receipt")
+			}
+			if stage, ok := FailureStage(err); !ok || stage != "existing" {
+				t.Fatalf("tampered receipt stage = %q, %v", stage, ok)
 			}
 		})
 	}
