@@ -363,7 +363,10 @@ func TestConfiguredDuplicateLiveSlotIsRejected(t *testing.T) {
 	s, _, server := configuredGate(t)
 	submitConfiguredInput(t, server.URL, "work")
 	old := dialConfiguredSlot(t, server.URL, 0)
-	defer old.CloseNow()
+	t.Cleanup(func() {
+		old.CloseNow()
+		waitWorkerDisconnected(t, s, "worker-1")
+	})
 	lease := readMessage(t, old)
 	before, err := s.Worker("worker-1")
 	if err != nil {
