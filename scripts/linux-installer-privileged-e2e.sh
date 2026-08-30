@@ -7,10 +7,18 @@ umask 077
 
 STAGE=argument-validation
 TMP=
+BIND_MOUNT_ACTIVE=0
 finish() {
   rc=$?
   trap - EXIT
   set +e
+  if [ "$BIND_MOUNT_ACTIVE" -eq 1 ]; then
+    if /usr/bin/umount /opt/agent-forge/bin; then
+      BIND_MOUNT_ACTIVE=0
+    else
+      rc=1
+    fi
+  fi
   if [ "$rc" -ne 0 ]; then
     printf '::error title=Privileged Linux installer E2E::stage=%s exit=%s\n' "$STAGE" "$rc" >&2
     account_present=0
@@ -88,10 +96,10 @@ if [ -n "$OLD_VERSION$OLD_COMMIT$OLD_ASSET_DIR" ]; then
   }
 fi
 
-for tool in chmod cmp getent grep id journalctl mkfifo mktemp readlink rm sha256sum stat systemctl tar tr uname python3; do
+for tool in chmod cmp getent grep id journalctl mkfifo mktemp mount readlink rm runuser sha256sum stat systemctl tar tr umount uname wc python3; do
   command -v "$tool" >/dev/null 2>&1 || { echo "missing required tool: $tool" >&2; exit 1; }
 done
-for path in /usr/bin/chmod /usr/bin/cmp /usr/bin/getent /usr/bin/grep /usr/bin/id /usr/bin/journalctl /usr/bin/mkfifo /usr/bin/mktemp /usr/bin/readlink /usr/bin/rm /usr/bin/sha256sum /usr/bin/stat /usr/bin/systemctl /usr/bin/tar /usr/bin/tr /usr/bin/python3; do
+for path in /usr/bin/chmod /usr/bin/cmp /usr/bin/getent /usr/bin/grep /usr/bin/id /usr/bin/journalctl /usr/bin/mkfifo /usr/bin/mktemp /usr/bin/mount /usr/bin/readlink /usr/bin/rm /usr/sbin/runuser /usr/bin/sha256sum /usr/bin/stat /usr/bin/systemctl /usr/bin/tar /usr/bin/tr /usr/bin/umount /usr/bin/wc /usr/bin/python3; do
   [ -x "$path" ] || { echo "invalid privileged tool: $path" >&2; exit 1; }
 done
 /usr/bin/python3 "$DIAGNOSTICS" self-test
@@ -182,10 +190,12 @@ OLD_ANCHOR=
 if [ -n "$OLD_VERSION" ]; then
   OLD_CLI_ARCHIVE="agent-forge-cli_${OLD_VERSION}_linux_${ARCH}.tar.gz"
   [ -f "$OLD_ASSET_DIR/$OLD_CLI_ARCHIVE" ] && [ ! -L "$OLD_ASSET_DIR/$OLD_CLI_ARCHIVE" ] || { echo "missing old CLI archive" >&2; exit 1; }
-  (
-    cd "$OLD_ASSET_DIR"
-    sha256sum -c SHA256SUMS >/dev/null
-  )
+  for role in cli gate worker; do
+    old_archive="agent-forge-${role}_${OLD_VERSION}_linux_${ARCH}.tar.gz"
+    /usr/bin/grep -F "  $old_archive" "$OLD_ASSET_DIR/SHA256SUMS" >"$TMP/old-check"
+    [ "$(/usr/bin/wc -l <"$TMP/old-check")" -eq 1 ] || { echo "missing or duplicate old archive checksum" >&2; exit 1; }
+    (cd "$OLD_ASSET_DIR" && /usr/bin/sha256sum --check --strict "$TMP/old-check" >/dev/null)
+  done
   OLD_ANCHOR=$(sha256sum "$OLD_ASSET_DIR/SHA256SUMS")
   OLD_ANCHOR=${OLD_ANCHOR%% *}
   tar --extract --gzip --file "$OLD_ASSET_DIR/$OLD_CLI_ARCHIVE" --directory "$TMP" --no-same-owner --no-same-permissions
@@ -413,9 +423,25 @@ snapshot_upgrade_preserved_state() {
       /opt/agent-forge/var/worker/runtime; do
       stat -c '%n:%i:%a:%u:%g' "$path"
     done
-    if [ -e /opt/agent-forge/var/gate/state/forge.db ]; then
-      stat -c '%n:%i:%a:%u:%g' /opt/agent-forge/var/gate/state/forge.db
-    fi
+    stat -c '%n:%i:%a:%u:%g' /opt/agent-forge/var/gate/state/forge.db
+    /usr/sbin/runuser -u agent-forge -- /usr/bin/python3 - <<'PY'
+import sqlite3
+
+with sqlite3.connect("file:/opt/agent-forge/var/gate/state/forge.db?mode=ro", uri=True) as database:
+    marker = database.execute(
+        "SELECT value FROM privileged_e2e_marker WHERE name = ?", ("preserved",)
+    ).fetchone()
+if marker != ("agent-forge-privileged-e2e-v1",):
+    raise SystemExit("SQLite preservation marker mismatch")
+print("sqlite-marker:" + marker[0])
+PY
+    for path in \
+      /opt/agent-forge/var/repositories/.privileged-e2e-marker \
+      /opt/agent-forge/var/worker/worktrees/.privileged-e2e-marker \
+      /opt/agent-forge/var/worker/runtime/.privileged-e2e-marker; do
+      stat -c '%n:%i:%s:%a:%u:%g:%y' "$path"
+      sha256sum "$path"
+    done
   } >"$output"
 }
 
@@ -480,6 +506,84 @@ STAGE=initial-token-exposure
 assert_tokens_not_exposed
 
 if [ -n "$OLD_VERSION" ]; then
+  STAGE=bind-mount-topology-rejection
+  GATE_PID_BEFORE=$(systemctl show --property=MainPID --value agent-forge-gate.service)
+  WORKER_PID_BEFORE=$(systemctl show --property=MainPID --value agent-forge-worker.service)
+  GATE_INVOCATION_BEFORE=$(systemctl show --property=InvocationID --value agent-forge-gate.service)
+  WORKER_INVOCATION_BEFORE=$(systemctl show --property=InvocationID --value agent-forge-worker.service)
+  OLD_CLI_ID_BEFORE=$(/opt/agent-forge/bin/forge --version)
+  [ -n "$GATE_INVOCATION_BEFORE" ] && [ -n "$WORKER_INVOCATION_BEFORE" ]
+  [ "$OLD_CLI_ID_BEFORE" = "forge $OLD_VERSION $OLD_COMMIT" ]
+  /usr/bin/mount --bind /opt/agent-forge/bin /opt/agent-forge/bin
+  BIND_MOUNT_ACTIVE=1
+
+  bind_log="$TMP/bind-mount-upgrade.log"
+  bind_pipe="$TMP/bind-mount-upgrade.pipe"
+  /usr/bin/mkfifo "$bind_pipe"
+  /usr/bin/python3 "$DIAGNOSTICS" capture "$bind_pipe" "$bind_log" &
+  capture_pid=$!
+  if "$BOOTSTRAP" install \
+    --version "$VERSION" \
+    --commit "$COMMIT" \
+    --asset-dir "$ASSET_DIR" \
+    --sha256sums-sha256 "$ANCHOR" \
+    --upgrade --enable-now >"$bind_pipe" 2>&1; then
+    bind_upgrade_rc=0
+  else
+    bind_upgrade_rc=$?
+  fi
+  wait "$capture_pid"
+  /usr/bin/rm -f "$bind_pipe"
+  [ "$bind_upgrade_rc" -ne 0 ] || { echo "bind-mounted upgrade unexpectedly succeeded" >&2; exit 1; }
+  [ "$(/usr/bin/python3 "$DIAGNOSTICS" parse "$bind_log")" = publication ] || {
+    echo "bind-mounted upgrade did not fail during publication" >&2
+    exit 1
+  }
+  /usr/bin/python3 - "$bind_log" <<'PY'
+import sys
+
+with open(sys.argv[1], "rb") as handle:
+    output = handle.read(4097)
+if len(output) > 4096:
+    raise SystemExit("bind-mounted upgrade output exceeded bound")
+tokens = []
+for path in ("/opt/agent-forge/secrets/gate.env", "/opt/agent-forge/secrets/worker.env"):
+    with open(path, "rb") as handle:
+        tokens.extend(line.partition(b"=")[2].strip() for line in handle if b"=" in line)
+if any(token and token in output for token in tokens):
+    raise SystemExit("token appeared in bind-mounted upgrade output")
+PY
+  assert_active agent-forge-gate.service
+  assert_active agent-forge-worker.service
+  [ "$(systemctl show --property=MainPID --value agent-forge-gate.service)" = "$GATE_PID_BEFORE" ]
+  [ "$(systemctl show --property=MainPID --value agent-forge-worker.service)" = "$WORKER_PID_BEFORE" ]
+  [ "$(systemctl show --property=InvocationID --value agent-forge-gate.service)" = "$GATE_INVOCATION_BEFORE" ]
+  [ "$(systemctl show --property=InvocationID --value agent-forge-worker.service)" = "$WORKER_INVOCATION_BEFORE" ]
+  [ "$(/opt/agent-forge/bin/forge --version)" = "forge $OLD_VERSION $OLD_COMMIT" ]
+  [ ! -e /opt/.agent-forge.previous ] && [ ! -L /opt/.agent-forge.previous ]
+  /usr/bin/umount /opt/agent-forge/bin
+  BIND_MOUNT_ACTIVE=0
+
+  STAGE=seed-upgrade-preservation-markers
+  /usr/sbin/runuser -u agent-forge -- /usr/bin/python3 - <<'PY'
+import sqlite3
+from pathlib import Path
+
+with sqlite3.connect("/opt/agent-forge/var/gate/state/forge.db") as database:
+    database.execute(
+        "CREATE TABLE privileged_e2e_marker (name TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    database.execute(
+        "INSERT INTO privileged_e2e_marker VALUES (?, ?)",
+        ("preserved", "agent-forge-privileged-e2e-v1"),
+    )
+for path in (
+    "/opt/agent-forge/var/repositories/.privileged-e2e-marker",
+    "/opt/agent-forge/var/worker/worktrees/.privileged-e2e-marker",
+    "/opt/agent-forge/var/worker/runtime/.privileged-e2e-marker",
+):
+    Path(path).write_bytes(b"agent-forge-privileged-e2e-v1\n")
+PY
   UPGRADE_BEFORE="$TMP/upgrade-before"
   UPGRADE_AFTER="$TMP/upgrade-after"
   snapshot_upgrade_preserved_state "$UPGRADE_BEFORE"
@@ -514,13 +618,91 @@ EOF
   assert_tokens_not_exposed
   snapshot_upgrade_preserved_state "$UPGRADE_AFTER"
   cmp "$UPGRADE_BEFORE" "$UPGRADE_AFTER" || { echo "upgrade changed preserved state" >&2; exit 1; }
+
+  STAGE=explicit-rollback
+  /opt/agent-forge/bin/forge rollback >"$TMP/rollback-output" 2>&1
+  [ ! -s "$TMP/rollback-output" ] || { echo "rollback emitted unexpected output" >&2; exit 1; }
+  for component in forge forge-gate forge-worker forge-codex-plugin forge-ref-plugin; do
+    [ "$("/opt/agent-forge/bin/$component" --version)" = "$component $OLD_VERSION $OLD_COMMIT" ] || {
+      echo "rollback binary identity mismatch: $component" >&2
+      exit 1
+    }
+  done
+  /usr/bin/python3 - "$OLD_VERSION" "$OLD_COMMIT" "$VERSION" "$COMMIT" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+
+with open("/opt/agent-forge/install-receipt.json", "rb") as handle:
+    receipt = json.load(handle)
+if receipt.get("version") != sys.argv[1] or receipt.get("commit") != sys.argv[2]:
+    raise SystemExit("rollback receipt identity mismatch")
+
+slot = "/opt/.agent-forge.previous"
+with open(slot + "/install-receipt.json", "rb") as handle:
+    candidate = json.load(handle)
+if candidate.get("version") != sys.argv[3] or candidate.get("commit") != sys.argv[4]:
+    raise SystemExit("rollback slot identity mismatch")
+
+expected_entries = {
+    slot: {"bin", "systemd", "install-receipt.json"},
+    slot + "/bin": {"forge", "forge-gate", "forge-worker", "forge-codex-plugin", "forge-ref-plugin"},
+    slot + "/systemd": {"agent-forge-gate.service", "agent-forge-worker.service"},
+}
+for path, expected in expected_entries.items():
+    if set(os.listdir(path)) != expected:
+        raise SystemExit("rollback slot entry set mismatch")
+
+expected_modes = {
+    "": 0o700,
+    "bin": 0o755,
+    "systemd": 0o755,
+    "install-receipt.json": 0o400,
+    "bin/forge": 0o755,
+    "bin/forge-gate": 0o755,
+    "bin/forge-worker": 0o755,
+    "bin/forge-codex-plugin": 0o755,
+    "bin/forge-ref-plugin": 0o755,
+    "systemd/agent-forge-gate.service": 0o644,
+    "systemd/agent-forge-worker.service": 0o644,
+}
+for name, mode in expected_modes.items():
+    metadata = os.lstat(os.path.join(slot, name))
+    want_type = stat.S_IFDIR if name in ("", "bin", "systemd") else stat.S_IFREG
+    if stat.S_IFMT(metadata.st_mode) != want_type or stat.S_IMODE(metadata.st_mode) != mode or metadata.st_uid != 0 or metadata.st_gid != 0:
+        raise SystemExit("rollback slot metadata mismatch")
+
+release_files = set(expected_modes) - {"", "bin", "systemd", "install-receipt.json"}
+for name in release_files:
+    with open(os.path.join(slot, name), "rb") as handle:
+        digest = hashlib.file_digest(handle, "sha256").hexdigest()
+    if candidate.get("files", {}).get(name) != digest or candidate.get("modes", {}).get(name) != expected_modes[name]:
+        raise SystemExit("rollback slot receipt binding mismatch")
+for forbidden in ("etc", "secrets", "var"):
+    if os.path.lexists(os.path.join(slot, forbidden)):
+        raise SystemExit("rollback slot contains mutable state")
+PY
+  assert_active agent-forge-gate.service
+  assert_active agent-forge-worker.service
+  STAGE=rollback-authenticated-readiness
+  wait_worker
+  STAGE=rollback-token-exposure
+  assert_tokens_not_exposed
+  snapshot_upgrade_preserved_state "$UPGRADE_AFTER"
+  cmp "$UPGRADE_BEFORE" "$UPGRADE_AFTER" || { echo "rollback changed preserved state" >&2; exit 1; }
 fi
 
 BEFORE="$TMP/before"
 AFTER="$TMP/after"
 snapshot_validation_only_state "$BEFORE"
 STAGE=validation-only-rerun
-install_release "$BOOTSTRAP" "$VERSION" "$COMMIT" "$ASSET_DIR" "$ANCHOR" validate
+if [ -n "$OLD_VERSION" ]; then
+  install_release "$OLD_BOOTSTRAP" "$OLD_VERSION" "$OLD_COMMIT" "$OLD_ASSET_DIR" "$OLD_ANCHOR" validate
+else
+  install_release "$BOOTSTRAP" "$VERSION" "$COMMIT" "$ASSET_DIR" "$ANCHOR" validate
+fi
 snapshot_validation_only_state "$AFTER"
 cmp "$BEFORE" "$AFTER" || { echo "same-version rerun mutated installation or service state" >&2; exit 1; }
 
@@ -535,6 +717,10 @@ STAGE=restart-token-exposure
 assert_tokens_not_exposed
 
 STAGE=final-installed-identity
-[ "$(/opt/agent-forge/bin/forge --version)" = "forge $VERSION $COMMIT" ]
+if [ -n "$OLD_VERSION" ]; then
+  [ "$(/opt/agent-forge/bin/forge --version)" = "forge $OLD_VERSION $OLD_COMMIT" ]
+else
+  [ "$(/opt/agent-forge/bin/forge --version)" = "forge $VERSION $COMMIT" ]
+fi
 STAGE=complete
 echo "privileged Linux installer e2e: PASS"

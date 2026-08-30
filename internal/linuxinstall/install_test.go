@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	"agent-forge/internal/gate"
 	"agent-forge/internal/store"
 	"agent-forge/internal/worker"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -721,6 +723,853 @@ func TestUpgradePreservesConfigSecretsAndStateWhileReplacingExactBinaries(t *tes
 	same.Services = validationServices
 	if err := Install(same); err != nil || len(validationServices.calls) != 0 {
 		t.Fatalf("post-upgrade validation-only rerun: err=%v calls=%v", err, validationServices.calls)
+	}
+}
+
+func TestUpgradePersistsExactPreviousReleaseSlot(t *testing.T) {
+	services := &fakeServices{}
+	upgrade, installPath, before := preparedUpgrade(t, services)
+	if err := Install(upgrade); err != nil {
+		t.Fatal(err)
+	}
+	previous := filepath.Join(filepath.Dir(installPath), ".agent-forge.previous")
+	for _, name := range upgradeObjects {
+		got, err := os.ReadFile(filepath.Join(previous, name))
+		if err != nil || !bytes.Equal(got, before[name]) {
+			t.Fatalf("previous slot object %s differs: %v", name, err)
+		}
+	}
+	for _, name := range []string{"etc", "secrets", "var"} {
+		if pathExists(filepath.Join(previous, name)) {
+			t.Fatalf("previous slot contains mutable path %s", name)
+		}
+	}
+}
+
+func TestSecondUpgradeRotatesSlotToImmediatePreviousRelease(t *testing.T) {
+	upgrade, installPath, _ := preparedUpgrade(t, &fakeServices{})
+	if err := Install(upgrade); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]byte{}
+	for _, name := range upgradeObjects {
+		want[name] = []byte(read(t, filepath.Join(installPath, name)))
+	}
+	version := "v1.2.5"
+	commit := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	assets, anchor := releaseFixtureFor(t, version, commit, nil)
+	upgrade.Version, upgrade.Commit = version, commit
+	upgrade.InstallerVersion, upgrade.InstallerCommit = version, commit
+	upgrade.AssetDir, upgrade.SHA256SUMSSHA256 = assets, anchor
+	if err := Install(upgrade); err != nil {
+		t.Fatal(err)
+	}
+	previous := filepath.Join(filepath.Dir(installPath), previousSlotName)
+	for _, name := range upgradeObjects {
+		got, err := os.ReadFile(filepath.Join(previous, name))
+		if err != nil || !bytes.Equal(got, want[name]) {
+			t.Fatalf("rotated slot object %s differs: %v", name, err)
+		}
+	}
+}
+
+func TestSameFilesystemFailsClosedWhenEndpointIsMissing(t *testing.T) {
+	existing := t.TempDir()
+	missing := filepath.Join(t.TempDir(), "missing")
+	for _, paths := range [][2]string{{missing, existing}, {existing, missing}} {
+		if sameFilesystem(paths[0], paths[1]) {
+			t.Fatalf("sameFilesystem(%q, %q) = true", paths[0], paths[1])
+		}
+	}
+}
+
+func TestSameFilesystemRequiresEqualMountAndDeviceIdentity(t *testing.T) {
+	tests := []struct {
+		name  string
+		a, b  unix.Statx_t
+		errAt int
+		want  bool
+	}{
+		{
+			name: "same device different mount",
+			a:    unix.Statx_t{Mask: unix.STATX_MNT_ID, Dev_major: 8, Dev_minor: 1, Mnt_id: 10},
+			b:    unix.Statx_t{Mask: unix.STATX_MNT_ID, Dev_major: 8, Dev_minor: 1, Mnt_id: 11},
+		},
+		{
+			name: "missing mount ID",
+			a:    unix.Statx_t{Mask: unix.STATX_MNT_ID, Dev_major: 8, Dev_minor: 1, Mnt_id: 10},
+			b:    unix.Statx_t{Dev_major: 8, Dev_minor: 1, Mnt_id: 10},
+		},
+		{
+			name: "same mount different device",
+			a:    unix.Statx_t{Mask: unix.STATX_MNT_ID, Dev_major: 8, Dev_minor: 1, Mnt_id: 10},
+			b:    unix.Statx_t{Mask: unix.STATX_MNT_ID, Dev_major: 8, Dev_minor: 2, Mnt_id: 10},
+		},
+		{
+			name:  "statx error",
+			a:     unix.Statx_t{Mask: unix.STATX_MNT_ID, Dev_major: 8, Dev_minor: 1, Mnt_id: 10},
+			b:     unix.Statx_t{Mask: unix.STATX_MNT_ID, Dev_major: 8, Dev_minor: 1, Mnt_id: 10},
+			errAt: 2,
+		},
+		{
+			name: "equal mount and device",
+			a:    unix.Statx_t{Mask: unix.STATX_MNT_ID, Dev_major: 8, Dev_minor: 1, Mnt_id: 10},
+			b:    unix.Statx_t{Mask: unix.STATX_MNT_ID, Dev_major: 8, Dev_minor: 1, Mnt_id: 10},
+			want: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			previousStatx := statx
+			t.Cleanup(func() { statx = previousStatx })
+			calls := 0
+			statx = func(_ int, _ string, flags int, mask int, result *unix.Statx_t) error {
+				calls++
+				if flags != unix.AT_SYMLINK_NOFOLLOW || mask&unix.STATX_MNT_ID == 0 {
+					t.Fatalf("statx flags=%#x mask=%#x", flags, mask)
+				}
+				if calls == test.errAt {
+					return errors.New("statx failed")
+				}
+				if calls == 1 {
+					*result = test.a
+				} else {
+					*result = test.b
+				}
+				return nil
+			}
+			if got := sameFilesystem("a", "b"); got != test.want {
+				t.Fatalf("sameFilesystem() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRollbackAndSecondUpgradeRejectCrossFilesystemObjectBeforeMutation(t *testing.T) {
+	for _, operation := range []string{"rollback", "upgrade"} {
+		t.Run(operation, func(t *testing.T) {
+			upgrade, installPath, _ := preparedUpgrade(t, &fakeServices{})
+			if err := Install(upgrade); err != nil {
+				t.Fatal(err)
+			}
+			previousPath := filepath.Join(filepath.Dir(installPath), previousSlotName)
+			currentBefore, slotBefore := map[string][]byte{}, map[string][]byte{}
+			for _, name := range upgradeObjects {
+				currentBefore[name] = []byte(read(t, filepath.Join(installPath, name)))
+				slotBefore[name] = []byte(read(t, filepath.Join(previousPath, name)))
+			}
+
+			previousSameFilesystem := sameFilesystem
+			t.Cleanup(func() { sameFilesystem = previousSameFilesystem })
+			crossCurrent := filepath.Join(installPath, "bin/forge")
+			crossSlot := filepath.Join(previousPath, "bin/forge")
+			sameFilesystem = func(a, b string) bool {
+				return a != crossCurrent || b != crossSlot
+			}
+
+			services := &fakeServices{}
+			var err error
+			if operation == "rollback" {
+				err = Rollback(RollbackOptions{Version: upgrade.Version, Commit: upgrade.Commit, Root: upgrade.Root, Arch: upgrade.Arch, Account: upgrade.Account, Ownership: upgrade.Ownership, Services: services})
+			} else {
+				version, commit := "v1.2.5", strings.Repeat("a", 40)
+				assets, anchor := releaseFixtureFor(t, version, commit, nil)
+				upgrade.Version, upgrade.Commit = version, commit
+				upgrade.InstallerVersion, upgrade.InstallerCommit = version, commit
+				upgrade.AssetDir, upgrade.SHA256SUMSSHA256, upgrade.Services = assets, anchor, services
+				err = Install(upgrade)
+			}
+			if err == nil {
+				t.Fatal("accepted cross-filesystem release object")
+			}
+			assertInstalledBytes(t, installPath, currentBefore)
+			assertInstalledBytes(t, previousPath, slotBefore)
+			if len(services.calls) != 0 {
+				t.Fatalf("services mutated before rejection: %v", services.calls)
+			}
+		})
+	}
+}
+
+func TestUpgradeRejectsActualCrossFilesystemRenameTopologyBeforeMutation(t *testing.T) {
+	for _, existingSlot := range []bool{false, true} {
+		for _, incompatible := range []string{"current-to-backup", "candidate-to-current"} {
+			t.Run(fmt.Sprintf("existing=%t/%s", existingSlot, incompatible), func(t *testing.T) {
+				services := &fakeServices{}
+				upgrade, installPath, currentBefore := preparedUpgrade(t, services)
+				previousPath := filepath.Join(filepath.Dir(installPath), previousSlotName)
+				var slotBefore map[string][]byte
+				if existingSlot {
+					if err := Install(upgrade); err != nil {
+						t.Fatal(err)
+					}
+					currentBefore, slotBefore = map[string][]byte{}, map[string][]byte{}
+					for _, name := range upgradeObjects {
+						currentBefore[name] = []byte(read(t, filepath.Join(installPath, name)))
+						slotBefore[name] = []byte(read(t, filepath.Join(previousPath, name)))
+					}
+					version, commit := "v1.2.5", strings.Repeat("a", 40)
+					assets, anchor := releaseFixtureFor(t, version, commit, nil)
+					upgrade.Version, upgrade.Commit = version, commit
+					upgrade.InstallerVersion, upgrade.InstallerCommit = version, commit
+					upgrade.AssetDir, upgrade.SHA256SUMSSHA256 = assets, anchor
+				}
+				services.calls = nil
+				previousSameFilesystem := sameFilesystem
+				t.Cleanup(func() { sameFilesystem = previousSameFilesystem })
+				sameFilesystem = func(a, b string) bool {
+					switch incompatible {
+					case "current-to-backup":
+						return a != filepath.Join(installPath, "bin/forge") || !strings.Contains(b, ".agent-forge.rollback-") || filepath.Base(b) != "bin"
+					case "candidate-to-current":
+						return !strings.Contains(a, ".agent-forge.upgrade-") || !strings.HasSuffix(a, "systemd/agent-forge-gate.service") || b != filepath.Join(installPath, "systemd")
+					}
+					return true
+				}
+
+				err := Install(upgrade)
+				if err == nil || err.Error() != "upgrade rename topology crosses filesystems" {
+					t.Fatalf("upgrade error = %v", err)
+				}
+				assertInstalledBytes(t, installPath, currentBefore)
+				if existingSlot {
+					assertInstalledBytes(t, previousPath, slotBefore)
+				} else if pathExists(previousPath) {
+					t.Fatal("rejected first upgrade published a previous slot")
+				}
+				if len(services.calls) != 0 {
+					t.Fatalf("services mutated before rejection: %v", services.calls)
+				}
+			})
+		}
+	}
+}
+
+func TestRollbackActivatesExactOlderReleaseAndPreservesMutableState(t *testing.T) {
+	upgrade, installPath, old := preparedUpgrade(t, &fakeServices{})
+	if err := Install(upgrade); err != nil {
+		t.Fatal(err)
+	}
+	newer := map[string][]byte{}
+	for _, name := range upgradeObjects {
+		newer[name] = []byte(read(t, filepath.Join(installPath, name)))
+	}
+	mutable := filepath.Join(installPath, "var/gate/state/forge.db")
+	if err := os.WriteFile(mutable, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	services := &fakeServices{}
+	err := Rollback(RollbackOptions{Version: upgrade.Version, Commit: upgrade.Commit, Root: upgrade.Root, Arch: upgrade.Arch, Account: upgrade.Account, Ownership: upgrade.Ownership, Services: services})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertInstalledBytes(t, installPath, old)
+	previous := filepath.Join(filepath.Dir(installPath), previousSlotName)
+	for _, name := range upgradeObjects {
+		got, readErr := os.ReadFile(filepath.Join(previous, name))
+		if readErr != nil || !bytes.Equal(got, newer[name]) {
+			t.Fatalf("newer slot object %s differs: %v", name, readErr)
+		}
+	}
+	if got := read(t, mutable); got != "unchanged" {
+		t.Fatalf("mutable state changed: %q", got)
+	}
+	gotCalls := make([]string, len(services.calls))
+	for i := range services.calls {
+		gotCalls[i] = strings.Join(services.calls[i], " ")
+	}
+	wantCalls := []string{"stop agent-forge-worker.service", "stop agent-forge-gate.service", "daemon-reload", "enable --now agent-forge-gate.service", "gate-ready", "enable --now agent-forge-worker.service", "worker-ready"}
+	if strings.Join(gotCalls, "|") != strings.Join(wantCalls, "|") {
+		t.Fatalf("rollback service order = %v", gotCalls)
+	}
+}
+
+func TestRollbackValidationDoesNotExecuteInstalledOrInactiveBinaries(t *testing.T) {
+	for _, location := range []string{"current", "previous"} {
+		t.Run(location, func(t *testing.T) {
+			upgrade, installPath, _ := preparedUpgrade(t, &fakeServices{})
+			if err := Install(upgrade); err != nil {
+				t.Fatal(err)
+			}
+			base := installPath
+			if location == "previous" {
+				base = filepath.Join(filepath.Dir(installPath), previousSlotName)
+			}
+			receiptPath := filepath.Join(base, "install-receipt.json")
+			var r receipt
+			if err := json.Unmarshal([]byte(read(t, receiptPath)), &r); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(upgrade.Root, "executed-"+location)
+			binary := []byte(fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then : > %q; fi\nprintf 'forge %s %s\\n'\n", marker, r.Version, r.Commit))
+			if err := os.WriteFile(filepath.Join(base, "bin/forge"), binary, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			r.Files["bin/forge"] = hashBytes(binary)
+			body, _ := json.MarshalIndent(r, "", "  ")
+			rewriteReceiptForTest(t, receiptPath, append(body, '\n'))
+			services := &fakeServices{}
+			if err := Rollback(RollbackOptions{Version: upgrade.Version, Commit: upgrade.Commit, Root: upgrade.Root, Arch: upgrade.Arch, Account: upgrade.Account, Ownership: upgrade.Ownership, Services: services}); err != nil {
+				t.Fatal(err)
+			}
+			if pathExists(marker) {
+				t.Fatal("rollback validation executed a receipt-matched binary")
+			}
+		})
+	}
+}
+
+func TestRollbackRejectsSymlinkInstallRootBeforeMutation(t *testing.T) {
+	upgrade, installPath, _ := preparedUpgrade(t, &fakeServices{})
+	if err := Install(upgrade); err != nil {
+		t.Fatal(err)
+	}
+	realPath := installPath + ".real"
+	if err := os.Rename(installPath, realPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Base(realPath), installPath); err != nil {
+		t.Fatal(err)
+	}
+	services := &fakeServices{}
+	err := Rollback(RollbackOptions{Version: upgrade.Version, Commit: upgrade.Commit, Root: upgrade.Root, Arch: upgrade.Arch, Account: upgrade.Account, Ownership: upgrade.Ownership, Services: services})
+	if err == nil {
+		t.Fatal("accepted symlink install root")
+	}
+	if len(services.calls) != 0 {
+		t.Fatalf("services mutated before rejection: %v", services.calls)
+	}
+}
+
+func TestRollbackRejectsMalformedSlotReceiptBeforeMutation(t *testing.T) {
+	upgrade, installPath, _ := preparedUpgrade(t, &fakeServices{})
+	if err := Install(upgrade); err != nil {
+		t.Fatal(err)
+	}
+	current := map[string][]byte{}
+	for _, name := range upgradeObjects {
+		current[name] = []byte(read(t, filepath.Join(installPath, name)))
+	}
+	receiptPath := filepath.Join(filepath.Dir(installPath), previousSlotName, "install-receipt.json")
+	var slotReceipt receipt
+	if err := json.Unmarshal([]byte(read(t, receiptPath)), &slotReceipt); err != nil {
+		t.Fatal(err)
+	}
+	for name := range slotReceipt.ArchiveSHA256 {
+		slotReceipt.ArchiveSHA256[name] = "invalid"
+		break
+	}
+	body, _ := json.MarshalIndent(slotReceipt, "", "  ")
+	body = append(body, '\n')
+	if err := os.Chmod(receiptPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(receiptPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(receiptPath, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	services := &fakeServices{}
+	err := Rollback(RollbackOptions{Version: upgrade.Version, Commit: upgrade.Commit, Root: upgrade.Root, Arch: upgrade.Arch, Account: upgrade.Account, Ownership: upgrade.Ownership, Services: services})
+	if err == nil {
+		t.Fatal("accepted malformed slot receipt")
+	}
+	assertInstalledBytes(t, installPath, current)
+	if len(services.calls) != 0 {
+		t.Fatalf("services mutated before rejection: %v", services.calls)
+	}
+}
+
+func TestRollbackRejectsPreservedMutableReceiptBindingMismatchBeforeMutation(t *testing.T) {
+	tests := map[string]func(*receipt){
+		"owner token":  func(r *receipt) { r.OwnerTokenSHA256 = strings.Repeat("f", 64) },
+		"worker token": func(r *receipt) { r.WorkerTokenSHA256 = strings.Repeat("f", 64) },
+	}
+	for _, name := range []string{"etc/gate.json", "etc/worker.json", "secrets/gate.env", "secrets/worker.env"} {
+		name := name
+		tests["file "+name] = func(r *receipt) { r.Files[name] = strings.Repeat("f", 64) }
+		tests["mode "+name] = func(r *receipt) { r.Modes[name] ^= 1 }
+	}
+	for name, tamper := range tests {
+		t.Run(name, func(t *testing.T) {
+			upgrade, installPath, _ := preparedUpgrade(t, &fakeServices{})
+			if err := Install(upgrade); err != nil {
+				t.Fatal(err)
+			}
+			current := map[string][]byte{}
+			for _, object := range upgradeObjects {
+				current[object] = []byte(read(t, filepath.Join(installPath, object)))
+			}
+			receiptPath := filepath.Join(filepath.Dir(installPath), previousSlotName, "install-receipt.json")
+			var target receipt
+			if err := json.Unmarshal([]byte(read(t, receiptPath)), &target); err != nil {
+				t.Fatal(err)
+			}
+			tamper(&target)
+			body, _ := json.MarshalIndent(target, "", "  ")
+			rewriteReceiptForTest(t, receiptPath, append(body, '\n'))
+			services := &fakeServices{}
+			err := Rollback(RollbackOptions{Version: upgrade.Version, Commit: upgrade.Commit, Root: upgrade.Root, Arch: upgrade.Arch, Account: upgrade.Account, Ownership: upgrade.Ownership, Services: services})
+			if err == nil {
+				t.Fatal("accepted target receipt mismatch for preserved mutable object")
+			}
+			assertInstalledBytes(t, installPath, current)
+			if len(services.calls) != 0 {
+				t.Fatalf("services mutated before rejection: %v", services.calls)
+			}
+		})
+	}
+}
+
+func TestUpgradeRejectsTamperedExistingSlotBeforeMutation(t *testing.T) {
+	upgrade, installPath, _ := preparedUpgrade(t, &fakeServices{})
+	if err := Install(upgrade); err != nil {
+		t.Fatal(err)
+	}
+	current := map[string][]byte{}
+	for _, name := range upgradeObjects {
+		current[name] = []byte(read(t, filepath.Join(installPath, name)))
+	}
+	previousBinary := filepath.Join(filepath.Dir(installPath), previousSlotName, "bin/forge")
+	if err := os.Chmod(previousBinary, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	version := "v1.2.5"
+	commit := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	assets, anchor := releaseFixtureFor(t, version, commit, nil)
+	services := &fakeServices{}
+	upgrade.Version, upgrade.Commit = version, commit
+	upgrade.InstallerVersion, upgrade.InstallerCommit = version, commit
+	upgrade.AssetDir, upgrade.SHA256SUMSSHA256, upgrade.Services = assets, anchor, services
+	if err := Install(upgrade); err == nil {
+		t.Fatal("accepted tampered existing slot")
+	}
+	assertInstalledBytes(t, installPath, current)
+	if len(services.calls) != 0 {
+		t.Fatalf("services mutated before rejection: %v", services.calls)
+	}
+}
+
+func TestUpgradeRejectsAmbiguousTransactionMaterialBeforeMutation(t *testing.T) {
+	for _, name := range []string{".agent-forge.upgrade-stale", ".agent-forge.rollback-stale", ".agent-forge.rollback-recovery"} {
+		t.Run(name, func(t *testing.T) {
+			upgrade, installPath, _ := preparedUpgrade(t, &fakeServices{})
+			if err := Install(upgrade); err != nil {
+				t.Fatal(err)
+			}
+			current := map[string][]byte{}
+			previous := filepath.Join(filepath.Dir(installPath), previousSlotName)
+			slot := map[string][]byte{}
+			for _, object := range upgradeObjects {
+				current[object] = []byte(read(t, filepath.Join(installPath, object)))
+				slot[object] = []byte(read(t, filepath.Join(previous, object)))
+			}
+			if err := os.WriteFile(filepath.Join(filepath.Dir(installPath), name), []byte("stale"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			version, commit := "v1.2.5", strings.Repeat("a", 40)
+			assets, anchor := releaseFixtureFor(t, version, commit, nil)
+			services := &fakeServices{}
+			upgrade.Version, upgrade.Commit = version, commit
+			upgrade.InstallerVersion, upgrade.InstallerCommit = version, commit
+			upgrade.AssetDir, upgrade.SHA256SUMSSHA256, upgrade.Services = assets, anchor, services
+			if err := Install(upgrade); err == nil {
+				t.Fatal("accepted ambiguous transaction material")
+			}
+			assertInstalledBytes(t, installPath, current)
+			assertInstalledBytes(t, previous, slot)
+			if len(services.calls) != 0 {
+				t.Fatalf("services mutated before rejection: %v", services.calls)
+			}
+		})
+	}
+}
+
+func TestRollbackRestorationExchangeFailureRetainsRecoveryMaterial(t *testing.T) {
+	upgrade, installPath, _ := preparedUpgrade(t, &fakeServices{})
+	if err := Install(upgrade); err != nil {
+		t.Fatal(err)
+	}
+	previousExchange := exchangeUpgrade
+	t.Cleanup(func() { exchangeUpgrade = previousExchange })
+	calls := 0
+	exchangeUpgrade = func(a, b string) error {
+		calls++
+		if calls == len(upgradeObjects)+1 {
+			return errors.New("injected restoration exchange failure")
+		}
+		return previousExchange(a, b)
+	}
+	services := &fakeServices{failAt: "worker-ready", failOnce: true}
+	err := Rollback(RollbackOptions{Version: upgrade.Version, Commit: upgrade.Commit, Root: upgrade.Root, Arch: upgrade.Arch, Account: upgrade.Account, Ownership: upgrade.Ownership, Services: services})
+	if err == nil || !strings.Contains(err.Error(), "rollback recovery failed") {
+		t.Fatalf("restoration failure not surfaced: %v", err)
+	}
+	recovery := filepath.Join(filepath.Dir(installPath), ".agent-forge.rollback-recovery")
+	info, statErr := os.Lstat(recovery)
+	if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		t.Fatalf("exact recovery material missing: info=%v err=%v", info, statErr)
+	}
+}
+
+func TestRollbackRejectsUnavailableOrIncompatibleTargetReadOnly(t *testing.T) {
+	for _, name := range []string{"no-slot", "newer-after-first-rollback", "equal-target", "schema", "architecture", "account", "run-as-root", "cli-identity"} {
+		t.Run(name, func(t *testing.T) {
+			upgrade, installPath, _ := preparedUpgrade(t, &fakeServices{})
+			if err := Install(upgrade); err != nil {
+				t.Fatal(err)
+			}
+			previous := filepath.Join(filepath.Dir(installPath), previousSlotName)
+			options := RollbackOptions{Version: upgrade.Version, Commit: upgrade.Commit, Root: upgrade.Root, Arch: upgrade.Arch, Account: upgrade.Account, Ownership: upgrade.Ownership, Services: &fakeServices{}}
+			if name == "newer-after-first-rollback" {
+				if err := Rollback(options); err != nil {
+					t.Fatal(err)
+				}
+				options.Version, options.Commit = testVersion, testCommit
+				options.Services = &fakeServices{}
+			} else if name == "no-slot" {
+				if err := os.Rename(previous, previous+".absent"); err != nil {
+					t.Fatal(err)
+				}
+			} else if name == "cli-identity" {
+				options.Commit = strings.Repeat("f", 40)
+			} else if name == "equal-target" {
+				for _, object := range upgradeObjects {
+					target := filepath.Join(previous, object)
+					if err := os.Chmod(target, 0o600); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(target, []byte(read(t, filepath.Join(installPath, object))), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					mode := immutableModes()[object]
+					if object == "install-receipt.json" {
+						mode = 0o400
+					}
+					if err := os.Chmod(target, fs.FileMode(mode)); err != nil {
+						t.Fatal(err)
+					}
+				}
+			} else {
+				receiptPath := filepath.Join(previous, "install-receipt.json")
+				var r receipt
+				if err := json.Unmarshal([]byte(read(t, receiptPath)), &r); err != nil {
+					t.Fatal(err)
+				}
+				switch name {
+				case "schema":
+					r.StoreSchemaVersion--
+				case "architecture":
+					r.Architecture = "arm64"
+				case "account":
+					r.AccountUID++
+				case "run-as-root":
+					r.RunAsRoot = !r.RunAsRoot
+				}
+				body, _ := json.MarshalIndent(r, "", "  ")
+				if err := os.Chmod(receiptPath, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(receiptPath, append(body, '\n'), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(receiptPath, 0o400); err != nil {
+					t.Fatal(err)
+				}
+			}
+			currentBefore := map[string][]byte{}
+			for _, object := range upgradeObjects {
+				currentBefore[object] = []byte(read(t, filepath.Join(installPath, object)))
+			}
+			services := options.Services.(*fakeServices)
+			if err := Rollback(options); err == nil {
+				t.Fatal("accepted unavailable or incompatible target")
+			}
+			assertInstalledBytes(t, installPath, currentBefore)
+			if len(services.calls) != 0 {
+				t.Fatalf("services mutated before rejection: %v", services.calls)
+			}
+		})
+	}
+}
+
+func TestRollbackPublicationAndServiceFailuresRestoreBothReleases(t *testing.T) {
+	for _, point := range append(append([]string(nil), upgradeObjects...), "stop agent-forge-worker.service", "stop agent-forge-gate.service", "daemon-reload", "enable --now agent-forge-gate.service", "gate-ready", "enable --now agent-forge-worker.service", "worker-ready") {
+		t.Run(strings.ReplaceAll(point, "/", "_"), func(t *testing.T) {
+			upgrade, installPath, _ := preparedUpgrade(t, &fakeServices{})
+			if err := Install(upgrade); err != nil {
+				t.Fatal(err)
+			}
+			previous := filepath.Join(filepath.Dir(installPath), previousSlotName)
+			currentBefore, slotBefore := map[string][]byte{}, map[string][]byte{}
+			for _, object := range upgradeObjects {
+				currentBefore[object] = []byte(read(t, filepath.Join(installPath, object)))
+				slotBefore[object] = []byte(read(t, filepath.Join(previous, object)))
+			}
+			services := &fakeServices{}
+			previousExchange := exchangeUpgrade
+			if strings.Contains(point, "/") || point == "install-receipt.json" {
+				failed := false
+				exchangeUpgrade = func(a, b string) error {
+					if !failed && a == filepath.Join(installPath, point) {
+						failed = true
+						return errors.New("injected publication failure")
+					}
+					return previousExchange(a, b)
+				}
+			} else {
+				services.failAt, services.failOnce = point, true
+			}
+			t.Cleanup(func() { exchangeUpgrade = previousExchange })
+			err := Rollback(RollbackOptions{Version: upgrade.Version, Commit: upgrade.Commit, Root: upgrade.Root, Arch: upgrade.Arch, Account: upgrade.Account, Ownership: upgrade.Ownership, Services: services})
+			if err == nil {
+				t.Fatal("injected failure returned success")
+			}
+			assertInstalledBytes(t, installPath, currentBefore)
+			assertInstalledBytes(t, previous, slotBefore)
+			if services.ready < 2 {
+				t.Fatalf("original release was not re-proved: %v", services.calls)
+			}
+		})
+	}
+}
+
+func TestRollbackLockIsHeldThroughRecovery(t *testing.T) {
+	upgrade, _, _ := preparedUpgrade(t, &fakeServices{})
+	if err := Install(upgrade); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	services := &fakeServices{failAt: "worker-ready", failOnce: true, blockWorkerReadyCall: 2, workerReadyEntered: entered, workerReadyRelease: release}
+	options := RollbackOptions{Version: upgrade.Version, Commit: upgrade.Commit, Root: upgrade.Root, Arch: upgrade.Arch, Account: upgrade.Account, Ownership: upgrade.Ownership, Services: services}
+	done := make(chan error, 1)
+	go func() { done <- Rollback(options) }()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("rollback recovery did not reach original Worker proof")
+	}
+	concurrent := options
+	concurrent.Services = &fakeServices{}
+	if err := Rollback(concurrent); err == nil || !strings.Contains(err.Error(), "another installer transaction is active") {
+		close(release)
+		t.Fatalf("concurrent rollback error = %v", err)
+	}
+	close(release)
+	if err := <-done; err == nil {
+		t.Fatal("failed target rollback returned success")
+	}
+}
+
+func TestUpgradeSlotPromotionFailuresRestoreCurrentAndExistingSlot(t *testing.T) {
+	for _, existingSlot := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing=%t", existingSlot), func(t *testing.T) {
+			upgrade, installPath, oldCurrent := preparedUpgrade(t, &fakeServices{})
+			var oldSlot map[string][]byte
+			if existingSlot {
+				if err := Install(upgrade); err != nil {
+					t.Fatal(err)
+				}
+				oldCurrent = map[string][]byte{}
+				for _, object := range upgradeObjects {
+					oldCurrent[object] = []byte(read(t, filepath.Join(installPath, object)))
+				}
+				previous := filepath.Join(filepath.Dir(installPath), previousSlotName)
+				oldSlot = map[string][]byte{}
+				for _, object := range upgradeObjects {
+					oldSlot[object] = []byte(read(t, filepath.Join(previous, object)))
+				}
+				version, commit := "v1.2.5", strings.Repeat("a", 40)
+				assets, anchor := releaseFixtureFor(t, version, commit, nil)
+				upgrade.Version, upgrade.Commit = version, commit
+				upgrade.InstallerVersion, upgrade.InstallerCommit = version, commit
+				upgrade.AssetDir, upgrade.SHA256SUMSSHA256 = assets, anchor
+			}
+			previousPromote, previousExchange := promoteAbsentUpgrade, exchangeUpgrade
+			t.Cleanup(func() { promoteAbsentUpgrade, exchangeUpgrade = previousPromote, previousExchange })
+			failed := false
+			if existingSlot {
+				exchangeUpgrade = func(a, b string) error {
+					if !failed && strings.Contains(a, ".agent-forge.rollback-") && strings.HasSuffix(b, previousSlotName) {
+						failed = true
+						return errors.New("injected slot exchange failure")
+					}
+					return previousExchange(a, b)
+				}
+			} else {
+				promoteAbsentUpgrade = func(a, b string) error {
+					if !failed && strings.Contains(a, ".agent-forge.rollback-") && strings.HasSuffix(b, previousSlotName) {
+						failed = true
+						return errors.New("injected slot rename failure")
+					}
+					return previousPromote(a, b)
+				}
+			}
+			if err := Install(upgrade); err == nil || !failed {
+				t.Fatalf("promotion failure not surfaced: %v", err)
+			}
+			assertInstalledBytes(t, installPath, oldCurrent)
+			previous := filepath.Join(filepath.Dir(installPath), previousSlotName)
+			if existingSlot {
+				assertInstalledBytes(t, previous, oldSlot)
+			} else if pathExists(previous) {
+				t.Fatal("failed first promotion created a previous slot")
+			}
+		})
+	}
+}
+
+func TestFirstUpgradeSlotPromotionDoesNotReplaceRacedTarget(t *testing.T) {
+	services := &fakeServices{}
+	upgrade, installPath, oldCurrent := preparedUpgrade(t, services)
+	previous := filepath.Join(filepath.Dir(installPath), previousSlotName)
+	previousPromote := promoteAbsentUpgrade
+	t.Cleanup(func() { promoteAbsentUpgrade = previousPromote })
+	raced := false
+	promoteAbsentUpgrade = func(from, to string) error {
+		raced = true
+		if err := os.Mkdir(to, 0o700); err != nil {
+			return err
+		}
+		return previousPromote(from, to)
+	}
+
+	err := Install(upgrade)
+	if err == nil || !raced {
+		t.Fatalf("raced first promotion succeeded: err=%v raced=%t", err, raced)
+	}
+	assertInstalledBytes(t, installPath, oldCurrent)
+	entries, readErr := os.ReadDir(previous)
+	if readErr != nil || len(entries) != 0 {
+		t.Fatalf("raced target was overwritten: entries=%v err=%v", entries, readErr)
+	}
+	if services.ready < 2 {
+		t.Fatalf("original release was not re-proved: %v", services.calls)
+	}
+}
+
+func TestPreviousSlotExplicitRollbackSchemaBridge(t *testing.T) {
+	for _, test := range []struct {
+		name                string
+		version, commit     string
+		storeSchemaVersion  int
+		includeSchemaMarker bool
+		wantAccepted        bool
+	}{
+		{"canonical marker-less v0.1.3", legacyInstallerVersion, legacyInstallerCommit, 0, false, true},
+		{"explicit zero marker", legacyInstallerVersion, legacyInstallerCommit, 0, true, false},
+		{"other marker-less identity", testVersion, testCommit, 0, false, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			upgrade, installPath, _ := preparedUpgrade(t, &fakeServices{})
+			if err := Install(upgrade); err != nil {
+				t.Fatal(err)
+			}
+			current, err := inspectExistingInstall(installPath, upgrade)
+			if err != nil {
+				t.Fatal(err)
+			}
+			previous := filepath.Join(filepath.Dir(installPath), previousSlotName)
+			receiptPath := filepath.Join(previous, "install-receipt.json")
+			var target map[string]any
+			if err := json.Unmarshal([]byte(read(t, receiptPath)), &target); err != nil {
+				t.Fatal(err)
+			}
+			target["version"], target["commit"] = test.version, test.commit
+			target["store_schema_version"] = test.storeSchemaVersion
+			if !test.includeSchemaMarker {
+				delete(target, "store_schema_version")
+			}
+			archives := target["archive_sha256"].(map[string]any)
+			for name, digest := range archives {
+				delete(archives, name)
+				role := strings.Split(strings.TrimPrefix(name, "agent-forge-"), "_")[0]
+				archives["agent-forge-"+role+"_"+test.version+"_linux_amd64.tar.gz"] = digest
+			}
+			body, err := json.MarshalIndent(target, "", "  ")
+			if err != nil {
+				t.Fatal(err)
+			}
+			rewriteReceiptForTest(t, receiptPath, append(body, '\n'))
+			before := []byte(read(t, receiptPath))
+
+			_, err = inspectPreviousSlot(previous, upgrade, current)
+			if (err == nil) != test.wantAccepted {
+				t.Fatalf("accepted=%t want %t: %v", err == nil, test.wantAccepted, err)
+			}
+			if got := []byte(read(t, receiptPath)); !bytes.Equal(got, before) {
+				t.Fatal("schema validation mutated target slot")
+			}
+		})
+	}
+}
+
+func TestRollbackRejectsUnsafeSlotObjectsAndAmbiguousRecoveryBeforeMutation(t *testing.T) {
+	for _, name := range []string{"symlink", "non-regular", "hardlink", "owner", "mode", "digest", "slot-symlink", "ambiguous-recovery"} {
+		t.Run(name, func(t *testing.T) {
+			upgrade, installPath, _ := preparedUpgrade(t, &fakeServices{})
+			if err := Install(upgrade); err != nil {
+				t.Fatal(err)
+			}
+			current := map[string][]byte{}
+			for _, object := range upgradeObjects {
+				current[object] = []byte(read(t, filepath.Join(installPath, object)))
+			}
+			previous := filepath.Join(filepath.Dir(installPath), previousSlotName)
+			object := filepath.Join(previous, "bin/forge")
+			switch name {
+			case "symlink":
+				if err := os.Rename(object, object+".real"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("forge.real", object); err != nil {
+					t.Fatal(err)
+				}
+			case "non-regular":
+				if err := os.Rename(object, object+".real"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(object, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			case "hardlink":
+				if err := os.Link(object, filepath.Join(previous, "forge-hardlink")); err != nil {
+					t.Fatal(err)
+				}
+			case "owner":
+				ownership := upgrade.Ownership.(*fakeOwnership)
+				ownership.owners[ownershipKey(object)] = [2]int{1, 1}
+			case "mode":
+				if err := os.Chmod(object, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			case "digest":
+				if err := os.WriteFile(object, []byte("tampered"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			case "slot-symlink":
+				if err := os.Rename(previous, previous+".real"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(filepath.Base(previous)+".real", previous); err != nil {
+					t.Fatal(err)
+				}
+			case "ambiguous-recovery":
+				if err := os.WriteFile(filepath.Join(filepath.Dir(installPath), ".agent-forge.rollback-stale"), []byte("stale"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			services := &fakeServices{}
+			err := Rollback(RollbackOptions{Version: upgrade.Version, Commit: upgrade.Commit, Root: upgrade.Root, Arch: upgrade.Arch, Account: upgrade.Account, Ownership: upgrade.Ownership, Services: services})
+			if err == nil {
+				t.Fatal("accepted unsafe slot or recovery material")
+			}
+			assertInstalledBytes(t, installPath, current)
+			if len(services.calls) != 0 {
+				t.Fatalf("services mutated before rejection: %v", services.calls)
+			}
+		})
 	}
 }
 
