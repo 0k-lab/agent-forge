@@ -11,6 +11,11 @@ TMP=$(mktemp -d)
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT INT TERM
 
+grep -Fq 'ref: ${{ github.ref }}' "$ROOT/.github/workflows/release.yml" || {
+  echo "release checkout must preserve the triggering annotated tag ref" >&2
+  exit 1
+}
+
 INPUT="$TMP/input"
 OUTPUT="$TMP/linux"
 mkdir -p "$INPUT"
