@@ -39,6 +39,20 @@ jobs:
         run: scripts/release-artifacts-e2e.sh "$GITHUB_SHA"
       - name: Linux installer E2E
         run: scripts/linux-installer-e2e.sh v0.0.0 "$GITHUB_SHA" "$PWD/dist"
+      - name: Privileged Linux installer E2E
+        env:
+          AGENT_FORGE_PRIVILEGED_E2E: "1"
+        run: |
+          linux_assets="$RUNNER_TEMP/agent-forge-linux-release"
+          scripts/prepare-linux-release.sh v0.0.0 "$PWD/dist" "$linux_assets"
+          sudo /usr/bin/env \
+            CI="$CI" \
+            GITHUB_ACTIONS="$GITHUB_ACTIONS" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            RUNNER_TEMP="$RUNNER_TEMP" \
+            AGENT_FORGE_PRIVILEGED_E2E="$AGENT_FORGE_PRIVILEGED_E2E" \
+            "$PWD/scripts/linux-installer-privileged-e2e.sh" \
+            v0.0.0 "$GITHUB_SHA" "$linux_assets"
       - name: Release publication E2E
         run: scripts/release-publication-e2e.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
