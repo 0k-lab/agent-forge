@@ -44,19 +44,38 @@ jobs:
           AGENT_FORGE_PRIVILEGED_E2E: "1"
         run: |
           linux_assets="$RUNNER_TEMP/agent-forge-linux-release"
-          old_matrix="$RUNNER_TEMP/agent-forge-old-matrix"
           old_linux_assets="$RUNNER_TEMP/agent-forge-old-linux-release"
           scripts/prepare-linux-release.sh v999.0.0 "$PWD/dist" "$linux_assets"
-          scripts/build-release.sh v998.0.0 "$GITHUB_SHA" "$old_matrix"
-          scripts/prepare-linux-release.sh v998.0.0 "$old_matrix" "$old_linux_assets"
+          mkdir "$old_linux_assets"
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 3 --retry-all-errors --retry-delay 1 \
+            --output "$old_linux_assets/SHA256SUMS" \
+            https://github.com/0k-lab/agent-forge/releases/download/v0.1.3/SHA256SUMS
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 3 --retry-all-errors --retry-delay 1 \
+            --output "$old_linux_assets/agent-forge-cli_v0.1.3_linux_amd64.tar.gz" \
+            https://github.com/0k-lab/agent-forge/releases/download/v0.1.3/agent-forge-cli_v0.1.3_linux_amd64.tar.gz
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 3 --retry-all-errors --retry-delay 1 \
+            --output "$old_linux_assets/agent-forge-gate_v0.1.3_linux_amd64.tar.gz" \
+            https://github.com/0k-lab/agent-forge/releases/download/v0.1.3/agent-forge-gate_v0.1.3_linux_amd64.tar.gz
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 3 --retry-all-errors --retry-delay 1 \
+            --output "$old_linux_assets/agent-forge-worker_v0.1.3_linux_amd64.tar.gz" \
+            https://github.com/0k-lab/agent-forge/releases/download/v0.1.3/agent-forge-worker_v0.1.3_linux_amd64.tar.gz
+          printf '%s  %s\n' c043682698f70bde9ec3f0f208c40f843df7138becf60d996a6056a2bdb2cc28 "$old_linux_assets/SHA256SUMS" | sha256sum --check --strict
+          for archive in \
+            agent-forge-cli_v0.1.3_linux_amd64.tar.gz \
+            agent-forge-gate_v0.1.3_linux_amd64.tar.gz \
+            agent-forge-worker_v0.1.3_linux_amd64.tar.gz; do
+            awk -v name="$archive" '$2 == name && NF == 2' "$old_linux_assets/SHA256SUMS" >"$RUNNER_TEMP/agent-forge-old-check"
+            [ "$(wc -l <"$RUNNER_TEMP/agent-forge-old-check")" -eq 1 ]
+            (cd "$old_linux_assets" && sha256sum --check --strict "$RUNNER_TEMP/agent-forge-old-check")
+          done
           sudo /usr/bin/env \
             CI="$CI" \
             GITHUB_ACTIONS="$GITHUB_ACTIONS" \
             RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
             RUNNER_TEMP="$RUNNER_TEMP" \
             AGENT_FORGE_PRIVILEGED_E2E="$AGENT_FORGE_PRIVILEGED_E2E" \
-            AGENT_FORGE_UPGRADE_FROM_VERSION=v998.0.0 \
-            AGENT_FORGE_UPGRADE_FROM_COMMIT="$GITHUB_SHA" \
+            AGENT_FORGE_UPGRADE_FROM_VERSION=v0.1.3 \
+            AGENT_FORGE_UPGRADE_FROM_COMMIT=dfa09f5fd82a01b79c977cae20299db79ede9bdc \
             AGENT_FORGE_UPGRADE_FROM_ASSET_DIR="$old_linux_assets" \
             "$PWD/scripts/linux-installer-privileged-e2e.sh" \
             v999.0.0 "$GITHUB_SHA" "$linux_assets"

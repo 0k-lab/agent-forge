@@ -11,8 +11,43 @@ import (
 	"testing"
 	"time"
 
+	"agent-forge/internal/buildinfo"
 	"agent-forge/internal/linuxinstall"
 )
+
+func TestRollbackCommandRequiresRootNoArgsAndPassesCLIIdentity(t *testing.T) {
+	previousRollback, previousUID := rollbackLinux, effectiveUID
+	previousVersion, previousCommit := buildinfo.Version, buildinfo.Commit
+	t.Cleanup(func() {
+		rollbackLinux, effectiveUID = previousRollback, previousUID
+		buildinfo.Version, buildinfo.Commit = previousVersion, previousCommit
+	})
+	buildinfo.Version = "v1.2.4"
+	buildinfo.Commit = "89abcdef0123456789abcdef0123456789abcdef"
+	effectiveUID = func() int { return 0 }
+	var got linuxinstall.RollbackOptions
+	rollbackLinux = func(o linuxinstall.RollbackOptions) error { got = o; return nil }
+	if err := run([]string{"rollback"}, env(nil), nil, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if got.Version != buildinfo.Version || got.Commit != buildinfo.Commit || got.Arch == "" || got.Account == nil || got.Ownership == nil || got.Services == nil {
+		t.Fatalf("rollback options = %#v", got)
+	}
+	if err := run([]string{"rollback", "extra"}, env(nil), nil, io.Discard, io.Discard); err == nil {
+		t.Fatal("accepted rollback arguments")
+	}
+	effectiveUID = func() int { return 1000 }
+	if err := run([]string{"rollback"}, env(nil), nil, io.Discard, io.Discard); err == nil {
+		t.Fatal("accepted non-root rollback")
+	}
+	effectiveUID = func() int { return 0 }
+	rollbackLinux = func(linuxinstall.RollbackOptions) error { return linuxinstall.Rollback(linuxinstall.RollbackOptions{}) }
+	err := run([]string{"rollback"}, env(nil), nil, io.Discard, io.Discard)
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr.Code != CodeInvalidInput || cliErr.InstallStage == "" {
+		t.Fatalf("rollback error = %#v", err)
+	}
+}
 
 func TestInstallCommandRequiresOfflineTrustInputsAndExplicitRootMode(t *testing.T) {
 	previous := installLinux

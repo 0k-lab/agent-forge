@@ -9,6 +9,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 var upgradeObjects = []string{
@@ -23,8 +26,29 @@ var upgradeObjects = []string{
 }
 
 var renameUpgrade = os.Rename
+var promoteAbsentUpgrade = func(a, b string) error {
+	return unix.Renameat2(unix.AT_FDCWD, a, unix.AT_FDCWD, b, unix.RENAME_NOREPLACE)
+}
+var exchangeUpgrade = func(a, b string) error {
+	return unix.Renameat2(unix.AT_FDCWD, a, unix.AT_FDCWD, b, unix.RENAME_EXCHANGE)
+}
 
-func upgradeInstall(o Options, installPath string, previous *receipt, archives []verifiedArchive) (retErr error) {
+const previousSlotName = ".agent-forge.previous"
+
+func rejectTransactionMaterial(parent string) error {
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".agent-forge.upgrade-") || strings.HasPrefix(entry.Name(), ".agent-forge.rollback-") {
+			return errors.New("ambiguous installer transaction material")
+		}
+	}
+	return nil
+}
+
+func upgradeInstall(o Options, installPath string, previous *receipt, archives []verifiedArchive, previousSlotExists bool) (retErr error) {
 	if !o.EnableNow || o.Services == nil {
 		return &installStageError{stage: "activation", err: errors.New("upgrade requires readiness activation")}
 	}
@@ -124,6 +148,10 @@ func upgradeInstall(o Options, installPath string, previous *receipt, archives [
 			return &installStageError{stage: "staging", err: err}
 		}
 	}
+	previousSlot := filepath.Join(parent, previousSlotName)
+	if !sameUpgradeFilesystem(installPath, stage, backup, previousSlot, previousSlotExists) {
+		return &installStageError{stage: "publication", err: errors.New("upgrade rename topology crosses filesystems")}
+	}
 
 	stopped := false
 	swapped := make([]string, 0, len(upgradeObjects))
@@ -186,7 +214,36 @@ func upgradeInstall(o Options, installPath string, previous *receipt, archives [
 	if err := activate(o, ownerToken); err != nil {
 		return &installStageError{stage: "activation", err: rollback(err)}
 	}
+	for _, dir := range []string{"bin", "systemd"} {
+		if err := os.Chmod(filepath.Join(backup, dir), 0o755); err != nil {
+			return &installStageError{stage: "publication", err: rollback(err)}
+		}
+	}
+	promote := promoteAbsentUpgrade
+	if _, err := os.Lstat(previousSlot); err == nil {
+		promote = exchangeUpgrade
+	} else if !os.IsNotExist(err) {
+		return &installStageError{stage: "publication", err: rollback(err)}
+	}
+	if err := promote(backup, previousSlot); err != nil {
+		return &installStageError{stage: "publication", err: rollback(err)}
+	}
 	return nil
+}
+
+func sameUpgradeFilesystem(installPath, stage, backup, previousSlot string, previousSlotExists bool) bool {
+	for _, pair := range [][2]string{{installPath, stage}, {installPath, backup}, {stage, backup}} {
+		if !sameFilesystem(pair[0], pair[1]) {
+			return false
+		}
+	}
+	for _, name := range upgradeObjects {
+		if !sameFilesystem(filepath.Join(installPath, name), filepath.Dir(filepath.Join(backup, name))) ||
+			!sameFilesystem(filepath.Join(stage, name), filepath.Dir(filepath.Join(installPath, name))) {
+			return false
+		}
+	}
+	return !previousSlotExists || sameFilesystem(backup, previousSlot)
 }
 
 func cloneStringMap(source map[string]string) map[string]string {

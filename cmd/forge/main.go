@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -86,6 +87,7 @@ type commandOptions struct {
 }
 
 var installLinux = linuxinstall.Install
+var rollbackLinux = linuxinstall.Rollback
 var doctorLinux = linuxinstall.Doctor
 var effectiveUID = os.Geteuid
 
@@ -102,6 +104,9 @@ func run(args []string, getenv func(string) string, stdin io.Reader, stdout, std
 	}
 	if name == "doctor" {
 		return runDoctor(args[1:], stdout)
+	}
+	if name == "rollback" {
+		return runRollback(args[1:])
 	}
 	if name != "submit" && name != "wait" && name != "status" && name != "events" && name != "result" {
 		return fail(CodeInvalidUsage)
@@ -169,6 +174,21 @@ func run(args []string, getenv func(string) string, stdin io.Reader, stdout, std
 		}
 		return printJSON(stdout, response)
 	}
+}
+
+func runRollback(args []string) error {
+	if len(args) != 0 || effectiveUID() != 0 {
+		return fail(CodeInvalidUsage)
+	}
+	err := rollbackLinux(linuxinstall.RollbackOptions{
+		Version: buildinfo.Version, Commit: buildinfo.Commit, Arch: runtime.GOARCH,
+		Account: linuxinstall.HostAccountManager{}, Ownership: linuxinstall.HostOwnershipManager{}, Services: linuxinstall.HostServiceManager{},
+	})
+	if err != nil {
+		stage, _ := linuxinstall.FailureStage(err)
+		return &CLIError{Code: CodeInvalidInput, InstallStage: stage}
+	}
+	return nil
 }
 
 func runDoctor(args []string, stdout io.Writer) error {

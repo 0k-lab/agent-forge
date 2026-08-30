@@ -206,7 +206,24 @@ func Install(o Options) (retErr error) {
 		if compareVersions(o.Version, existing.Version) <= 0 {
 			return errors.New("requested release is not newer than installed release")
 		}
-		return upgradeInstall(o, installPath, existing, archives)
+		parent := filepath.Dir(installPath)
+		if err := rejectTransactionMaterial(parent); err != nil {
+			return err
+		}
+		previousPath := filepath.Join(parent, previousSlotName)
+		previousSlotExists := false
+		if _, statErr := os.Lstat(previousPath); statErr == nil {
+			if _, inspectErr := inspectPreviousSlot(previousPath, o, existing); inspectErr != nil {
+				return errors.New("existing previous release slot mismatch")
+			}
+			if !sameReleaseFilesystem(installPath, previousPath) {
+				return errors.New("existing previous release slot mismatch")
+			}
+			previousSlotExists = true
+		} else if !os.IsNotExist(statErr) {
+			return errors.New("existing previous release slot mismatch")
+		}
+		return upgradeInstall(o, installPath, existing, archives, previousSlotExists)
 	}
 	if o.Upgrade {
 		return errors.New("upgrade requires an existing installation")
