@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish-linux:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate exact annotated release tag
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$GITHUB_REF_NAME"
+          commit="$(git rev-parse HEAD)"
+          scripts/validate-release-tag.sh "$version" "$commit"
+          printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+          printf 'commit=%s\n' "$commit" >>"$GITHUB_OUTPUT"
+      - name: Build deterministic release matrix
+        run: scripts/build-release.sh "${{ steps.identity.outputs.version }}" "${{ steps.identity.outputs.commit }}" dist
+      - name: Stage exact Linux publication assets
+        run: scripts/prepare-linux-release.sh "${{ steps.identity.outputs.version }}" dist release
+      - name: Extract Linux archives for SBOM cataloging
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir sbom-root
+          for archive in release/*.tar.gz; do
+            tar --extract --gzip --file "$archive" --directory sbom-root --no-same-owner --no-same-permissions
+          done
+      - name: Install pinned Syft
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            https://github.com/anchore/syft/releases/download/v1.51.1/syft_1.51.1_linux_amd64.tar.gz \
+            --output syft.tar.gz
+          printf '%s  %s\n' \
+            8fcb33017a0dc1058298c923c436d19dfa68ae93968e0b423248542e3afb9fc3 \
+            syft.tar.gz | sha256sum -c -
+          mkdir syft-tool
+          tar --extract --gzip --file syft.tar.gz --directory syft-tool syft
+      - name: Generate SPDX JSON SBOM
+        shell: bash
+        env:
+          SYFT_CHECK_FOR_APP_UPDATE: "false"
+          SYFT_SOURCE_NAME: agent-forge-linux
+          SYFT_SOURCE_VERSION: ${{ steps.identity.outputs.version }}
+        run: |
+          set -euo pipefail
+          syft-tool/syft scan dir:sbom-root \
+            --output spdx-json=release/agent-forge_${{ steps.identity.outputs.version }}_linux.spdx.json
+      - name: Verify publishable Linux release
+        run: python3 scripts/verify-linux-release.py "${{ steps.identity.outputs.version }}" release
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: release/SHA256SUMS
+      - name: Attest SPDX SBOM
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-checksums: release/SHA256SUMS
+          sbom-path: release/agent-forge_${{ steps.identity.outputs.version }}_linux.spdx.json
+      - name: Publish verified GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/publish-github-release.py "${{ steps.identity.outputs.version }}" "${{ steps.identity.outputs.commit }}" release

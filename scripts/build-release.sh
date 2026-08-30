@@ -2,7 +2,7 @@
 set -eu
 
 usage() {
-  echo "usage: $0 <vMAJOR.MINOR.PATCH[-PRERELEASE]> <40-lowercase-hex-commit> <output-directory>" >&2
+  echo "usage: $0 <vMAJOR.MINOR.PATCH> <40-lowercase-hex-commit> <output-directory>" >&2
   exit 2
 }
 
@@ -10,27 +10,10 @@ usage() {
 VERSION=$1
 COMMIT=$2
 OUTPUT_ARG=$3
-case "$VERSION" in ''|*[!0-9A-Za-z.-]*) usage ;; esac
+case "$VERSION" in ''|*[!0-9A-Za-z.]*) usage ;; esac
 [ "${#VERSION}" -le 128 ] || usage
 case "$COMMIT" in ''|*[!0-9a-f]*) usage ;; esac
-printf '%s\n' "$VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$' || usage
-case "$VERSION" in
-  *-*)
-    identifier=${VERSION#*-}
-    while :; do
-      current=${identifier%%.*}
-      case "$current" in
-        *[!0-9]*) ;;
-        0|[1-9]*) ;;
-        *) usage ;;
-      esac
-      case "$identifier" in
-        *.*) identifier=${identifier#*.} ;;
-        *) break ;;
-      esac
-    done
-    ;;
-esac
+printf '%s\n' "$VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || usage
 printf '%s\n' "$COMMIT" | grep -Eq '^[0-9a-f]{40}$' || usage
 case "$OUTPUT_ARG" in ''|.|..|/) usage ;; esac
 

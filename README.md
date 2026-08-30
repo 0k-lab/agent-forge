@@ -44,7 +44,9 @@ The canonical matrix is:
 - Worker archives for `linux/amd64`, `linux/arm64`, `darwin/amd64`, and `darwin/arm64`.
 - Each Worker archive contains `forge-worker`, `forge-codex-plugin`, and `forge-ref-plugin`.
 
-Every archive contains a `VERSION` file, and each runtime binary supports `--version`. CI runs `scripts/release-artifacts-e2e.sh` and uploads the verified bundles as short-lived workflow artifacts. GitHub Release publication remains disabled until the same tag pipeline also produces the SBOM and GitHub artifact attestation required by issue #43.
+Every archive contains a `VERSION` file, and each runtime binary supports `--version`. CI runs `scripts/release-artifacts-e2e.sh` and uploads the verified full matrix as short-lived workflow artifacts.
+
+A pushed annotated `vMAJOR.MINOR.PATCH` tag starts `.github/workflows/release.yml`; prerelease suffixes, lightweight tags, and commits outside `origin/main` are rejected. The tag pipeline selects the six Linux archives, writes a Linux-only `SHA256SUMS`, generates an SPDX JSON SBOM with pinned Syft, and creates GitHub build-provenance and SBOM attestations through OIDC. It then uploads the exact verified asset set to a draft GitHub Release, verifies every remote SHA-256 digest, and publishes the draft. Existing releases and assets are never replaced. If upload fails after draft creation, the partial draft is deliberately retained and a rerun refuses it; an operator must inspect it and explicitly decide whether to delete it before retrying. macOS is distributed through a Homebrew Formula and bottles rather than as GitHub Release assets; Cask and Apple notarization are not part of this CLI release path.
 
 ## Run
 
