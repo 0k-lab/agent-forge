@@ -64,6 +64,8 @@ The default installation is staged under `/opt/agent-forge` for the dedicated `a
 
 The installer verifies the trust anchor and exact six-entry Linux manifest before destination mutation, copies and hashes selected archives into private staging, applies a strict tar allowlist, generates isolated owner/Worker tokens, and publishes without replacement. Re-running the exact version is validation-only and does not rotate tokens or repair drift. Upgrade, rollback, repair, uninstall, online download, and `forge doctor` are intentionally not part of this clean-install command.
 
+CI and release publication run an additional privileged installer acceptance test only on a clean disposable GitHub-hosted runner. It exercises the real dedicated account, `/opt/agent-forge`, systemd enable/start, authenticated Worker connection, validation-only same-version rerun, and service restart before a release can be published. GitHub's Ubuntu image provisioning intentionally makes `/opt` mode `0777`; after all clean-host guards, the acceptance fixture permits only root-owned mode `0755` or that exact documented `0777` state and normalizes the latter to `0755`. The production installer remains fail-closed on writable privileged ancestors.
+
 ## Run
 
 Gate and Worker accept only `-config`. Config files name secret environment variables; secret values never enter config, SQLite, leases, evidence, or logs.
