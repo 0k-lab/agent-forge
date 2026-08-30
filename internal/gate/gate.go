@@ -54,6 +54,8 @@ type Options struct {
 	Logger            *slog.Logger
 	Context           context.Context
 	Delivery          githubdelivery.Options
+	ReleaseVersion    string
+	ReleaseCommit     string
 }
 
 func DefaultOptions() Options {
@@ -296,8 +298,8 @@ func (x *server) routes() http.Handler {
 			return
 		}
 		mac := hmac.New(sha256.New, x.ownerDigest[:])
-		_, _ = mac.Write([]byte("agent-forge/install-ready/v1\x00" + values[0]))
-		writeJSON(w, http.StatusOK, map[string]string{"proof": base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), "status": "ready"})
+		_, _ = mac.Write([]byte("agent-forge/install-ready/v2\x00" + values[0] + "\x00" + x.options.ReleaseVersion + "\x00" + x.options.ReleaseCommit))
+		writeJSON(w, http.StatusOK, map[string]string{"commit": x.options.ReleaseCommit, "proof": base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), "status": "ready", "version": x.options.ReleaseVersion})
 	})
 	m.HandleFunc("POST /v1/jobs", x.ownerAuth(x.submit))
 	m.HandleFunc("GET /v1/jobs/{id}", x.ownerAuth(x.getJob))

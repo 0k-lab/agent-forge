@@ -191,16 +191,23 @@ func readinessClient() *http.Client {
 	}
 }
 
-func (HostServiceManager) GateReady(ownerToken string) error {
+func (HostServiceManager) GateReady(ownerToken, version, commit string) error {
 	challengeBytes := make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, challengeBytes); err != nil || ownerToken == "" {
+	if _, err := io.ReadFull(rand.Reader, challengeBytes); err != nil || ownerToken == "" || !versionRE.MatchString(version) || !commitRE.MatchString(commit) {
 		return errors.New("create Gate proof challenge failed")
 	}
 	challenge := base64.RawURLEncoding.EncodeToString(challengeBytes)
 	ownerDigest := sha256.Sum256([]byte(ownerToken))
 	mac := hmac.New(sha256.New, ownerDigest[:])
-	_, _ = mac.Write([]byte("agent-forge/install-ready/v1\x00" + challenge))
+	_, _ = mac.Write([]byte("agent-forge/install-ready/v2\x00" + challenge + "\x00" + version + "\x00" + commit))
 	wantProof := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	legacyRelease := version == legacyInstallerVersion && commit == legacyInstallerCommit
+	wantLegacyProof := ""
+	if legacyRelease {
+		mac.Reset()
+		_, _ = mac.Write([]byte("agent-forge/install-ready/v1\x00" + challenge))
+		wantLegacyProof = base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), readinessWindow)
 	defer cancel()
 	client := readinessClient()
@@ -211,15 +218,19 @@ func (HostServiceManager) GateReady(ownerToken string) error {
 			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 257))
 			_ = resp.Body.Close()
 			var proof struct {
-				Proof  string `json:"proof"`
-				Status string `json:"status"`
+				Commit  string `json:"commit"`
+				Proof   string `json:"proof"`
+				Status  string `json:"status"`
+				Version string `json:"version"`
 			}
 			decoder := json.NewDecoder(bytes.NewReader(body))
 			decoder.DisallowUnknownFields()
 			decodeErr := decoder.Decode(&proof)
 			var extra any
 			trailingErr := decoder.Decode(&extra)
-			if resp.StatusCode == http.StatusOK && readErr == nil && len(body) <= 256 && decodeErr == nil && trailingErr == io.EOF && proof.Status == "ready" && hmac.Equal([]byte(proof.Proof), []byte(wantProof)) {
+			v2 := proof.Version == version && proof.Commit == commit && hmac.Equal([]byte(proof.Proof), []byte(wantProof))
+			v1 := legacyRelease && proof.Version == "" && proof.Commit == "" && hmac.Equal([]byte(proof.Proof), []byte(wantLegacyProof))
+			if resp.StatusCode == http.StatusOK && readErr == nil && len(body) <= 256 && decodeErr == nil && trailingErr == io.EOF && proof.Status == "ready" && (v2 || v1) {
 				return nil
 			}
 		}

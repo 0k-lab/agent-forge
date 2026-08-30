@@ -1191,15 +1191,21 @@ func TestInstallationProofBindsReadinessToOwnerSecret(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	h := NewHandler(s, nil, "owner")
+	options := DefaultOptions()
+	options.ReleaseVersion = "v1.2.3"
+	options.ReleaseCommit = "0123456789abcdef0123456789abcdef01234567"
+	h, err := NewHandlerWithOptions(s, nil, "owner", options)
+	if err != nil {
+		t.Fatal(err)
+	}
 	challenge := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
 	res := httptest.NewRecorder()
 	h.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/install-proof?challenge="+challenge, nil))
 	ownerDigest := sha256.Sum256([]byte("owner"))
 	mac := hmac.New(sha256.New, ownerDigest[:])
-	_, _ = mac.Write([]byte("agent-forge/install-ready/v1\x00" + challenge))
+	_, _ = mac.Write([]byte("agent-forge/install-ready/v2\x00" + challenge + "\x00" + options.ReleaseVersion + "\x00" + options.ReleaseCommit))
 	want := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	if res.Code != http.StatusOK || strings.TrimSpace(res.Body.String()) != `{"proof":"`+want+`","status":"ready"}` {
+	if res.Code != http.StatusOK || strings.TrimSpace(res.Body.String()) != `{"commit":"`+options.ReleaseCommit+`","proof":"`+want+`","status":"ready","version":"`+options.ReleaseVersion+`"}` {
 		t.Fatalf("proof response=%d %q", res.Code, res.Body.String())
 	}
 	for _, target := range []string{"/install-proof", "/install-proof?challenge=bad", "/install-proof?challenge=" + challenge + "&extra=1"} {

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"time"
 )
 
@@ -11,6 +12,21 @@ const schemaVersion = 5
 
 // SchemaVersion is the current on-disk SQLite schema supported by Gate.
 func SchemaVersion() int { return schemaVersion }
+
+// CheckSchemaReadOnly verifies the current schema without migrations or SQLite sidecar writes.
+func CheckSchemaReadOnly(path string) error {
+	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: "immutable=1&mode=ro"}).String()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return errors.New("database schema unavailable")
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != schemaVersion {
+		return errors.New("unsupported database schema")
+	}
+	return nil
+}
 
 func migrate(db *sql.DB) error {
 	var version int

@@ -111,6 +111,8 @@ func run(args []string, logger *slog.Logger) error {
 	options.RecoveryInterval = config.RecoveryInterval
 	options.LeasePollInterval = config.LeasePollInterval
 	options.Logger = logger
+	options.ReleaseVersion = buildinfo.Version
+	options.ReleaseCommit = buildinfo.Commit
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	options.Context = ctx
