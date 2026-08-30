@@ -56,6 +56,7 @@ jobs:
         run: |
           set -euo pipefail
           curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            --retry 3 --retry-all-errors --retry-delay 1 \
             https://github.com/anchore/syft/releases/download/v1.51.1/syft_1.51.1_linux_amd64.tar.gz \
             --output syft.tar.gz
           printf '%s  %s\n' \
