@@ -43,6 +43,20 @@ jobs:
         run: scripts/build-release.sh "${{ steps.identity.outputs.version }}" "${{ steps.identity.outputs.commit }}" dist
       - name: Stage exact Linux publication assets
         run: scripts/prepare-linux-release.sh "${{ steps.identity.outputs.version }}" dist release
+      - name: Privileged Linux installer E2E
+        env:
+          AGENT_FORGE_PRIVILEGED_E2E: "1"
+        run: |
+          sudo /usr/bin/env \
+            CI="$CI" \
+            GITHUB_ACTIONS="$GITHUB_ACTIONS" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            RUNNER_TEMP="$RUNNER_TEMP" \
+            AGENT_FORGE_PRIVILEGED_E2E="$AGENT_FORGE_PRIVILEGED_E2E" \
+            "$PWD/scripts/linux-installer-privileged-e2e.sh" \
+            "${{ steps.identity.outputs.version }}" \
+            "${{ steps.identity.outputs.commit }}" \
+            "$PWD/release"
       - name: Extract Linux archives for SBOM cataloging
         shell: bash
         run: |
