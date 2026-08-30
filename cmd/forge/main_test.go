@@ -10,7 +10,38 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"agent-forge/internal/linuxinstall"
 )
+
+func TestInstallCommandRequiresOfflineTrustInputsAndExplicitRootMode(t *testing.T) {
+	previous := installLinux
+	previousUID := effectiveUID
+	t.Cleanup(func() { installLinux = previous; effectiveUID = previousUID })
+	effectiveUID = func() int { return 0 }
+	var got linuxinstall.Options
+	installLinux = func(o linuxinstall.Options) error { got = o; return nil }
+	args := []string{"install", "--version", "v1.2.3", "--commit", "0123456789abcdef0123456789abcdef01234567", "--asset-dir", "/offline/assets", "--sha256sums-sha256", strings.Repeat("a", 64), "--run-as-root"}
+	if err := run(args, env(nil), nil, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if got.Version != "v1.2.3" || got.AssetDir != "/offline/assets" || !got.RunAsRoot || got.Account == nil || got.Services == nil {
+		t.Fatalf("installer options = %#v", got)
+	}
+	effectiveUID = func() int { return 1000 }
+	if err := run(args, env(nil), nil, io.Discard, io.Discard); err == nil {
+		t.Fatal("accepted installer invocation from non-root caller")
+	}
+	effectiveUID = func() int { return 0 }
+	for _, bad := range [][]string{
+		{"install", "--version", "latest", "--commit", got.Commit, "--asset-dir", "/offline/assets", "--sha256sums-sha256", strings.Repeat("a", 64)},
+		{"install", "--version", "v1.2.3", "--commit", "ABC", "--asset-dir", "relative", "--sha256sums-sha256", "bad"},
+	} {
+		if err := run(bad, env(nil), nil, io.Discard, io.Discard); err == nil {
+			t.Fatalf("accepted invalid args: %v", bad)
+		}
+	}
+}
 
 func TestSubmitReadsStrictTaskAndUsesEnvironmentCredential(t *testing.T) {
 	var requests atomic.Int32

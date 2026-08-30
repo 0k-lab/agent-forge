@@ -17,6 +17,7 @@ import (
 
 	"agent-forge/internal/buildinfo"
 	"agent-forge/internal/configjson"
+	"agent-forge/internal/linuxinstall"
 	"agent-forge/internal/protocol"
 )
 
@@ -60,6 +61,9 @@ type commandOptions struct {
 	wait     bool
 }
 
+var installLinux = linuxinstall.Install
+var effectiveUID = os.Geteuid
+
 func run(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if requested, err := buildinfo.WriteIfRequested(args, stdout, "forge"); requested {
 		return err
@@ -68,6 +72,9 @@ func run(args []string, getenv func(string) string, stdin io.Reader, stdout, std
 		return fail(CodeInvalidUsage)
 	}
 	name := args[0]
+	if name == "install" {
+		return runInstall(args[1:])
+	}
 	if name != "submit" && name != "wait" && name != "status" && name != "events" && name != "result" {
 		return fail(CodeInvalidUsage)
 	}
@@ -134,6 +141,27 @@ func run(args []string, getenv func(string) string, stdin io.Reader, stdout, std
 		}
 		return printJSON(stdout, response)
 	}
+}
+
+func runInstall(args []string) error {
+	fs := flag.NewFlagSet("install", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var o linuxinstall.Options
+	fs.StringVar(&o.Version, "version", "", "exact release version")
+	fs.StringVar(&o.Commit, "commit", "", "full release commit")
+	fs.StringVar(&o.AssetDir, "asset-dir", "", "absolute offline release asset directory")
+	fs.StringVar(&o.SHA256SUMSSHA256, "sha256sums-sha256", "", "trusted SHA256SUMS digest")
+	fs.BoolVar(&o.EnableNow, "enable-now", false, "enable and start services after installation")
+	fs.BoolVar(&o.RunAsRoot, "run-as-root", false, "run Gate and Worker as root")
+	o.Account = linuxinstall.HostAccountManager{}
+	o.Services = linuxinstall.HostServiceManager{}
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || effectiveUID() != 0 || !regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`).MatchString(o.Version) || !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(o.Commit) || !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(o.SHA256SUMSSHA256) || !strings.HasPrefix(o.AssetDir, "/") {
+		return fail(CodeInvalidUsage)
+	}
+	if err := installLinux(o); err != nil {
+		return fail(CodeInvalidInput)
+	}
+	return nil
 }
 
 type submission struct {

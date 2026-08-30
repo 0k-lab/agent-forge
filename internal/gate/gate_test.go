@@ -1185,6 +1185,32 @@ func TestEventsAPIExposesOnlyStableSafeFields(t *testing.T) {
 	}
 }
 
+func TestInstallationProofBindsReadinessToOwnerSecret(t *testing.T) {
+	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	h := NewHandler(s, nil, "owner")
+	challenge := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/install-proof?challenge="+challenge, nil))
+	ownerDigest := sha256.Sum256([]byte("owner"))
+	mac := hmac.New(sha256.New, ownerDigest[:])
+	_, _ = mac.Write([]byte("agent-forge/install-ready/v1\x00" + challenge))
+	want := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	if res.Code != http.StatusOK || strings.TrimSpace(res.Body.String()) != `{"proof":"`+want+`","status":"ready"}` {
+		t.Fatalf("proof response=%d %q", res.Code, res.Body.String())
+	}
+	for _, target := range []string{"/install-proof", "/install-proof?challenge=bad", "/install-proof?challenge=" + challenge + "&extra=1"} {
+		bad := httptest.NewRecorder()
+		h.ServeHTTP(bad, httptest.NewRequest(http.MethodGet, target, nil))
+		if bad.Code == http.StatusOK {
+			t.Fatalf("accepted malformed proof request %q", target)
+		}
+	}
+}
+
 func TestHealthReadinessStatusAndOwnerNoStore(t *testing.T) {
 	s, err := store.Open(filepath.Join(secureTempDir(t), "forge.db"))
 	if err != nil {

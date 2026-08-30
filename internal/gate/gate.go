@@ -284,6 +284,21 @@ func (x *server) routes() http.Handler {
 	m.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
+	m.HandleFunc("GET /install-proof", func(w http.ResponseWriter, r *http.Request) {
+		values, ok := r.URL.Query()["challenge"]
+		if !ok || len(values) != 1 || len(values[0]) != 43 || r.URL.RawQuery != "challenge="+values[0] || !x.ownerConfigured {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid challenge"})
+			return
+		}
+		challenge, err := base64.RawURLEncoding.DecodeString(values[0])
+		if err != nil || len(challenge) != 32 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid challenge"})
+			return
+		}
+		mac := hmac.New(sha256.New, x.ownerDigest[:])
+		_, _ = mac.Write([]byte("agent-forge/install-ready/v1\x00" + values[0]))
+		writeJSON(w, http.StatusOK, map[string]string{"proof": base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), "status": "ready"})
+	})
 	m.HandleFunc("POST /v1/jobs", x.ownerAuth(x.submit))
 	m.HandleFunc("GET /v1/jobs/{id}", x.ownerAuth(x.getJob))
 	m.HandleFunc("GET /v1/jobs/{id}/status", x.ownerAuth(x.getJobStatus))
