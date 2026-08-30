@@ -1,5 +1,6 @@
 /bin/
 /dist/
+__pycache__/
 /.e2e-run/
 /forge.db
 /forge-gate

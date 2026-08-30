@@ -3,7 +3,7 @@ set -eu
 export LC_ALL=C
 unset GOFIPS140 TAR_OPTIONS GZIP POSIXLY_CORRECT
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-VERSION=v0.0.0-ci
+VERSION=v0.0.0
 COMMIT=${1:-}
 case "$COMMIT" in
   [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
@@ -96,7 +96,7 @@ if "$BUILDER" "$MULTILINE_VERSION" "$COMMIT" "$SECOND/multiline-version" >/dev/n
   echo "builder accepted a multiline version" >&2
   exit 1
 fi
-for invalid_semver in v01.2.3 v1.02.3 v1.2.03 v1.2.3-01 v1.2.3-alpha.01; do
+for invalid_semver in v01.2.3 v1.02.3 v1.2.03 v1.2.3-alpha v1.2.3-rc.1 v1.2.3-nightly; do
   if "$BUILDER" "$invalid_semver" "$COMMIT" "$SECOND/invalid-semver" >/dev/null 2>&1; then
     echo "builder accepted invalid SemVer: $invalid_semver" >&2
     exit 1
@@ -142,14 +142,14 @@ fi
 [ "$(sha256sum "$DIST/SHA256SUMS")" = "$MANIFEST_BEFORE" ]
 GOFIPS140=latest TAR_OPTIONS=--exclude=VERSION GZIP=-1 POSIXLY_CORRECT=1 "$BUILDER" "$VERSION" "$COMMIT" "$SECOND_OUT"
 
-EXPECTED='agent-forge-cli_v0.0.0-ci_linux_amd64.tar.gz
-agent-forge-cli_v0.0.0-ci_linux_arm64.tar.gz
-agent-forge-gate_v0.0.0-ci_linux_amd64.tar.gz
-agent-forge-gate_v0.0.0-ci_linux_arm64.tar.gz
-agent-forge-worker_v0.0.0-ci_darwin_amd64.tar.gz
-agent-forge-worker_v0.0.0-ci_darwin_arm64.tar.gz
-agent-forge-worker_v0.0.0-ci_linux_amd64.tar.gz
-agent-forge-worker_v0.0.0-ci_linux_arm64.tar.gz'
+EXPECTED='agent-forge-cli_v0.0.0_linux_amd64.tar.gz
+agent-forge-cli_v0.0.0_linux_arm64.tar.gz
+agent-forge-gate_v0.0.0_linux_amd64.tar.gz
+agent-forge-gate_v0.0.0_linux_arm64.tar.gz
+agent-forge-worker_v0.0.0_darwin_amd64.tar.gz
+agent-forge-worker_v0.0.0_darwin_arm64.tar.gz
+agent-forge-worker_v0.0.0_linux_amd64.tar.gz
+agent-forge-worker_v0.0.0_linux_arm64.tar.gz'
 ACTUAL=$(sed 's/^.*  //' "$DIST/SHA256SUMS")
 [ "$ACTUAL" = "$EXPECTED" ] || { echo "unexpected release matrix" >&2; printf '%s\n' "$ACTUAL" >&2; exit 1; }
 (
