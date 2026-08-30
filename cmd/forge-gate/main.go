@@ -17,9 +17,15 @@ import (
 	"agent-forge/internal/buildinfo"
 	"agent-forge/internal/gate"
 	"agent-forge/internal/store"
+
+	"golang.org/x/sys/unix"
 )
 
 const shutdownTimeout = 10 * time.Second
+
+var hardenProcess = func() error {
+	return unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0)
+}
 
 func newHTTPServer(handler http.Handler) *http.Server {
 	return &http.Server{
@@ -84,6 +90,12 @@ func writeStartupError(output io.Writer, err error) {
 }
 
 func run(args []string, logger *slog.Logger) error {
+	// This must precede config parsing: ParseConfig resolves bearer tokens from
+	// the environment, which must never become readable through /proc by the
+	// shared service UID.
+	if err := hardenProcess(); err != nil {
+		return fmt.Errorf("process hardening failed: %w", err)
+	}
 	logger.Info("gate lifecycle", "component", "gate", "event", "startup")
 	flags := flag.NewFlagSet("forge-gate", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)

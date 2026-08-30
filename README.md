@@ -48,6 +48,22 @@ Every archive contains a `VERSION` file, and each runtime binary supports `--ver
 
 A pushed annotated `vMAJOR.MINOR.PATCH` tag starts `.github/workflows/release.yml`; prerelease suffixes, lightweight tags, and commits outside `origin/main` are rejected. The tag pipeline selects the six Linux archives, writes a Linux-only `SHA256SUMS`, generates an SPDX JSON SBOM with pinned Syft, and creates GitHub build-provenance and SBOM attestations through OIDC. It then uploads the exact verified asset set to a draft GitHub Release, verifies every remote SHA-256 digest, and publishes the draft. Existing releases and assets are never replaced. If upload fails after draft creation, the partial draft is deliberately retained and a rerun refuses it; an operator must inspect it and explicitly decide whether to delete it before retrying. macOS is distributed through a Homebrew Formula and bottles rather than as GitHub Release assets; Cask and Apple notarization are not part of this CLI release path.
 
+## Offline Linux clean install
+
+`forge install` performs a clean install from an exact local Linux release set. It never downloads assets or resolves a `latest` version. Extract the matching `forge` binary from the CLI archive, place `SHA256SUMS` and the Linux CLI, Gate, and Worker archives in one absolute directory, and obtain the SHA-256 digest of the raw `SHA256SUMS` bytes through a trusted channel independent of that directory. Then run:
+
+```sh
+sudo ./forge install \
+  --version v0.1.3 \
+  --commit <full-lowercase-40-hex-release-commit> \
+  --asset-dir /absolute/path/to/linux-release-assets \
+  --sha256sums-sha256 <trusted-64-lowercase-hex-digest>
+```
+
+The default installation is staged under `/opt/agent-forge` for the dedicated `agent-forge` system account but is not started. Add `--enable-now` to reload systemd, enable and start Gate, wait for `/readyz`, start Worker, and verify its authenticated connection. `--run-as-root` is an explicit alternative service identity; it is never inferred from the caller's effective UID.
+
+The installer verifies the trust anchor and exact six-entry Linux manifest before destination mutation, copies and hashes selected archives into private staging, applies a strict tar allowlist, generates isolated owner/Worker tokens, and publishes without replacement. Re-running the exact version is validation-only and does not rotate tokens or repair drift. Upgrade, rollback, repair, uninstall, online download, and `forge doctor` are intentionally not part of this clean-install command.
+
 ## Run
 
 Gate and Worker accept only `-config`. Config files name secret environment variables; secret values never enter config, SQLite, leases, evidence, or logs.

@@ -52,3 +52,13 @@ func TestAlreadyOwnedStartupErrorIsStable(t *testing.T) {
 		t.Fatalf("startup error = %s", output.String())
 	}
 }
+
+func TestRunMakesProcessNonDumpableBeforeConfigOrEnvironment(t *testing.T) {
+	want := errors.New("hardened before config")
+	original := hardenProcess
+	hardenProcess = func() error { return want }
+	t.Cleanup(func() { hardenProcess = original })
+	if err := run([]string{"-config", "/definitely-not-read"}, newJSONLogger(&bytes.Buffer{})); !errors.Is(err, want) {
+		t.Fatalf("run error=%v; process hardening was not first", err)
+	}
+}

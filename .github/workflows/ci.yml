@@ -37,6 +37,8 @@ jobs:
           cache: true
       - name: Build and verify deterministic release artifacts
         run: scripts/release-artifacts-e2e.sh "$GITHUB_SHA"
+      - name: Linux installer E2E
+        run: scripts/linux-installer-e2e.sh v0.0.0 "$GITHUB_SHA" "$PWD/dist"
       - name: Release publication E2E
         run: scripts/release-publication-e2e.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
