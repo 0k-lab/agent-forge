@@ -26,10 +26,17 @@ SUFFIX=${RUN##*/}
 IMAGE=agent-forge-gate-e2e:$SUFFIX
 CONTAINER=agent-forge-gate-e2e-$SUFFIX
 cleanup() {
+  local status=$?
+  trap - ERR
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-  docker run --rm --user 0:0 --entrypoint /bin/chown -v "$RUN:/cleanup" "$IMAGE" -R 0:0 /cleanup >/dev/null 2>&1 || true
+  docker run --rm --user 0:0 --entrypoint /bin/chmod -v "$RUN:/cleanup" "$IMAGE" \
+    -R a+rwx /cleanup/state /cleanup/repositories >/dev/null 2>&1 || true
   docker image rm -f "$IMAGE" >/dev/null 2>&1 || true
-  rm -rf -- "$RUN"
+  if ! rm -rf -- "$RUN"; then
+    printf '::error file=scripts/oci-gate-e2e.sh::cleanup could not remove its temporary directory\n' >&2
+    status=1
+  fi
+  return "$status"
 }
 trap cleanup EXIT
 
