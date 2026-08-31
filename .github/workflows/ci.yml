@@ -10,6 +10,17 @@ permissions:
   contents: read
 
 jobs:
+  oci-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: OCI release helper self-tests
+        run: python3 scripts/oci-release-self-test.py
+      - name: Verify OCI Gate contract
+        run: scripts/oci-gate-contract.sh
+      - name: Native OCI Gate E2E
+        run: scripts/oci-gate-e2e.sh v999.0.0 "$GITHUB_SHA"
+
   test:
     runs-on: ubuntu-latest
     steps:

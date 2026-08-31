@@ -13,10 +13,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish-linux:
+  prepare-linux:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       id-token: write
       attestations: write
     steps:
@@ -99,6 +99,160 @@ jobs:
         with:
           subject-checksums: release/SHA256SUMS
           sbom-path: release/agent-forge_${{ steps.identity.outputs.version }}_linux.spdx.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agent-forge-linux-${{ github.sha }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-oci-gate:
+    needs: prepare-linux
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate exact annotated release tag
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$GITHUB_REF_NAME"
+          commit="$(git rev-parse HEAD)"
+          scripts/validate-release-tag.sh "$version" "$commit"
+          printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+          printf 'commit=%s\n' "$commit" >>"$GITHUB_OUTPUT"
+      - name: Require existing public GHCR package
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/ghcr-package-public.py
+      - name: Probe exact GHCR tag
+        id: tag
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/ghcr-tag-state.py 0k-lab/agent-forge-gate "${{ steps.identity.outputs.version }}" >>"$GITHUB_OUTPUT"
+      - name: Refuse an existing stable tag
+        if: steps.tag.outputs.state != 'absent'
+        run: |
+          echo "OCI tag already exists; stable tags are never resumed or rerun. Correct the release and use the next patch version." >&2
+          exit 1
+      - name: Use isolated authenticated Docker config
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$RUNNER_TEMP/agent-forge-oci-auth"
+          printf 'DOCKER_CONFIG=%s\n' "$RUNNER_TEMP/agent-forge-oci-auth" >>"$GITHUB_ENV"
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and push multi-architecture Gate image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: Dockerfile.gate
+          platforms: linux/amd64,linux/arm64
+          push: true
+          pull: true
+          no-cache: true
+          sbom: true
+          provenance: mode=max
+          tags: ghcr.io/0k-lab/agent-forge-gate:${{ steps.identity.outputs.version }}
+          build-args: |
+            VERSION=${{ steps.identity.outputs.version }}
+            COMMIT=${{ steps.identity.outputs.commit }}
+      - name: Attest registry image provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/0k-lab/agent-forge-gate
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: Remove GHCR credentials
+        run: |
+          set -euo pipefail
+          [ "$DOCKER_CONFIG" = "$RUNNER_TEMP/agent-forge-oci-auth" ]
+          docker logout ghcr.io
+          rm -rf -- "$RUNNER_TEMP/agent-forge-oci-auth"
+          install -d -m 0700 "$RUNNER_TEMP/agent-forge-oci-anonymous"
+          printf 'DOCKER_CONFIG=%s\n' "$RUNNER_TEMP/agent-forge-oci-anonymous" >>"$GITHUB_ENV"
+      - name: Anonymously verify exact index
+        id: image
+        env:
+          IMAGE: ghcr.io/0k-lab/agent-forge-gate
+          VERSION: ${{ steps.identity.outputs.version }}
+          EXPECTED_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect --raw "$IMAGE:$VERSION" >"$RUNNER_TEMP/agent-forge-gate-index.json"
+          python3 scripts/verify-oci-gate-release.py \
+            "$RUNNER_TEMP/agent-forge-gate-index.json" "$EXPECTED_DIGEST" >>"$GITHUB_OUTPUT"
+          printf 'digest=%s\n' "$EXPECTED_DIGEST" >>"$GITHUB_OUTPUT"
+      - name: Anonymously validate both runtime images
+        env:
+          IMAGE: ghcr.io/0k-lab/agent-forge-gate
+          VERSION: ${{ steps.identity.outputs.version }}
+          COMMIT: ${{ steps.identity.outputs.commit }}
+        run: |
+          set -euo pipefail
+          for architecture in amd64 arm64; do
+            case "$architecture" in
+              amd64) digest="${{ steps.image.outputs.amd64_digest }}" ;;
+              arm64) digest="${{ steps.image.outputs.arm64_digest }}" ;;
+            esac
+            reference="$IMAGE@$digest"
+            docker pull --platform "linux/$architecture" "$reference"
+            [ "$(docker image inspect --format '{{.Architecture}}' "$reference")" = "$architecture" ]
+            [ "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.source"}}' "$reference")" = https://github.com/0k-lab/agent-forge ]
+            [ "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$reference")" = "$VERSION" ]
+            [ "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$reference")" = "$COMMIT" ]
+            [ "$(docker image inspect --format '{{.Config.User}}' "$reference")" = 65532:65532 ]
+            [ "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$reference")" = '["/usr/local/bin/forge-gate"]' ]
+            [ "$(docker image inspect --format '{{json .Config.Cmd}}' "$reference")" = '["-config","/etc/agent-forge/gate.json"]' ]
+            [ "$(docker run --rm --platform "linux/$architecture" "$reference" --version)" = "forge-gate $VERSION $COMMIT" ]
+          done
+          docker buildx imagetools inspect --raw "$IMAGE:$VERSION" >"$RUNNER_TEMP/agent-forge-gate-index-recheck.json"
+          python3 scripts/verify-oci-gate-release.py \
+            "$RUNNER_TEMP/agent-forge-gate-index-recheck.json" "${{ steps.build.outputs.digest }}" >/dev/null
+
+  publish-linux:
+    needs: [prepare-linux, publish-oci-gate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate exact annotated release tag
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$GITHUB_REF_NAME"
+          commit="$(git rev-parse HEAD)"
+          scripts/validate-release-tag.sh "$version" "$commit"
+          printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+          printf 'commit=%s\n' "$commit" >>"$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: agent-forge-linux-${{ github.sha }}
+          path: release
+      - name: Verify downloaded Linux release
+        run: python3 scripts/verify-linux-release.py "${{ steps.identity.outputs.version }}" release
       - name: Publish verified GitHub Release
         env:
           GITHUB_TOKEN: ${{ github.token }}

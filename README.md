@@ -7,7 +7,7 @@ A minimal Go vertical slice: submit a job to **forge-gate**, persist it in SQLit
 - **Gate** owns repository registrations and authorization, public-source clone/fetch/reuse, prepared local repository paths, Worker pools and authenticated slots, submission-time lifecycle/execution policy resolution, leases, exact GitHub App publication, CI observation/merge, and authoritative SQLite state.
 - **Worker** consumes Gate-prepared local repositories, edits, runs only instructed checks, commits locally, and returns the candidate SHA/evidence. External repository URLs and GitHub credentials never cross the Gate/Worker boundary; Worker never clones, pushes, or writes external APIs.
 - **Plugin** uses the strict NDJSON [plugin protocol v1](docs/plugin-protocol-v1.md). The reference plugin implements `text`; `forge-codex-plugin` implements `workspace_edit`, invokes `CODEX_BIN` (default `codex`) with bounded output and a timeout, obtains the actual-diff commit subject through Codex structured output, and never reports business success or commits.
-- This MVP deliberately has no control panel, Docker, reviewer, mTLS, PostgreSQL, or plugin marketplace. Its only browser UI is a read-only debug viewer. GitHub delivery is optional.
+- This MVP deliberately has no control panel, universal Worker image, reviewer, mTLS, PostgreSQL, or plugin marketplace. Its only browser UI is a read-only debug viewer. GitHub delivery is optional.
 
 ## Build and test
 
@@ -46,7 +46,57 @@ The canonical matrix is:
 
 Every archive contains a `VERSION` file, and each runtime binary supports `--version`. CI runs `scripts/release-artifacts-e2e.sh` and uploads the verified full matrix as short-lived workflow artifacts.
 
-A pushed annotated `vMAJOR.MINOR.PATCH` tag starts `.github/workflows/release.yml`; prerelease suffixes, lightweight tags, and commits outside `origin/main` are rejected. The tag pipeline selects the six Linux archives, writes a Linux-only `SHA256SUMS`, generates an SPDX JSON SBOM with pinned Syft, and creates GitHub build-provenance and SBOM attestations through OIDC. It then uploads the exact verified asset set to a draft GitHub Release, verifies every remote SHA-256 digest, and publishes the draft. Existing releases and assets are never replaced. If upload fails after draft creation, the partial draft is deliberately retained and a rerun refuses it; an operator must inspect it and explicitly decide whether to delete it before retrying. macOS is distributed through a Homebrew Formula and bottles rather than as GitHub Release assets; Cask and Apple notarization are not part of this CLI release path.
+## OCI Gate image
+
+Gate is published separately as the publicly pullable multi-architecture image `ghcr.io/0k-lab/agent-forge-gate:vMAJOR.MINOR.PATCH`. The release workflow publishes only that exact version tag—never `latest`, major, or minor tags—and refuses any version tag that already exists. Failed stable tags are never resumed or rerun; correct the release and use the next patch version. This is workflow policy, not registry-enforced immutability. Pinning the resolved index digest remains the strongest production reference, for example `ghcr.io/0k-lab/agent-forge-gate@sha256:<index-digest>`.
+
+### One-time GHCR bootstrap before the first stable OCI release
+
+Use a GitHub token with `write:packages` and permission to publish for `0k-lab/agent-forge`. Keep it in `GHCR_TOKEN`, never in argv or the image. From a clean checkout of the exact reviewed `main` commit:
+
+```sh
+export GHCR_USER='<github-user>'
+export GHCR_TOKEN='<write-packages-token>'
+COMMIT=$(git rev-parse HEAD)
+printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USER" --password-stdin
+docker buildx build --file Dockerfile.gate \
+  --platform linux/amd64,linux/arm64 --pull --no-cache --sbom=true --provenance=mode=max \
+  --build-arg VERSION=v0.0.0 --build-arg COMMIT="$COMMIT" \
+  --tag "ghcr.io/0k-lab/agent-forge-gate:bootstrap-$COMMIT" --push .
+docker logout ghcr.io
+unset GHCR_TOKEN
+```
+
+The pinned Dockerfile bases and source label create the package and link it to this repository. Confirm the repository link and make the package public in GitHub Package settings. Then use a fresh Docker config with no GHCR credentials to verify an anonymous pull of the bootstrap image:
+
+```sh
+DOCKER_CONFIG=$(mktemp -d)
+export DOCKER_CONFIG
+docker pull "ghcr.io/0k-lab/agent-forge-gate:bootstrap-$COMMIT"
+rm -rf "$DOCKER_CONFIG"
+unset DOCKER_CONFIG
+```
+
+Confirm the package metadata reports public visibility; only then create the stable git tag. After the first stable image is published and verified, the bootstrap package version may be removed through GitHub Package settings.
+
+The stable-tag workflow only reads package metadata and fails before any image write when the package is absent or nonpublic. It does not and cannot change package visibility through GitHub's supported REST API. GHCR has no registry-enforced create-only or immutable tag operation: repository Actions concurrency is the single-writer control, the workflow checks absence through an authenticated registry request, and it verifies the exact index digest again after descriptor-bound runtime checks. Consumers that require cryptographic identity must pin the digest rather than trusting a mutable tag.
+
+The image runs as UID/GID `65532:65532`. Mount Gate config read-only, mount `/var/lib/agent-forge/state` writable, and supply tokens through environment variables or mounted secret files referenced by the runtime environment. The image contains Gate and Git for supported public-source/delivery operation; it does not contain Worker, CLI, or plugin binaries, and no universal Worker image is published.
+
+```sh
+docker run --rm --read-only --cap-drop=ALL \
+  --security-opt=no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,noexec \
+  -p 18080:18080 \
+  --mount type=bind,src="$PWD/gate.json",dst=/etc/agent-forge/gate.json,readonly \
+  --mount type=bind,src="$PWD/state",dst=/var/lib/agent-forge/state \
+  --mount type=bind,src="$PWD/repositories",dst=/var/lib/agent-forge/repositories \
+  -e FORGE_OWNER_TOKEN -e FORGE_WORKER_TOKEN \
+  ghcr.io/0k-lab/agent-forge-gate:v0.1.0
+```
+
+Create the host state and repositories directories owned by `65532:65532`; config should listen on `0.0.0.0:18080`, place SQLite under the mounted state directory, and use the mounted repositories directory for public-source storage. Keep secret values out of the image and config.
+
+A pushed annotated `vMAJOR.MINOR.PATCH` tag starts `.github/workflows/release.yml`; prerelease suffixes, lightweight tags, and commits outside `origin/main` are rejected. The tag pipeline selects the six Linux archives, writes a Linux-only `SHA256SUMS`, generates an SPDX JSON SBOM with pinned Syft, creates GitHub build-provenance and SBOM attestations through OIDC, and completes privileged disposable acceptance before any OCI push. It uploads those exact prepared assets as a short-lived workflow artifact, publishes and anonymously validates the Gate image, then downloads and revalidates the prepared assets before GitHub Release publication. Existing releases and assets are never replaced. If upload fails after draft creation, the partial draft is deliberately retained and the stable version is not rerun; an operator must inspect it, and any corrected release uses the next patch version. macOS is distributed through a Homebrew Formula and bottles rather than as GitHub Release assets; Cask and Apple notarization are not part of this CLI release path.
 
 ## Linux install and upgrade
 
