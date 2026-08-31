@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,76 @@ import (
 	"testing"
 	"time"
 )
+
+func TestHostServiceStateUsesFixedShowQueryAndExactParsing(t *testing.T) {
+	previous := systemctlStateOutput
+	t.Cleanup(func() { systemctlStateOutput = previous })
+	for _, tc := range []struct {
+		name string
+		body string
+		want ServiceState
+	}{
+		{"enabled active", "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n", ServiceState{Enabled: true, Active: true}},
+		{"disabled inactive", "LoadState=loaded\nActiveState=inactive\nUnitFileState=disabled\n", ServiceState{}},
+		{"disabled active", "LoadState=loaded\nActiveState=active\nUnitFileState=disabled\n", ServiceState{Active: true}},
+		{"enabled inactive", "LoadState=loaded\nActiveState=inactive\nUnitFileState=enabled\n", ServiceState{Enabled: true}},
+		{"linked inactive", "LoadState=loaded\nActiveState=inactive\nUnitFileState=linked\n", ServiceState{}},
+		{"linked active", "LoadState=loaded\nActiveState=active\nUnitFileState=linked\n", ServiceState{Active: true}},
+		{"not found", "LoadState=not-found\nActiveState=inactive\nUnitFileState=\n", ServiceState{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var argv []string
+			systemctlStateOutput = func(args ...string) ([]byte, error) {
+				argv = append([]string(nil), args...)
+				return []byte(tc.body), nil
+			}
+			got, err := (HostServiceManager{}).State("agent-forge-gate.service")
+			if err != nil || got != tc.want {
+				t.Fatalf("state=%+v err=%v", got, err)
+			}
+			wantArgv := "show --no-pager --property=LoadState --property=ActiveState --property=UnitFileState agent-forge-gate.service"
+			if strings.Join(argv, " ") != wantArgv {
+				t.Fatalf("argv=%q", argv)
+			}
+		})
+	}
+}
+
+func TestHostServiceStateRejectsAmbiguousOutputAndCommandFailure(t *testing.T) {
+	previous := systemctlStateOutput
+	t.Cleanup(func() { systemctlStateOutput = previous })
+	for _, tc := range []struct {
+		name string
+		body string
+		err  error
+	}{
+		{"malformed", "LoadState loaded\nActiveState=active\nUnitFileState=enabled\n", nil},
+		{"missing", "LoadState=loaded\nActiveState=active\n", nil},
+		{"duplicate", "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\nActiveState=active\n", nil},
+		{"unknown key", "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\nDescription=secret\n", nil},
+		{"failed", "LoadState=loaded\nActiveState=failed\nUnitFileState=enabled\n", nil},
+		{"activating", "LoadState=loaded\nActiveState=activating\nUnitFileState=enabled\n", nil},
+		{"masked", "LoadState=loaded\nActiveState=inactive\nUnitFileState=masked\n", nil},
+		{"static", "LoadState=loaded\nActiveState=inactive\nUnitFileState=static\n", nil},
+		{"linked runtime", "LoadState=loaded\nActiveState=inactive\nUnitFileState=linked-runtime\n", nil},
+		{"alias", "LoadState=loaded\nActiveState=inactive\nUnitFileState=alias\n", nil},
+		{"unknown load", "LoadState=error\nActiveState=inactive\nUnitFileState=disabled\n", nil},
+		{"inconsistent not found", "LoadState=not-found\nActiveState=active\nUnitFileState=\n", nil},
+		{"oversized", strings.Repeat("x", serviceStateOutputLimit+1), nil},
+		{"nonzero", "raw secret output", errors.New("raw secret command error")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			systemctlStateOutput = func(...string) ([]byte, error) { return []byte(tc.body), tc.err }
+			_, err := (HostServiceManager{}).State("agent-forge-worker.service")
+			if err == nil {
+				t.Fatal("accepted ambiguous service state")
+			}
+			if strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), tc.body) {
+				t.Fatalf("exposed raw systemctl output: %v", err)
+			}
+		})
+	}
+}
 
 func TestGateReadyRequiresStrictOwnerBoundProof(t *testing.T) {
 	oldURL, oldWindow := gateBaseURL, readinessWindow

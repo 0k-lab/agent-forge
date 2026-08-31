@@ -42,6 +42,7 @@ jobs:
       - name: Privileged Linux installer E2E
         env:
           AGENT_FORGE_PRIVILEGED_E2E: "1"
+          AGENT_FORGE_UNINSTALL_ACCEPTANCE: ""
         run: |
           linux_assets="$RUNNER_TEMP/agent-forge-linux-release"
           old_linux_assets="$RUNNER_TEMP/agent-forge-old-linux-release"
@@ -74,6 +75,7 @@ jobs:
             RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
             RUNNER_TEMP="$RUNNER_TEMP" \
             AGENT_FORGE_PRIVILEGED_E2E="$AGENT_FORGE_PRIVILEGED_E2E" \
+            AGENT_FORGE_UNINSTALL_ACCEPTANCE="$AGENT_FORGE_UNINSTALL_ACCEPTANCE" \
             AGENT_FORGE_UPGRADE_FROM_VERSION=v0.1.3 \
             AGENT_FORGE_UPGRADE_FROM_COMMIT=dfa09f5fd82a01b79c977cae20299db79ede9bdc \
             AGENT_FORGE_UPGRADE_FROM_ASSET_DIR="$old_linux_assets" \
@@ -87,3 +89,53 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 7
+
+  uninstall-acceptance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build deterministic candidate release assets
+        run: scripts/release-artifacts-e2e.sh "$GITHUB_SHA" v999.0.0
+      - name: Privileged uninstall acceptance from v0.1.5
+        env:
+          AGENT_FORGE_PRIVILEGED_E2E: "1"
+          AGENT_FORGE_UNINSTALL_ACCEPTANCE: "1"
+        run: |
+          linux_assets="$RUNNER_TEMP/agent-forge-linux-release"
+          old_linux_assets="$RUNNER_TEMP/agent-forge-v0.1.5-linux-release"
+          scripts/prepare-linux-release.sh v999.0.0 "$PWD/dist" "$linux_assets"
+          mkdir "$old_linux_assets"
+          for asset in \
+            SHA256SUMS \
+            agent-forge-cli_v0.1.5_linux_amd64.tar.gz \
+            agent-forge-gate_v0.1.5_linux_amd64.tar.gz \
+            agent-forge-worker_v0.1.5_linux_amd64.tar.gz; do
+            curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 3 --retry-all-errors --retry-delay 1 \
+              --output "$old_linux_assets/$asset" \
+              "https://github.com/0k-lab/agent-forge/releases/download/v0.1.5/$asset"
+          done
+          printf '%s  %s\n' e983a4f637cbbdb623d8366d6abf41d84cf9fa43bf297edefc6b3aeca7a8dbee "$old_linux_assets/SHA256SUMS" | sha256sum --check --strict
+          for archive in \
+            agent-forge-cli_v0.1.5_linux_amd64.tar.gz \
+            agent-forge-gate_v0.1.5_linux_amd64.tar.gz \
+            agent-forge-worker_v0.1.5_linux_amd64.tar.gz; do
+            awk -v name="$archive" '$2 == name && NF == 2' "$old_linux_assets/SHA256SUMS" >"$RUNNER_TEMP/agent-forge-v0.1.5-check"
+            [ "$(wc -l <"$RUNNER_TEMP/agent-forge-v0.1.5-check")" -eq 1 ]
+            (cd "$old_linux_assets" && sha256sum --check --strict "$RUNNER_TEMP/agent-forge-v0.1.5-check")
+          done
+          sudo /usr/bin/env \
+            CI="$CI" \
+            GITHUB_ACTIONS="$GITHUB_ACTIONS" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            RUNNER_TEMP="$RUNNER_TEMP" \
+            AGENT_FORGE_PRIVILEGED_E2E="$AGENT_FORGE_PRIVILEGED_E2E" \
+            AGENT_FORGE_UNINSTALL_ACCEPTANCE="$AGENT_FORGE_UNINSTALL_ACCEPTANCE" \
+            AGENT_FORGE_UPGRADE_FROM_VERSION=v0.1.5 \
+            AGENT_FORGE_UPGRADE_FROM_COMMIT=8fb034dc678793bbc1ecbe1cb9c9083e622c08fe \
+            AGENT_FORGE_UPGRADE_FROM_ASSET_DIR="$old_linux_assets" \
+            "$PWD/scripts/linux-installer-privileged-e2e.sh" \
+            v999.0.0 "$GITHUB_SHA" "$linux_assets"

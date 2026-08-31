@@ -45,12 +45,13 @@ func (HostOwnershipManager) Owner(name string) (int, int, error) {
 type HostAccountManager struct{}
 
 const (
-	groupaddPath  = "/usr/sbin/groupadd"
-	groupdelPath  = "/usr/sbin/groupdel"
-	useraddPath   = "/usr/sbin/useradd"
-	userdelPath   = "/usr/sbin/userdel"
-	getentPath    = "/usr/bin/getent"
-	systemctlPath = "/usr/bin/systemctl"
+	groupaddPath            = "/usr/sbin/groupadd"
+	groupdelPath            = "/usr/sbin/groupdel"
+	useraddPath             = "/usr/sbin/useradd"
+	userdelPath             = "/usr/sbin/userdel"
+	getentPath              = "/usr/bin/getent"
+	systemctlPath           = "/usr/bin/systemctl"
+	serviceStateOutputLimit = 1024
 )
 
 var (
@@ -172,6 +173,32 @@ func validateServiceAccountRecord(body []byte, name, home, gid string) error {
 // HostServiceManager invokes systemctl with an argument vector and no shell.
 type HostServiceManager struct{}
 
+type boundedOutput struct {
+	bytes.Buffer
+	overflow bool
+}
+
+func (b *boundedOutput) Write(p []byte) (int, error) {
+	written := len(p)
+	remaining := serviceStateOutputLimit - b.Len()
+	if len(p) > remaining {
+		p = p[:max(remaining, 0)]
+		b.overflow = true
+	}
+	_, err := b.Buffer.Write(p)
+	return written, err
+}
+
+var systemctlStateOutput = func(argv ...string) ([]byte, error) {
+	cmd := privilegedCommand(systemctlPath, argv...)
+	var output boundedOutput
+	cmd.Stdout, cmd.Stderr = &output, io.Discard
+	if err := cmd.Run(); err != nil || output.overflow {
+		return nil, errors.New("systemctl state query failed")
+	}
+	return output.Bytes(), nil
+}
+
 func (HostServiceManager) Run(argv ...string) error {
 	if len(argv) == 0 {
 		return errors.New("empty systemctl invocation")
@@ -180,6 +207,52 @@ func (HostServiceManager) Run(argv ...string) error {
 		return errors.New("systemctl operation failed")
 	}
 	return nil
+}
+
+func (HostServiceManager) State(unit string) (ServiceState, error) {
+	if unit != "agent-forge-gate.service" && unit != "agent-forge-worker.service" {
+		return ServiceState{}, errors.New("unsupported service state query")
+	}
+	body, err := systemctlStateOutput("show", "--no-pager", "--property=LoadState", "--property=ActiveState", "--property=UnitFileState", unit)
+	if err != nil || len(body) == 0 || len(body) > serviceStateOutputLimit {
+		return ServiceState{}, errors.New("systemctl state query failed")
+	}
+	values := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSuffix(string(body), "\n"), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || key != "LoadState" && key != "ActiveState" && key != "UnitFileState" {
+			return ServiceState{}, errors.New("invalid systemctl state")
+		}
+		if _, duplicate := values[key]; duplicate {
+			return ServiceState{}, errors.New("invalid systemctl state")
+		}
+		values[key] = value
+	}
+	if len(values) != 3 {
+		return ServiceState{}, errors.New("invalid systemctl state")
+	}
+	if values["LoadState"] == "not-found" && values["ActiveState"] == "inactive" && values["UnitFileState"] == "" {
+		return ServiceState{}, nil
+	}
+	if values["LoadState"] != "loaded" {
+		return ServiceState{}, errors.New("ambiguous systemctl state")
+	}
+	state := ServiceState{}
+	switch values["ActiveState"] {
+	case "active":
+		state.Active = true
+	case "inactive":
+	default:
+		return ServiceState{}, errors.New("ambiguous systemctl state")
+	}
+	switch values["UnitFileState"] {
+	case "enabled":
+		state.Enabled = true
+	case "disabled", "linked":
+	default:
+		return ServiceState{}, errors.New("ambiguous systemctl state")
+	}
+	return state, nil
 }
 
 func readinessClient() *http.Client {

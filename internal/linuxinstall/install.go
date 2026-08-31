@@ -61,6 +61,12 @@ type ServiceManager interface {
 	GateReady(ownerToken, version, commit string) error
 	WorkerReady(ownerToken string) error
 }
+type ServiceState struct {
+	Enabled, Active bool
+}
+type ServiceStateManager interface {
+	State(unit string) (ServiceState, error)
+}
 type OwnershipManager interface {
 	Chown(name string, uid, gid int) error
 	Owner(name string) (uid, gid int, err error)
