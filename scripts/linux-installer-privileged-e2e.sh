@@ -72,6 +72,11 @@ case "$ASSET_DIR" in /*) ;; *) usage ;; esac
 # run on a persistent or self-hosted machine.
 STAGE=runner-preflight
 [ "${AGENT_FORGE_PRIVILEGED_E2E:-}" = 1 ] || { echo "privileged E2E opt-in is required" >&2; exit 1; }
+UNINSTALL_ACCEPTANCE=${AGENT_FORGE_UNINSTALL_ACCEPTANCE:-}
+case "$UNINSTALL_ACCEPTANCE" in
+  ''|1) ;;
+  *) echo "invalid uninstall acceptance opt-in" >&2; exit 1 ;;
+esac
 [ "${CI:-}" = true ] && [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] || {
   echo "privileged E2E requires a disposable GitHub-hosted runner" >&2
   exit 1
@@ -95,6 +100,10 @@ if [ -n "$OLD_VERSION$OLD_COMMIT$OLD_ASSET_DIR" ]; then
     exit 1
   }
 fi
+[ "$UNINSTALL_ACCEPTANCE" != 1 ] || [ -n "$OLD_VERSION" ] || {
+  echo "uninstall acceptance requires an upgrade baseline" >&2
+  exit 1
+}
 
 for tool in chmod cmp getent grep id journalctl mkfifo mktemp mount readlink rm runuser sha256sum stat systemctl tar tr umount uname wc python3; do
   command -v "$tool" >/dev/null 2>&1 || { echo "missing required tool: $tool" >&2; exit 1; }
@@ -445,6 +454,66 @@ PY
   } >"$output"
 }
 
+run_candidate_uninstall_acceptance() {
+  UNINSTALL_BEFORE="$TMP/uninstall-before"
+  UNINSTALL_AFTER="$TMP/uninstall-after"
+  ACCOUNT_BEFORE="$TMP/account-before"
+  ACCOUNT_AFTER="$TMP/account-after"
+  snapshot_upgrade_preserved_state "$UNINSTALL_BEFORE"
+  {
+    getent passwd agent-forge
+    getent group agent-forge
+  } >"$ACCOUNT_BEFORE"
+  STAGE=candidate-uninstall
+  uninstall_log="$TMP/uninstall.log"
+  uninstall_pipe="$TMP/uninstall.pipe"
+  /usr/bin/mkfifo "$uninstall_pipe"
+  /usr/bin/python3 "$DIAGNOSTICS" capture "$uninstall_pipe" "$uninstall_log" &
+  capture_pid=$!
+  if /opt/agent-forge/bin/forge uninstall >"$uninstall_pipe" 2>&1; then
+    uninstall_rc=0
+  else
+    uninstall_rc=$?
+  fi
+  wait "$capture_pid"
+  /usr/bin/rm -f "$uninstall_pipe"
+  if [ "$uninstall_rc" -ne 0 ]; then
+    uninstall_stage=$(/usr/bin/python3 "$DIAGNOSTICS" parse "$uninstall_log")
+    [ -z "$uninstall_stage" ] || printf '::error title=Privileged Linux uninstall stage::install_stage=%s\n' "$uninstall_stage" >&2
+    exit 1
+  fi
+  [ ! -s "$uninstall_log" ] || { echo "uninstall emitted unexpected output" >&2; exit 1; }
+  for unit in agent-forge-gate.service agent-forge-worker.service; do
+    [ "$(systemctl is-active "$unit" 2>/dev/null || true)" != active ]
+    ! systemctl is-enabled "$unit" >/dev/null 2>&1
+    [ "$(systemctl show --property=LoadState --value "$unit")" = not-found ]
+  done
+  for path in \
+    /opt/agent-forge/bin/forge \
+    /opt/agent-forge/bin/forge-gate \
+    /opt/agent-forge/bin/forge-worker \
+    /opt/agent-forge/bin/forge-codex-plugin \
+    /opt/agent-forge/bin/forge-ref-plugin \
+    /opt/agent-forge/systemd/agent-forge-gate.service \
+    /opt/agent-forge/systemd/agent-forge-worker.service \
+    /opt/agent-forge/install-receipt.json \
+    /opt/.agent-forge.previous \
+    /etc/systemd/system/agent-forge-gate.service \
+    /etc/systemd/system/agent-forge-worker.service; do
+    [ ! -e "$path" ] && [ ! -L "$path" ] || { echo "uninstall retained release path: $path" >&2; exit 1; }
+  done
+  for path in /opt/.agent-forge.uninstall-*; do
+    [ ! -e "$path" ] && [ ! -L "$path" ] || { echo "uninstall retained quarantine: $path" >&2; exit 1; }
+  done
+  snapshot_upgrade_preserved_state "$UNINSTALL_AFTER"
+  cmp "$UNINSTALL_BEFORE" "$UNINSTALL_AFTER" || { echo "uninstall changed preserved state" >&2; exit 1; }
+  {
+    getent passwd agent-forge
+    getent group agent-forge
+  } >"$ACCOUNT_AFTER"
+  cmp "$ACCOUNT_BEFORE" "$ACCOUNT_AFTER" || { echo "uninstall changed dedicated account" >&2; exit 1; }
+}
+
 STAGE=initial-install
 if [ -n "$OLD_VERSION" ]; then
   install_release "$OLD_BOOTSTRAP" "$OLD_VERSION" "$OLD_COMMIT" "$OLD_ASSET_DIR" "$OLD_ANCHOR" clean
@@ -618,6 +687,13 @@ EOF
   assert_tokens_not_exposed
   snapshot_upgrade_preserved_state "$UPGRADE_AFTER"
   cmp "$UPGRADE_BEFORE" "$UPGRADE_AFTER" || { echo "upgrade changed preserved state" >&2; exit 1; }
+
+  if [ "$UNINSTALL_ACCEPTANCE" = 1 ]; then
+    run_candidate_uninstall_acceptance
+    STAGE=complete
+    echo "privileged Linux installer e2e: PASS"
+    exit 0
+  fi
 
   STAGE=explicit-rollback
   /opt/agent-forge/bin/forge rollback >"$TMP/rollback-output" 2>&1

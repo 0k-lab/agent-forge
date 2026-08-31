@@ -231,10 +231,36 @@ type fakeServices struct {
 	ready                int
 	failAt               string
 	failOnce             bool
+	states               map[string]ServiceState
+	stateCalls           []string
+	stateFailures        map[int]error
+	stateResults         map[int]ServiceState
 	workerReadyCalls     int
 	blockWorkerReadyCall int
 	workerReadyEntered   chan struct{}
 	workerReadyRelease   chan struct{}
+}
+
+func (f *fakeServices) serviceState(unit string) ServiceState {
+	if f.states == nil {
+		f.states = map[string]ServiceState{
+			"agent-forge-gate.service":   {Enabled: true, Active: true},
+			"agent-forge-worker.service": {Enabled: true, Active: true},
+		}
+	}
+	return f.states[unit]
+}
+
+func (f *fakeServices) State(unit string) (ServiceState, error) {
+	f.stateCalls = append(f.stateCalls, unit)
+	call := len(f.stateCalls)
+	if err := f.stateFailures[call]; err != nil {
+		return ServiceState{}, err
+	}
+	if state, ok := f.stateResults[call]; ok {
+		return state, nil
+	}
+	return f.serviceState(unit), nil
 }
 
 func (f *fakeServices) fails(name string) bool {
@@ -249,6 +275,20 @@ func (f *fakeServices) fails(name string) bool {
 
 func (f *fakeServices) Run(argv ...string) error {
 	f.calls = append(f.calls, append([]string(nil), argv...))
+	if len(argv) == 2 {
+		state := f.serviceState(argv[1])
+		switch argv[0] {
+		case "enable":
+			state.Enabled = true
+		case "disable":
+			state.Enabled = false
+		case "start":
+			state.Active = true
+		case "stop":
+			state.Active = false
+		}
+		f.states[argv[1]] = state
+	}
 	if f.fails(strings.Join(argv, " ")) {
 		return errors.New("injected service failure")
 	}

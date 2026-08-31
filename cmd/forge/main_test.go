@@ -49,6 +49,46 @@ func TestRollbackCommandRequiresRootNoArgsAndPassesCLIIdentity(t *testing.T) {
 	}
 }
 
+func TestUninstallCommandRequiresRootNoArgsAndPassesCLIIdentity(t *testing.T) {
+	previousUninstall, previousUID := uninstallLinux, effectiveUID
+	previousVersion, previousCommit := buildinfo.Version, buildinfo.Commit
+	t.Cleanup(func() {
+		uninstallLinux, effectiveUID = previousUninstall, previousUID
+		buildinfo.Version, buildinfo.Commit = previousVersion, previousCommit
+	})
+	buildinfo.Version = "v1.2.4"
+	buildinfo.Commit = "89abcdef0123456789abcdef0123456789abcdef"
+	effectiveUID = func() int { return 0 }
+	var got linuxinstall.UninstallOptions
+	uninstallLinux = func(o linuxinstall.UninstallOptions) error { got = o; return nil }
+	var stdout, stderr bytes.Buffer
+	if err := run([]string{"uninstall"}, env(nil), nil, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if got.Version != buildinfo.Version || got.Commit != buildinfo.Commit || got.Arch == "" || got.Account == nil || got.Ownership == nil || got.Services == nil {
+		t.Fatalf("uninstall options = %#v", got)
+	}
+	if err := run([]string{"uninstall", "extra"}, env(nil), nil, io.Discard, io.Discard); err == nil {
+		t.Fatal("accepted uninstall arguments")
+	}
+	effectiveUID = func() int { return 1000 }
+	if err := run([]string{"uninstall"}, env(nil), nil, io.Discard, io.Discard); err == nil {
+		t.Fatal("accepted non-root uninstall")
+	}
+	effectiveUID = func() int { return 0 }
+	uninstallLinux = func(linuxinstall.UninstallOptions) error {
+		return linuxinstall.Uninstall(linuxinstall.UninstallOptions{})
+	}
+	err := run([]string{"uninstall"}, env(nil), nil, io.Discard, io.Discard)
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr.Code != CodeInvalidInput || cliErr.InstallStage != "validate" {
+		t.Fatalf("uninstall error = %#v", err)
+	}
+}
+
 func TestInstallCommandRequiresOfflineTrustInputsAndExplicitRootMode(t *testing.T) {
 	previous := installLinux
 	previousUID := effectiveUID

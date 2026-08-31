@@ -41,7 +41,7 @@ func rejectTransactionMaterial(parent string) error {
 		return err
 	}
 	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), ".agent-forge.upgrade-") || strings.HasPrefix(entry.Name(), ".agent-forge.rollback-") {
+		if strings.HasPrefix(entry.Name(), ".agent-forge.upgrade-") || strings.HasPrefix(entry.Name(), ".agent-forge.rollback-") || strings.HasPrefix(entry.Name(), ".agent-forge.uninstall-") {
 			return errors.New("ambiguous installer transaction material")
 		}
 	}
