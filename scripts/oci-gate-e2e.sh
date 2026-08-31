@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+
+on_error() {
+  local status=$? line=$1 command=$2
+  printf '::error file=scripts/oci-gate-e2e.sh,line=%s::command failed (exit %s): %s\n' \
+    "$line" "$status" "$command" >&2
+  return "$status"
+}
+trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 
 if [[ ${OCI_GATE_E2E_BOUNDED:-} != 1 ]]; then
   exec timeout --signal=TERM 10m env OCI_GATE_E2E_BOUNDED=1 "$0" "$@"
