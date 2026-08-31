@@ -414,6 +414,10 @@ func validate(o *Options) error {
 }
 
 func verifyAssets(o Options) ([]verifiedArchive, error) {
+	return verifyAssetsIn(o, "")
+}
+
+func verifyAssetsIn(o Options, tempDir string) ([]verifiedArchive, error) {
 	st, err := os.Lstat(o.AssetDir)
 	if err != nil || !st.IsDir() || st.Mode()&os.ModeSymlink != 0 {
 		return nil, errors.New("asset directory must be a real directory")
@@ -447,7 +451,7 @@ func verifyAssets(o Options) ([]verifiedArchive, error) {
 		if err != nil {
 			return nil, err
 		}
-		tmp, err := os.CreateTemp("", "agent-forge-verified-*.tar.gz")
+		tmp, err := os.CreateTemp(tempDir, "agent-forge-verified-*.tar.gz")
 		if err != nil {
 			src.Close()
 			return nil, err
@@ -508,20 +512,33 @@ func parseManifest(body []byte, version string) (map[string]string, error) {
 }
 
 func validateArchives(archives []verifiedArchive, version, commit string) error {
-	stage, err := os.MkdirTemp("", "agent-forge-archive-preflight-")
-	if err != nil {
-		return err
+	stage, err := validateArchivesIn(archives, version, commit, "")
+	if stage != "" {
+		defer os.RemoveAll(stage)
 	}
-	defer os.RemoveAll(stage)
+	return err
+}
+
+func validateArchivesIn(archives []verifiedArchive, version, commit, tempDir string) (string, error) {
+	stage, err := os.MkdirTemp(tempDir, "agent-forge-archive-preflight-")
+	if err != nil {
+		return "", err
+	}
 	if err := os.Chmod(stage, 0o700); err != nil {
-		return err
+		os.RemoveAll(stage)
+		return "", err
 	}
 	for _, archive := range archives {
 		if err := extractArchive(archive, stage, version, commit); err != nil {
-			return err
+			os.RemoveAll(stage)
+			return "", err
 		}
 	}
-	return verifyBinaryIdentities(stage, version, commit)
+	if err := verifyBinaryIdentities(stage, version, commit); err != nil {
+		os.RemoveAll(stage)
+		return "", err
+	}
+	return stage, nil
 }
 
 func verifyBinaryIdentities(binDir, version, commit string) error {
