@@ -39,9 +39,11 @@ const (
 type CLIError struct {
 	Code         ErrorCode
 	InstallStage string
+	cause        error
 }
 
 func (e *CLIError) Error() string { return string(e.Code) }
+func (e *CLIError) Unwrap() error { return e.cause }
 
 func fail(code ErrorCode) error { return &CLIError{Code: code} }
 
@@ -74,6 +76,10 @@ func exitStatus(err error) int {
 	if errors.As(err, &cliErr) && cliErr.Code == CodeUnhealthy {
 		return 2
 	}
+	var exitErr interface{ ExitCode() int }
+	if errors.As(err, &exitErr) && exitErr.ExitCode() > 0 {
+		return exitErr.ExitCode()
+	}
 	return 1
 }
 
@@ -87,6 +93,7 @@ type commandOptions struct {
 }
 
 var installLinux = linuxinstall.Install
+var installOnlineLinux = linuxinstall.InstallOnline
 var rollbackLinux = linuxinstall.Rollback
 var uninstallLinux = linuxinstall.Uninstall
 var doctorLinux = linuxinstall.Doctor
@@ -244,14 +251,44 @@ func runInstall(args []string) error {
 	fs.BoolVar(&o.Upgrade, "upgrade", false, "upgrade an existing installation to a newer exact release")
 	o.Account = linuxinstall.HostAccountManager{}
 	o.Services = linuxinstall.HostServiceManager{}
-	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || effectiveUID() != 0 || !regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`).MatchString(o.Version) || !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(o.Commit) || !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(o.SHA256SUMSSHA256) || !strings.HasPrefix(o.AssetDir, "/") {
+	if duplicateFlag(args) || fs.Parse(args) != nil || fs.NArg() != 0 || effectiveUID() != 0 || !regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`).MatchString(o.Version) {
 		return fail(CodeInvalidUsage)
 	}
-	if err := installLinux(o); err != nil {
+	offlineCount := 0
+	fs.Visit(func(parsed *flag.Flag) {
+		if parsed.Name == "commit" || parsed.Name == "asset-dir" || parsed.Name == "sha256sums-sha256" {
+			offlineCount++
+		}
+	})
+	var err error
+	if offlineCount == 0 {
+		err = installOnlineLinux(linuxinstall.OnlineOptions{Version: o.Version, EnableNow: o.EnableNow, RunAsRoot: o.RunAsRoot, Upgrade: o.Upgrade})
+	} else if offlineCount == 3 && regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(o.Commit) && regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(o.SHA256SUMSSHA256) && strings.HasPrefix(o.AssetDir, "/") {
+		err = installLinux(o)
+	} else {
+		return fail(CodeInvalidUsage)
+	}
+	if err != nil {
 		stage, _ := linuxinstall.FailureStage(err)
-		return &CLIError{Code: CodeInvalidInput, InstallStage: stage}
+		return &CLIError{Code: CodeInvalidInput, InstallStage: stage, cause: err}
 	}
 	return nil
+}
+
+func duplicateFlag(args []string) bool {
+	seen := map[string]bool{}
+	for _, arg := range args {
+		isFlag := strings.HasPrefix(arg, "-") && arg != "-"
+		if !isFlag {
+			continue
+		}
+		name, _, _ := strings.Cut(strings.TrimLeft(arg, "-"), "=")
+		if seen[name] {
+			return true
+		}
+		seen[name] = true
+	}
+	return false
 }
 
 type submission struct {

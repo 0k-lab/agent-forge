@@ -139,3 +139,28 @@ jobs:
             AGENT_FORGE_UPGRADE_FROM_ASSET_DIR="$old_linux_assets" \
             "$PWD/scripts/linux-installer-privileged-e2e.sh" \
             v999.0.0 "$GITHUB_SHA" "$linux_assets"
+
+  online-install-acceptance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build deterministic candidate release assets
+        run: scripts/release-artifacts-e2e.sh "$GITHUB_SHA" v999.0.0
+      - name: Privileged online clean-VM acceptance
+        env:
+          AGENT_FORGE_PRIVILEGED_E2E: "1"
+        run: |
+          linux_assets="$RUNNER_TEMP/agent-forge-online-linux-release"
+          scripts/prepare-linux-release.sh v999.0.0 "$PWD/dist" "$linux_assets"
+          sudo /usr/bin/env -i \
+            CI="$CI" \
+            GITHUB_ACTIONS="$GITHUB_ACTIONS" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            RUNNER_TEMP="$RUNNER_TEMP" \
+            AGENT_FORGE_PRIVILEGED_E2E="$AGENT_FORGE_PRIVILEGED_E2E" \
+            "$PWD/scripts/linux-online-installer-privileged-e2e.sh" \
+            v999.0.0 "$GITHUB_SHA" "$linux_assets"

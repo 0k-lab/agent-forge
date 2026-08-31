@@ -90,9 +90,9 @@ func TestUninstallCommandRequiresRootNoArgsAndPassesCLIIdentity(t *testing.T) {
 }
 
 func TestInstallCommandRequiresOfflineTrustInputsAndExplicitRootMode(t *testing.T) {
-	previous := installLinux
+	previous, previousOnline := installLinux, installOnlineLinux
 	previousUID := effectiveUID
-	t.Cleanup(func() { installLinux = previous; effectiveUID = previousUID })
+	t.Cleanup(func() { installLinux, installOnlineLinux = previous, previousOnline; effectiveUID = previousUID })
 	effectiveUID = func() int { return 0 }
 	var got linuxinstall.Options
 	installLinux = func(o linuxinstall.Options) error { got = o; return nil }
@@ -115,6 +115,57 @@ func TestInstallCommandRequiresOfflineTrustInputsAndExplicitRootMode(t *testing.
 		if err := run(bad, env(nil), nil, io.Discard, io.Discard); err == nil {
 			t.Fatalf("accepted invalid args: %v", bad)
 		}
+	}
+}
+
+func TestInstallCommandSelectsExactOnlineModeAndRejectsMixedTrustBeforeNetwork(t *testing.T) {
+	previous, previousOnline, previousUID := installLinux, installOnlineLinux, effectiveUID
+	t.Cleanup(func() { installLinux, installOnlineLinux, effectiveUID = previous, previousOnline, previousUID })
+	effectiveUID = func() int { return 0 }
+	offlineCalls, onlineCalls := 0, 0
+	installLinux = func(linuxinstall.Options) error { offlineCalls++; return nil }
+	var got linuxinstall.OnlineOptions
+	installOnlineLinux = func(o linuxinstall.OnlineOptions) error { onlineCalls++; got = o; return nil }
+
+	if err := runInstall([]string{"--version", "v1.2.3", "--enable-now", "--run-as-root", "--upgrade"}); err != nil {
+		t.Fatal(err)
+	}
+	if onlineCalls != 1 || offlineCalls != 0 || got.Version != "v1.2.3" || !got.EnableNow || !got.RunAsRoot || !got.Upgrade {
+		t.Fatalf("online=%d offline=%d options=%#v", onlineCalls, offlineCalls, got)
+	}
+	for _, args := range [][]string{
+		{"--version", "v1.2.3", "--commit", strings.Repeat("a", 40)},
+		{"--version", "v1.2.3", "--asset-dir", "/tmp/assets"},
+		{"--version", "v1.2.3", "--sha256sums-sha256", strings.Repeat("a", 64)},
+		{"--version", "v1.2.3", "--commit", strings.Repeat("a", 40), "--asset-dir", "/tmp/assets"},
+		{"--version", "v1.2.3", "--commit="},
+		{"--version", "v1.2.3", "--version", "v1.2.3"},
+		{"-version", "v1.2.3", "-version", "v1.2.3"},
+		{"--version", "version", "--version", "v1.2.3"},
+		{"--version", "latest"},
+	} {
+		if err := runInstall(args); err == nil {
+			t.Fatalf("accepted invalid mode: %v", args)
+		}
+	}
+	if onlineCalls != 1 || offlineCalls != 0 {
+		t.Fatalf("invalid invocation reached installer: online=%d offline=%d", onlineCalls, offlineCalls)
+	}
+}
+
+type installExitError int
+
+func (e installExitError) Error() string { return "target failed" }
+func (e installExitError) ExitCode() int { return int(e) }
+
+func TestOnlineInstallPreservesTargetExitStatus(t *testing.T) {
+	previous, previousUID := installOnlineLinux, effectiveUID
+	t.Cleanup(func() { installOnlineLinux, effectiveUID = previous, previousUID })
+	effectiveUID = func() int { return 0 }
+	installOnlineLinux = func(linuxinstall.OnlineOptions) error { return installExitError(7) }
+	err := runInstall([]string{"--version", "v1.2.3"})
+	if exitStatus(err) != 7 {
+		t.Fatalf("exit status=%d error=%v", exitStatus(err), err)
 	}
 }
 
