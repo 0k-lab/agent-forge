@@ -51,6 +51,19 @@ def main() -> int:
         raise AssertionError(f"positive workflow rejected:\n{positive.stdout}")
     print("accept intended workflow: PASS")
 
+    isolated_auth = '''          install -d -m 0700 "$RUNNER_TEMP/agent-forge-ghcr-bootstrap-auth/.docker"
+          printf 'HOME=%s\\n' "$RUNNER_TEMP/agent-forge-ghcr-bootstrap-auth" >>"$GITHUB_ENV"
+          printf 'DOCKER_CONFIG=%s\\n' "$RUNNER_TEMP/agent-forge-ghcr-bootstrap-auth/.docker" >>"$GITHUB_ENV"
+'''
+    legacy_auth = '''          install -d -m 0700 "$RUNNER_TEMP/agent-forge-ghcr-bootstrap-auth"
+          printf 'DOCKER_CONFIG=%s\\n' "$RUNNER_TEMP/agent-forge-ghcr-bootstrap-auth" >>"$GITHUB_ENV"
+'''
+    reject(
+        "attestation credentials outside isolated HOME",
+        replace_once(source, isolated_auth, legacy_auth),
+        "ordered bootstrap steps is not exact",
+    )
+
     reject("push trigger", replace_once(source, "  workflow_dispatch:\n", "  workflow_dispatch:\n  push:\n"), "trigger is not exact")
     reject("permissions write-all", replace_once(source, "permissions:\n  contents: read\n", "permissions: write-all\n"), "top-level permissions is not exact")
     reject(
