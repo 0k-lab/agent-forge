@@ -7,6 +7,7 @@ IGNORE=$ROOT/.dockerignore
 CI=$ROOT/.github/workflows/ci.yml
 RELEASE=$ROOT/.github/workflows/release.yml
 README=$ROOT/README.md
+BOOTSTRAP_CONTRACT=$ROOT/scripts/ghcr-bootstrap-contract.sh
 
 fail() { echo "oci gate contract: $*" >&2; exit 1; }
 has() { grep -Fq -- "$2" "$1" || fail "$1 lacks: $2"; }
@@ -17,6 +18,7 @@ lacks() { ! grep -Eqi -- "$2" "$1" || fail "$1 contains forbidden pattern: $2"; 
 for helper in ghcr-tag-state.py ghcr-package-public.py verify-oci-gate-release.py oci-release-self-test.py; do
   [[ -f $ROOT/scripts/$helper ]] || fail "$helper is missing"
 done
+[[ -x $BOOTSTRAP_CONTRACT ]] || fail "ghcr-bootstrap-contract.sh is missing or not executable"
 
 mapfile -t froms < <(awk 'toupper($1) == "FROM" {print $2}' "$DOCKERFILE")
 [[ ${#froms[@]} -eq 2 ]] || fail "Dockerfile.gate must have exactly two stages"
@@ -108,10 +110,11 @@ has "$README" 'make the package public in GitHub Package settings'
 has "$README" 'verify an anonymous pull'
 has "$README" 'only then create the stable git tag'
 has "$README" 'registry-enforced immutability'
-has "$README" 'docker login ghcr.io'
+has "$README" 'GHCR Bootstrap'
+has "$README" 'no personal package token is required'
 has "$README" 'bootstrap-$COMMIT'
-has "$README" 'docker buildx build'
-has "$README" '--push'
+lacks "$README" 'GHCR_TOKEN|write:packages'
 has "$ROOT/scripts/verify-oci-gate-release.py" 'vnd.docker.reference.digest'
+"$BOOTSTRAP_CONTRACT"
 
 echo "oci gate contract: PASS"

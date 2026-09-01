@@ -52,24 +52,12 @@ Gate is published separately as the publicly pullable multi-architecture image `
 
 ### One-time GHCR bootstrap before the first stable OCI release
 
-Use a GitHub token with `write:packages` and permission to publish for `0k-lab/agent-forge`. Keep it in `GHCR_TOKEN`, never in argv or the image. From a clean checkout of the exact reviewed `main` commit:
-
-```sh
-export GHCR_USER='<github-user>'
-export GHCR_TOKEN='<write-packages-token>'
-COMMIT=$(git rev-parse HEAD)
-printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USER" --password-stdin
-docker buildx build --file Dockerfile.gate \
-  --platform linux/amd64,linux/arm64 --pull --no-cache --sbom=true --provenance=mode=max \
-  --build-arg VERSION=v0.0.0 --build-arg COMMIT="$COMMIT" \
-  --tag "ghcr.io/0k-lab/agent-forge-gate:bootstrap-$COMMIT" --push .
-docker logout ghcr.io
-unset GHCR_TOKEN
-```
+Run the **GHCR Bootstrap** workflow manually from the repository's `main` branch. The workflow requires its checked-out commit to be the current remote `main` tip, uses the repository `GITHUB_TOKEN`; no personal package token is required, and publishes only `bootstrap-<main-commit>`—never a stable or `latest` tag. It builds both Linux architectures with SBOM and provenance attestations, verifies the exact authenticated index digest, and removes registry credentials after use.
 
 The pinned Dockerfile bases and source label create the package and link it to this repository. Confirm the repository link and make the package public in GitHub Package settings. Then use a fresh Docker config with no GHCR credentials to verify an anonymous pull of the bootstrap image:
 
 ```sh
+COMMIT='<exact-main-commit-reported-by-the-workflow>'
 DOCKER_CONFIG=$(mktemp -d)
 export DOCKER_CONFIG
 docker pull "ghcr.io/0k-lab/agent-forge-gate:bootstrap-$COMMIT"
