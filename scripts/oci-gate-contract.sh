@@ -5,7 +5,9 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DOCKERFILE=$ROOT/Dockerfile.gate
 IGNORE=$ROOT/.dockerignore
 CI=$ROOT/.github/workflows/ci.yml
-RELEASE=$ROOT/.github/workflows/release.yml
+RELEASE=${OCI_GATE_RELEASE:-$ROOT/.github/workflows/release.yml}
+YAML_CONTRACT=$ROOT/scripts/oci-gate-yaml-contract.py
+SELF_TEST=$ROOT/scripts/oci-gate-contract-self-test.py
 README=$ROOT/README.md
 BOOTSTRAP_CONTRACT=$ROOT/scripts/ghcr-bootstrap-contract.sh
 
@@ -14,6 +16,10 @@ has() { grep -Fq -- "$2" "$1" || fail "$1 lacks: $2"; }
 lacks() { ! grep -Eqi -- "$2" "$1" || fail "$1 contains forbidden pattern: $2"; }
 
 [[ -f $DOCKERFILE ]] || fail "Dockerfile.gate is missing"
+[[ -x $YAML_CONTRACT ]] || fail "oci-gate-yaml-contract.py is missing or not executable"
+[[ -x $SELF_TEST ]] || fail "oci-gate-contract-self-test.py is missing or not executable"
+if [[ ${OCI_GATE_SELF_TEST_ACTIVE:-} != 1 ]]; then python3 "$SELF_TEST"; fi
+python3 "$YAML_CONTRACT" "$RELEASE"
 [[ -f $IGNORE ]] || fail ".dockerignore is missing"
 for helper in ghcr-tag-state.py ghcr-package-public.py verify-oci-gate-release.py oci-release-self-test.py; do
   [[ -f $ROOT/scripts/$helper ]] || fail "$helper is missing"

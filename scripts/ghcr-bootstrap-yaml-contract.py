@@ -59,8 +59,9 @@ exit 1
 '''
 
 DOCKER_CONFIG_RUN = '''set -euo pipefail
-install -d -m 0700 "$RUNNER_TEMP/agent-forge-ghcr-bootstrap-auth"
-printf 'DOCKER_CONFIG=%s\\n' "$RUNNER_TEMP/agent-forge-ghcr-bootstrap-auth" >>"$GITHUB_ENV"
+install -d -m 0700 "$RUNNER_TEMP/agent-forge-ghcr-bootstrap-auth/.docker"
+printf 'HOME=%s\\n' "$RUNNER_TEMP/agent-forge-ghcr-bootstrap-auth" >>"$GITHUB_ENV"
+printf 'DOCKER_CONFIG=%s\\n' "$RUNNER_TEMP/agent-forge-ghcr-bootstrap-auth/.docker" >>"$GITHUB_ENV"
 '''
 
 VERIFY_RUN = '''set -euo pipefail
@@ -73,9 +74,10 @@ printf '\\nMake the package public in GitHub Package settings, then verify an an
 '''
 
 CLEANUP_RUN = '''set -euo pipefail
-if [ "${DOCKER_CONFIG:-}" = "$RUNNER_TEMP/agent-forge-ghcr-bootstrap-auth" ]; then
+if [ "${HOME:-}" = "$RUNNER_TEMP/agent-forge-ghcr-bootstrap-auth" ] &&
+   [ "${DOCKER_CONFIG:-}" = "$HOME/.docker" ]; then
   docker logout ghcr.io || true
-  rm -rf -- "$RUNNER_TEMP/agent-forge-ghcr-bootstrap-auth"
+  rm -rf -- "$DOCKER_CONFIG"
 fi
 '''
 
