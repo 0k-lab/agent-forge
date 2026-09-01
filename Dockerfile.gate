@@ -1,0 +1,42 @@
+FROM golang:1.24.4-bookworm@sha256:10f549dc8489597aa7ed2b62008199bb96717f52a8e8434ea035d5b44368f8a6 AS build
+
+ARG VERSION
+ARG COMMIT
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/forge-gate ./cmd/forge-gate
+COPY internal/buildinfo ./internal/buildinfo
+COPY internal/configjson ./internal/configjson
+COPY internal/gate ./internal/gate
+COPY internal/githubdelivery ./internal/githubdelivery
+COPY internal/processtree ./internal/processtree
+COPY internal/protocol ./internal/protocol
+COPY internal/store ./internal/store
+RUN printf '%s\n' "$VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+    && printf '%s\n' "$COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
+    && CGO_ENABLED=0 GOFLAGS=-mod=readonly GOENV=off GOWORK=off GOEXPERIMENT= GOFIPS140=off GOTOOLCHAIN=go1.24.4 \
+       go build -trimpath -buildvcs=false \
+       -ldflags="-s -w -buildid= -X agent-forge/internal/buildinfo.Version=${VERSION} -X agent-forge/internal/buildinfo.Commit=${COMMIT}" \
+       -o /out/forge-gate ./cmd/forge-gate
+
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
+
+ARG VERSION
+ARG COMMIT
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates git \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/cache/apt/* \
+    && printf 'agent-forge:x:65532:\n' >>/etc/group \
+    && printf 'agent-forge:x:65532:65532:Agent Forge:/var/lib/agent-forge:/usr/sbin/nologin\n' >>/etc/passwd \
+    && install -d -o 65532 -g 65532 -m 0700 /var/lib/agent-forge/state /var/lib/agent-forge/repositories \
+    && install -d -o 0 -g 0 -m 0755 /etc/agent-forge
+COPY --from=build /out/forge-gate /usr/local/bin/forge-gate
+LABEL org.opencontainers.image.source="https://github.com/0k-lab/agent-forge" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${COMMIT}"
+USER 65532:65532
+EXPOSE 18080
+ENTRYPOINT ["/usr/local/bin/forge-gate"]
+CMD ["-config", "/etc/agent-forge/gate.json"]
