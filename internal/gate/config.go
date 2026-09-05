@@ -1,14 +1,18 @@
 package gate
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"agent-forge/internal/configjson"
 	"agent-forge/internal/githubdelivery"
@@ -50,11 +54,27 @@ type WorkerRegistration struct {
 }
 
 type RepositoryRegistration struct {
-	ID            string          `json:"id"`
-	RepositoryURL string          `json:"repository_url,omitempty"`
-	DefaultBranch string          `json:"default_branch"`
-	WorkerPool    string          `json:"worker_pool"`
-	Execution     ExecutionConfig `json:"execution"`
+	ID                string          `json:"id"`
+	RepositoryURL     string          `json:"repository_url,omitempty"`
+	DefaultBranch     string          `json:"default_branch"`
+	WorkerPool        string          `json:"worker_pool"`
+	Execution         ExecutionConfig `json:"execution"`
+	DeploymentProfile string          `json:"deployment_profile,omitempty"`
+}
+
+type DeploymentCommand struct {
+	Argv    []string      `json:"argv"`
+	Timeout time.Duration `json:"-"`
+}
+
+type DeploymentProfile struct {
+	Version       int               `json:"version"`
+	ID            string            `json:"id"`
+	Target        string            `json:"target"`
+	Prepare       DeploymentCommand `json:"prepare"`
+	Activate      DeploymentCommand `json:"activate"`
+	Healthcheck   DeploymentCommand `json:"healthcheck"`
+	CleanupPolicy string            `json:"cleanup_policy"`
 }
 
 type DeliveryConfig struct {
@@ -80,6 +100,7 @@ type Config struct {
 	DefaultExecution     ExecutionConfig
 	Workers              []WorkerRegistration
 	Repositories         []RepositoryRegistration
+	DeploymentProfiles   []DeploymentProfile `json:"deployment_profiles,omitempty"`
 	PublicRepositoryRoot string
 	GitExecutable        string
 	Delivery             *DeliveryConfig
@@ -111,29 +132,79 @@ type durationExecution struct {
 	GitOutputBytes    int64    `json:"git_output_bytes"`
 }
 
+type rawDeploymentProfileReference struct {
+	value *string
+}
+
+func (reference *rawDeploymentProfileReference) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(data, []byte("null")) {
+		return errConfig
+	}
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return errConfig
+	}
+	reference.value = &value
+	return nil
+}
+
 type rawRepository struct {
-	ID            string            `json:"id"`
-	RepositoryURL string            `json:"repository_url"`
-	DefaultBranch string            `json:"default_branch"`
-	WorkerPool    string            `json:"worker_pool"`
-	Execution     durationExecution `json:"execution"`
+	ID                string                        `json:"id"`
+	RepositoryURL     string                        `json:"repository_url"`
+	DefaultBranch     string                        `json:"default_branch"`
+	WorkerPool        string                        `json:"worker_pool"`
+	Execution         durationExecution             `json:"execution"`
+	DeploymentProfile rawDeploymentProfileReference `json:"deployment_profile"`
+}
+
+type rawDeploymentCommand struct {
+	Argv    []string `json:"argv"`
+	Timeout string   `json:"timeout"`
+}
+
+type rawDeploymentProfile struct {
+	Version       int                  `json:"version"`
+	ID            string               `json:"id"`
+	Target        string               `json:"target"`
+	Prepare       rawDeploymentCommand `json:"prepare"`
+	Activate      rawDeploymentCommand `json:"activate"`
+	Healthcheck   rawDeploymentCommand `json:"healthcheck"`
+	CleanupPolicy string               `json:"cleanup_policy"`
+}
+
+type rawDeploymentProfiles []rawDeploymentProfile
+
+func (profiles *rawDeploymentProfiles) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(data, []byte("null")) {
+		return errConfig
+	}
+	type plainDeploymentProfiles rawDeploymentProfiles
+	var decoded plainDeploymentProfiles
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return errConfig
+	}
+	*profiles = rawDeploymentProfiles(decoded)
+	return nil
 }
 
 type rawGateConfig struct {
-	Version              int                  `json:"version"`
-	Listen               string               `json:"listen"`
-	Database             string               `json:"database"`
-	OwnerTokenEnv        string               `json:"owner_token_env"`
-	RecoveryInterval     string               `json:"recovery_interval"`
-	LeasePollInterval    string               `json:"lease_poll_interval"`
-	DefaultPool          string               `json:"default_pool"`
-	Lifecycle            durationLifecycle    `json:"lifecycle"`
-	DefaultExecution     durationExecution    `json:"default_execution"`
-	Workers              []WorkerRegistration `json:"workers"`
-	Repositories         []rawRepository      `json:"repositories"`
-	PublicRepositoryRoot string               `json:"public_repository_root"`
-	GitExecutable        string               `json:"git_executable"`
-	Delivery             *rawDeliveryConfig   `json:"delivery"`
+	Version              int                   `json:"version"`
+	Listen               string                `json:"listen"`
+	Database             string                `json:"database"`
+	OwnerTokenEnv        string                `json:"owner_token_env"`
+	RecoveryInterval     string                `json:"recovery_interval"`
+	LeasePollInterval    string                `json:"lease_poll_interval"`
+	DefaultPool          string                `json:"default_pool"`
+	Lifecycle            durationLifecycle     `json:"lifecycle"`
+	DefaultExecution     durationExecution     `json:"default_execution"`
+	Workers              []WorkerRegistration  `json:"workers"`
+	Repositories         []rawRepository       `json:"repositories"`
+	DeploymentProfiles   rawDeploymentProfiles `json:"deployment_profiles"`
+	PublicRepositoryRoot string                `json:"public_repository_root"`
+	GitExecutable        string                `json:"git_executable"`
+	Delivery             *rawDeliveryConfig    `json:"delivery"`
 }
 
 type rawDeliveryConfig struct {
@@ -177,7 +248,7 @@ func ParseConfig(data []byte, getenv func(string) string) (Config, error) {
 	if c.DefaultExecution, err = parseExecution(raw.DefaultExecution); err != nil {
 		return Config{}, errConfig
 	}
-	if c.Version != 1 || c.Listen == "" || len(c.Listen) > 256 || c.Database == "" || len(c.Database) > 4096 || !envName.MatchString(c.OwnerTokenEnv) || !configID.MatchString(c.DefaultPool) || c.RecoveryInterval > c.Lifecycle.LeaseTTL || len(c.Workers) == 0 || len(c.Workers) > maxGateSlots || len(raw.Repositories) > 1024 || (raw.PublicRepositoryRoot == "") != (raw.GitExecutable == "") {
+	if c.Version != 1 || c.Listen == "" || len(c.Listen) > 256 || c.Database == "" || len(c.Database) > 4096 || !envName.MatchString(c.OwnerTokenEnv) || !configID.MatchString(c.DefaultPool) || c.RecoveryInterval > c.Lifecycle.LeaseTTL || len(c.Workers) == 0 || len(c.Workers) > maxGateSlots || len(raw.Repositories) > 1024 || len(raw.DeploymentProfiles) > 128 || (raw.PublicRepositoryRoot == "") != (raw.GitExecutable == "") {
 		return Config{}, errConfig
 	}
 	if raw.PublicRepositoryRoot != "" {
@@ -216,11 +287,24 @@ func ParseConfig(data []byte, getenv func(string) string) (Config, error) {
 	if totalSlots > maxGateSlots || !pools[c.DefaultPool] {
 		return Config{}, errConfig
 	}
+	profiles := map[string]bool{}
+	for _, rawProfile := range raw.DeploymentProfiles {
+		profile, err := parseDeploymentProfile(rawProfile)
+		if err != nil || profiles[profile.ID] {
+			return Config{}, errConfig
+		}
+		profiles[profile.ID] = true
+		c.DeploymentProfiles = append(c.DeploymentProfiles, profile)
+	}
 	repositories := map[string]bool{}
 	publicRepositories := 0
 	for _, repository := range raw.Repositories {
 		execution, err := parseExecution(repository.Execution)
-		if err != nil || !configID.MatchString(repository.ID) || repositories[repository.ID] || protocol.ValidateBranchName(repository.DefaultBranch) != nil || !pools[repository.WorkerPool] {
+		profileID := ""
+		if repository.DeploymentProfile.value != nil {
+			profileID = *repository.DeploymentProfile.value
+		}
+		if err != nil || !configID.MatchString(repository.ID) || repositories[repository.ID] || protocol.ValidateBranchName(repository.DefaultBranch) != nil || !pools[repository.WorkerPool] || repository.DeploymentProfile.value != nil && (!configID.MatchString(profileID) || !profiles[profileID]) {
 			return Config{}, errConfig
 		}
 		if repository.RepositoryURL != "" {
@@ -230,7 +314,7 @@ func ParseConfig(data []byte, getenv func(string) string) (Config, error) {
 			publicRepositories++
 		}
 		repositories[repository.ID] = true
-		c.Repositories = append(c.Repositories, RepositoryRegistration{repository.ID, repository.RepositoryURL, repository.DefaultBranch, repository.WorkerPool, execution})
+		c.Repositories = append(c.Repositories, RepositoryRegistration{ID: repository.ID, RepositoryURL: repository.RepositoryURL, DefaultBranch: repository.DefaultBranch, WorkerPool: repository.WorkerPool, Execution: execution, DeploymentProfile: profileID})
 	}
 	if publicRepositories > 0 && c.PublicRepositoryRoot == "" {
 		return Config{}, errConfig
@@ -297,6 +381,33 @@ func parseExecution(raw durationExecution) (ExecutionConfig, error) {
 		seen[name] = true
 	}
 	return result, nil
+}
+
+func parseDeploymentProfile(raw rawDeploymentProfile) (DeploymentProfile, error) {
+	if raw.Version != 1 || !configID.MatchString(raw.ID) || !configID.MatchString(raw.Target) || raw.CleanupPolicy != "restore_previous" && raw.CleanupPolicy != "retain" && raw.CleanupPolicy != "cleanup" {
+		return DeploymentProfile{}, errConfig
+	}
+	profile := DeploymentProfile{Version: raw.Version, ID: raw.ID, Target: raw.Target, CleanupPolicy: raw.CleanupPolicy}
+	commands := []struct {
+		raw    rawDeploymentCommand
+		target *DeploymentCommand
+	}{{raw.Prepare, &profile.Prepare}, {raw.Activate, &profile.Activate}, {raw.Healthcheck, &profile.Healthcheck}}
+	for _, item := range commands {
+		if len(item.raw.Argv) == 0 || len(item.raw.Argv) > 64 || !filepath.IsAbs(item.raw.Argv[0]) {
+			return DeploymentProfile{}, errConfig
+		}
+		for _, arg := range item.raw.Argv {
+			if arg == "" || len(arg) > 4096 || !utf8.ValidString(arg) || strings.IndexByte(arg, 0) >= 0 {
+				return DeploymentProfile{}, errConfig
+			}
+		}
+		timeout, err := boundedDuration(item.raw.Timeout, time.Millisecond, 24*time.Hour)
+		if err != nil {
+			return DeploymentProfile{}, errConfig
+		}
+		*item.target = DeploymentCommand{Argv: append([]string(nil), item.raw.Argv...), Timeout: timeout}
+	}
+	return profile, nil
 }
 
 func boundedDuration(value string, low, high time.Duration) (time.Duration, error) {
