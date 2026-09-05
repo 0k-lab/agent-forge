@@ -42,6 +42,53 @@ func TestParseConfigStrictAndResolvesSecrets(t *testing.T) {
 	}
 }
 
+func TestParseConfigDeploymentProfilesContract(t *testing.T) {
+	values := map[string]string{"FORGE_OWNER_TOKEN": "owner-secret", "FORGE_WORKER_TOKEN": "worker-secret"}
+	getenv := func(name string) string { return values[name] }
+	profile := `"deployment_profiles":[{"version":1,"id":"staging","target":"staging-app","prepare":{"argv":["/opt/forge/prepare","staging"],"timeout":"2m"},"activate":{"argv":["/opt/forge/activate","staging"],"timeout":"30s"},"healthcheck":{"argv":["/opt/forge/healthcheck","staging"],"timeout":"10s"},"cleanup_policy":"restore_previous"}],`
+	body := strings.Replace(validGateConfig, `"workers":`, profile+`"workers":`, 1)
+	body = strings.Replace(body, `"id":"agent-forge"`, `"id":"agent-forge","deployment_profile":"staging"`, 1)
+
+	config, err := ParseConfig([]byte(body), getenv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.DeploymentProfiles) != 1 || config.DeploymentProfiles[0].Prepare.Timeout != 2*time.Minute || config.Repositories[0].DeploymentProfile != "staging" {
+		t.Fatalf("deployment config = %#v, repository = %#v", config.DeploymentProfiles, config.Repositories[0])
+	}
+
+	invalid := map[string]string{
+		"duplicate profile ID":    strings.Replace(body, `"deployment_profiles":[`, `"deployment_profiles":[{"version":1,"id":"staging","target":"other","prepare":{"argv":["/bin/true"],"timeout":"1s"},"activate":{"argv":["/bin/true"],"timeout":"1s"},"healthcheck":{"argv":["/bin/true"],"timeout":"1s"},"cleanup_policy":"retain"},`, 1),
+		"unknown profile version": strings.Replace(body, `"version":1,"id":"staging"`, `"version":2,"id":"staging"`, 1),
+		"unknown profile field":   strings.Replace(body, `"target":"staging-app"`, `"target":"staging-app","surprise":true`, 1),
+		"unsafe profile ID":       strings.Replace(body, `"id":"staging"`, `"id":"../staging"`, 1),
+		"unsafe target identity":  strings.Replace(body, `"target":"staging-app"`, `"target":"../staging"`, 1),
+		"empty executable":        strings.Replace(body, `"/opt/forge/prepare","staging"`, `"","staging"`, 1),
+		"relative executable":     strings.Replace(body, `"/opt/forge/prepare"`, `"bin/prepare"`, 1),
+		"missing argv":            strings.Replace(body, `"argv":["/opt/forge/prepare","staging"],`, ``, 1),
+		"invalid duration":        strings.Replace(body, `"timeout":"2m"`, `"timeout":"0s"`, 1),
+		"unknown profile":         strings.Replace(body, `"deployment_profile":"staging"`, `"deployment_profile":"missing"`, 1),
+		"empty profile selection": strings.Replace(body, `"deployment_profile":"staging"`, `"deployment_profile":""`, 1),
+		"unknown cleanup policy":  strings.Replace(body, `"cleanup_policy":"restore_previous"`, `"cleanup_policy":"restore-and-retain"`, 1),
+	}
+	for name, invalidBody := range invalid {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseConfig([]byte(invalidBody), getenv); err == nil {
+				t.Fatal("accepted invalid deployment config")
+			}
+		})
+	}
+
+	baseline, err := ParseConfig([]byte(validGateConfig), getenv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(baseline)
+	if err != nil || strings.Contains(string(encoded), "DeploymentProfiles") || strings.Contains(string(encoded), "deployment_profile") {
+		t.Fatalf("baseline serialization changed: %s, %v", encoded, err)
+	}
+}
+
 func TestLoadConfigRejectsOversizedFileWithoutLeakingValues(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "private-config-path")
 	private := "private-config-content"
