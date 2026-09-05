@@ -1,8 +1,10 @@
 package gate
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"net/url"
 	"os"
@@ -130,13 +132,29 @@ type durationExecution struct {
 	GitOutputBytes    int64    `json:"git_output_bytes"`
 }
 
+type rawDeploymentProfileReference struct {
+	value *string
+}
+
+func (reference *rawDeploymentProfileReference) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(data, []byte("null")) {
+		return errConfig
+	}
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return errConfig
+	}
+	reference.value = &value
+	return nil
+}
+
 type rawRepository struct {
-	ID                string            `json:"id"`
-	RepositoryURL     string            `json:"repository_url"`
-	DefaultBranch     string            `json:"default_branch"`
-	WorkerPool        string            `json:"worker_pool"`
-	Execution         durationExecution `json:"execution"`
-	DeploymentProfile *string           `json:"deployment_profile"`
+	ID                string                        `json:"id"`
+	RepositoryURL     string                        `json:"repository_url"`
+	DefaultBranch     string                        `json:"default_branch"`
+	WorkerPool        string                        `json:"worker_pool"`
+	Execution         durationExecution             `json:"execution"`
+	DeploymentProfile rawDeploymentProfileReference `json:"deployment_profile"`
 }
 
 type rawDeploymentCommand struct {
@@ -154,22 +172,39 @@ type rawDeploymentProfile struct {
 	CleanupPolicy string               `json:"cleanup_policy"`
 }
 
+type rawDeploymentProfiles []rawDeploymentProfile
+
+func (profiles *rawDeploymentProfiles) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(data, []byte("null")) {
+		return errConfig
+	}
+	type plainDeploymentProfiles rawDeploymentProfiles
+	var decoded plainDeploymentProfiles
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return errConfig
+	}
+	*profiles = rawDeploymentProfiles(decoded)
+	return nil
+}
+
 type rawGateConfig struct {
-	Version              int                    `json:"version"`
-	Listen               string                 `json:"listen"`
-	Database             string                 `json:"database"`
-	OwnerTokenEnv        string                 `json:"owner_token_env"`
-	RecoveryInterval     string                 `json:"recovery_interval"`
-	LeasePollInterval    string                 `json:"lease_poll_interval"`
-	DefaultPool          string                 `json:"default_pool"`
-	Lifecycle            durationLifecycle      `json:"lifecycle"`
-	DefaultExecution     durationExecution      `json:"default_execution"`
-	Workers              []WorkerRegistration   `json:"workers"`
-	Repositories         []rawRepository        `json:"repositories"`
-	DeploymentProfiles   []rawDeploymentProfile `json:"deployment_profiles"`
-	PublicRepositoryRoot string                 `json:"public_repository_root"`
-	GitExecutable        string                 `json:"git_executable"`
-	Delivery             *rawDeliveryConfig     `json:"delivery"`
+	Version              int                   `json:"version"`
+	Listen               string                `json:"listen"`
+	Database             string                `json:"database"`
+	OwnerTokenEnv        string                `json:"owner_token_env"`
+	RecoveryInterval     string                `json:"recovery_interval"`
+	LeasePollInterval    string                `json:"lease_poll_interval"`
+	DefaultPool          string                `json:"default_pool"`
+	Lifecycle            durationLifecycle     `json:"lifecycle"`
+	DefaultExecution     durationExecution     `json:"default_execution"`
+	Workers              []WorkerRegistration  `json:"workers"`
+	Repositories         []rawRepository       `json:"repositories"`
+	DeploymentProfiles   rawDeploymentProfiles `json:"deployment_profiles"`
+	PublicRepositoryRoot string                `json:"public_repository_root"`
+	GitExecutable        string                `json:"git_executable"`
+	Delivery             *rawDeliveryConfig    `json:"delivery"`
 }
 
 type rawDeliveryConfig struct {
@@ -266,10 +301,10 @@ func ParseConfig(data []byte, getenv func(string) string) (Config, error) {
 	for _, repository := range raw.Repositories {
 		execution, err := parseExecution(repository.Execution)
 		profileID := ""
-		if repository.DeploymentProfile != nil {
-			profileID = *repository.DeploymentProfile
+		if repository.DeploymentProfile.value != nil {
+			profileID = *repository.DeploymentProfile.value
 		}
-		if err != nil || !configID.MatchString(repository.ID) || repositories[repository.ID] || protocol.ValidateBranchName(repository.DefaultBranch) != nil || !pools[repository.WorkerPool] || repository.DeploymentProfile != nil && (!configID.MatchString(profileID) || !profiles[profileID]) {
+		if err != nil || !configID.MatchString(repository.ID) || repositories[repository.ID] || protocol.ValidateBranchName(repository.DefaultBranch) != nil || !pools[repository.WorkerPool] || repository.DeploymentProfile.value != nil && (!configID.MatchString(profileID) || !profiles[profileID]) {
 			return Config{}, errConfig
 		}
 		if repository.RepositoryURL != "" {

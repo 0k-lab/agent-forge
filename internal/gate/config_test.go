@@ -89,6 +89,49 @@ func TestParseConfigDeploymentProfilesContract(t *testing.T) {
 	}
 }
 
+func TestParseConfigDeploymentProfileNullContract(t *testing.T) {
+	values := map[string]string{"FORGE_OWNER_TOKEN": "owner-secret", "FORGE_WORKER_TOKEN": "worker-secret"}
+	getenv := func(name string) string { return values[name] }
+	profile := `"deployment_profiles":[{"version":1,"id":"staging","target":"staging-app","prepare":{"argv":["/opt/forge/prepare","staging"],"timeout":"2m"},"activate":{"argv":["/opt/forge/activate","staging"],"timeout":"30s"},"healthcheck":{"argv":["/opt/forge/healthcheck","staging"],"timeout":"10s"},"cleanup_policy":"restore_previous"}],`
+	withProfile := strings.Replace(validGateConfig, `"workers":`, profile+`"workers":`, 1)
+	withProfile = strings.Replace(withProfile, `"id":"agent-forge"`, `"id":"agent-forge","deployment_profile":"staging"`, 1)
+
+	t.Run("normal profile parses", func(t *testing.T) {
+		config, err := ParseConfig([]byte(withProfile), getenv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(config.DeploymentProfiles) != 1 || config.Repositories[0].DeploymentProfile != "staging" {
+			t.Fatalf("deployment config = %#v, repository = %#v", config.DeploymentProfiles, config.Repositories[0])
+		}
+	})
+
+	t.Run("omitted fields remain accepted", func(t *testing.T) {
+		config, err := ParseConfig([]byte(validGateConfig), getenv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(config.DeploymentProfiles) != 0 || config.Repositories[0].DeploymentProfile != "" {
+			t.Fatalf("deployment config = %#v, repository = %#v", config.DeploymentProfiles, config.Repositories[0])
+		}
+	})
+
+	nullCases := []struct {
+		name string
+		body string
+	}{
+		{"repository deployment_profile", strings.Replace(validGateConfig, `"id":"agent-forge"`, `"id":"agent-forge","deployment_profile":null`, 1)},
+		{"top-level deployment_profiles", strings.Replace(validGateConfig, `"workers":`, `"deployment_profiles":null,"workers":`, 1)},
+	}
+	for _, test := range nullCases {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := ParseConfig([]byte(test.body), getenv); err == nil {
+				t.Fatal("accepted explicit null deployment profile field")
+			}
+		})
+	}
+}
+
 func TestLoadConfigRejectsOversizedFileWithoutLeakingValues(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "private-config-path")
 	private := "private-config-content"
