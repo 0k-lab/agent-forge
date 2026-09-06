@@ -114,28 +114,39 @@ func TestMigrationSixDeploymentAttempts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	insert := `INSERT INTO deployment_attempts(id,job_id,attempt_id,kind,repository_id,base_sha,candidate_sha,profile_id,target,profile_version,profile_snapshot,phase,failure_code,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-	valid := []any{"deploy-1", strings.Repeat("a", 32), strings.Repeat("b", 32), "preview", "agent-forge", strings.Repeat("c", 40), strings.Repeat("d", 40), "staging", "staging-app", 1, profile, "pending", "", int64(1), int64(1)}
+	insert := `INSERT INTO deployment_attempts(id,job_id,attempt_id,kind,repository_id,base_sha,candidate_sha,expected_tree_sha,profile_id,target,profile_version,profile_snapshot,phase,failure_code,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	valid := []any{strings.Repeat("e", 32), strings.Repeat("a", 32), strings.Repeat("b", 32), "preview", "agent-forge", strings.Repeat("c", 40), strings.Repeat("d", 40), strings.Repeat("e", 40), "staging", "staging-app", 1, profile, "awaiting_acceptance", "", int64(1), int64(1)}
 	if _, err := db.Exec(insert, valid...); err != nil {
 		t.Fatalf("valid deployment attempt rejected: %v", err)
 	}
 
 	invalid := map[string]func([]any){
-		"empty id":            func(v []any) { v[0] = "" },
-		"overlong id":         func(v []any) { v[0] = strings.Repeat("x", 65) },
-		"unknown kind":        func(v []any) { v[3] = "production" },
-		"uppercase base sha":  func(v []any) { v[5] = strings.Repeat("A", 40) },
-		"short candidate sha": func(v []any) { v[6] = strings.Repeat("d", 39) },
-		"unknown phase":       func(v []any) { v[11] = "unknown" },
-		"overlong failure":    func(v []any) { v[12] = strings.Repeat("x", 65) },
-		"text snapshot":       func(v []any) { v[10] = string(profile) },
-		"zero timestamp":      func(v []any) { v[13] = int64(0) },
-		"backwards timestamp": func(v []any) { v[13], v[14] = int64(2), int64(1) },
+		"short id":                    func(v []any) { v[0] = strings.Repeat("e", 31) },
+		"uppercase id":                func(v []any) { v[0] = strings.Repeat("E", 32) },
+		"nonhex id":                   func(v []any) { v[0] = strings.Repeat("g", 32) },
+		"short job id":                func(v []any) { v[1] = strings.Repeat("a", 31) },
+		"uppercase job id":            func(v []any) { v[1] = strings.Repeat("A", 32) },
+		"nonhex job id":               func(v []any) { v[1] = strings.Repeat("g", 32) },
+		"short attempt id":            func(v []any) { v[2] = strings.Repeat("b", 31) },
+		"uppercase attempt id":        func(v []any) { v[2] = strings.Repeat("B", 32) },
+		"nonhex attempt id":           func(v []any) { v[2] = strings.Repeat("g", 32) },
+		"unknown kind":                func(v []any) { v[3] = "production" },
+		"uppercase base sha":          func(v []any) { v[5] = strings.Repeat("A", 40) },
+		"short candidate sha":         func(v []any) { v[6] = strings.Repeat("d", 39) },
+		"null expected tree sha":      func(v []any) { v[7] = nil },
+		"short expected tree sha":     func(v []any) { v[7] = strings.Repeat("e", 39) },
+		"uppercase expected tree sha": func(v []any) { v[7] = strings.Repeat("E", 40) },
+		"succeeded phase":             func(v []any) { v[12] = "succeeded" },
+		"unknown phase":               func(v []any) { v[12] = "unknown" },
+		"overlong failure":            func(v []any) { v[13] = strings.Repeat("x", 65) },
+		"text snapshot":               func(v []any) { v[11] = string(profile) },
+		"zero timestamp":              func(v []any) { v[14] = int64(0) },
+		"backwards timestamp":         func(v []any) { v[14], v[15] = int64(2), int64(1) },
 	}
 	for name, mutate := range invalid {
 		t.Run(name, func(t *testing.T) {
 			candidate := append([]any(nil), valid...)
-			candidate[0] = "bad-" + strings.ReplaceAll(name, " ", "-")
+			candidate[0] = strings.Repeat("f", 32)
 			mutate(candidate)
 			if _, err := db.Exec(insert, candidate...); err == nil {
 				t.Fatal("constraint accepted invalid deployment attempt")
@@ -143,7 +154,7 @@ func TestMigrationSixDeploymentAttempts(t *testing.T) {
 		})
 	}
 	var stored []byte
-	if err := db.QueryRow(`SELECT profile_snapshot FROM deployment_attempts WHERE id='deploy-1'`).Scan(&stored); err != nil || !bytes.Equal(stored, profile) {
+	if err := db.QueryRow(`SELECT profile_snapshot FROM deployment_attempts WHERE id=?`, valid[0]).Scan(&stored); err != nil || !bytes.Equal(stored, profile) {
 		t.Fatalf("profile snapshot changed: %x, %v", stored, err)
 	}
 }

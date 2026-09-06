@@ -159,7 +159,7 @@ func TestSchemaV4MigrationPreservesJobsWithoutSourceReference(t *testing.T) {
 		t.Fatalf("new job = %#v, %v", created, err)
 	}
 	var version int
-	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 5 {
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 6 {
 		t.Fatalf("schema version = %d, %v", version, err)
 	}
 }
