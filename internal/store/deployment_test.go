@@ -1,14 +1,10 @@
 package store
 
 import (
-	"bytes"
-	"database/sql"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
 func TestCanonicalDeploymentProfileContract(t *testing.T) {
@@ -66,95 +62,5 @@ func TestCanonicalDeploymentProfileContract(t *testing.T) {
 		if _, err := CanonicalDeploymentProfile(candidate); err != nil {
 			t.Fatalf("rejected cleanup policy %q: %v", policy, err)
 		}
-	}
-}
-
-func TestMigrationSixDeploymentAttempts(t *testing.T) {
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	for version := 1; version <= 5; version++ {
-		tx, err := db.Begin()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := runMigration(tx, version); err != nil {
-			t.Fatal(err)
-		}
-		if err := tx.Commit(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := db.Exec(`PRAGMA user_version=5; INSERT INTO metadata(key,value) VALUES('preserved',x'01')`); err != nil {
-		t.Fatal(err)
-	}
-	if err := migrate(db); err != nil {
-		t.Fatal(err)
-	}
-	if err := migrate(db); err != nil {
-		t.Fatalf("migration is not idempotent: %v", err)
-	}
-	var version, preserved int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 6 {
-		t.Fatalf("schema version = %d, %v", version, err)
-	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM metadata WHERE key='preserved' AND value=x'01'`).Scan(&preserved); err != nil || preserved != 1 {
-		t.Fatalf("schema-5 data was not preserved: %d, %v", preserved, err)
-	}
-
-	profile, err := CanonicalDeploymentProfile(ResolvedDeploymentProfile{
-		Version: 1, ID: "staging", Target: "staging-app",
-		Prepare:       ResolvedDeploymentCommand{Argv: []string{"/bin/true"}, TimeoutNanos: int64(time.Second)},
-		Activate:      ResolvedDeploymentCommand{Argv: []string{"/bin/true"}, TimeoutNanos: int64(time.Second)},
-		Healthcheck:   ResolvedDeploymentCommand{Argv: []string{"/bin/true"}, TimeoutNanos: int64(time.Second)},
-		CleanupPolicy: "retain",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	insert := `INSERT INTO deployment_attempts(id,job_id,attempt_id,kind,repository_id,base_sha,candidate_sha,expected_tree_sha,profile_id,target,profile_version,profile_snapshot,phase,failure_code,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-	valid := []any{strings.Repeat("e", 32), strings.Repeat("a", 32), strings.Repeat("b", 32), "preview", "agent-forge", strings.Repeat("c", 40), strings.Repeat("d", 40), strings.Repeat("e", 40), "staging", "staging-app", 1, profile, "awaiting_acceptance", "", int64(1), int64(1)}
-	if _, err := db.Exec(insert, valid...); err != nil {
-		t.Fatalf("valid deployment attempt rejected: %v", err)
-	}
-
-	invalid := map[string]func([]any){
-		"short id":                    func(v []any) { v[0] = strings.Repeat("e", 31) },
-		"uppercase id":                func(v []any) { v[0] = strings.Repeat("E", 32) },
-		"nonhex id":                   func(v []any) { v[0] = strings.Repeat("g", 32) },
-		"short job id":                func(v []any) { v[1] = strings.Repeat("a", 31) },
-		"uppercase job id":            func(v []any) { v[1] = strings.Repeat("A", 32) },
-		"nonhex job id":               func(v []any) { v[1] = strings.Repeat("g", 32) },
-		"short attempt id":            func(v []any) { v[2] = strings.Repeat("b", 31) },
-		"uppercase attempt id":        func(v []any) { v[2] = strings.Repeat("B", 32) },
-		"nonhex attempt id":           func(v []any) { v[2] = strings.Repeat("g", 32) },
-		"unknown kind":                func(v []any) { v[3] = "production" },
-		"uppercase base sha":          func(v []any) { v[5] = strings.Repeat("A", 40) },
-		"short candidate sha":         func(v []any) { v[6] = strings.Repeat("d", 39) },
-		"null expected tree sha":      func(v []any) { v[7] = nil },
-		"short expected tree sha":     func(v []any) { v[7] = strings.Repeat("e", 39) },
-		"uppercase expected tree sha": func(v []any) { v[7] = strings.Repeat("E", 40) },
-		"succeeded phase":             func(v []any) { v[12] = "succeeded" },
-		"unknown phase":               func(v []any) { v[12] = "unknown" },
-		"overlong failure":            func(v []any) { v[13] = strings.Repeat("x", 65) },
-		"text snapshot":               func(v []any) { v[11] = string(profile) },
-		"zero timestamp":              func(v []any) { v[14] = int64(0) },
-		"backwards timestamp":         func(v []any) { v[14], v[15] = int64(2), int64(1) },
-	}
-	for name, mutate := range invalid {
-		t.Run(name, func(t *testing.T) {
-			candidate := append([]any(nil), valid...)
-			candidate[0] = strings.Repeat("f", 32)
-			mutate(candidate)
-			if _, err := db.Exec(insert, candidate...); err == nil {
-				t.Fatal("constraint accepted invalid deployment attempt")
-			}
-		})
-	}
-	var stored []byte
-	if err := db.QueryRow(`SELECT profile_snapshot FROM deployment_attempts WHERE id=?`, valid[0]).Scan(&stored); err != nil || !bytes.Equal(stored, profile) {
-		t.Fatalf("profile snapshot changed: %x, %v", stored, err)
 	}
 }

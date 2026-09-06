@@ -34,7 +34,7 @@ import (
 
 const (
 	prefix                 = "/opt/agent-forge"
-	storeSchemaVersion     = 6
+	storeSchemaVersion     = 5
 	legacyInstallerVersion = "v0.1.3"
 	legacyInstallerCommit  = "dfa09f5fd82a01b79c977cae20299db79ede9bdc"
 )
