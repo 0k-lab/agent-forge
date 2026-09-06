@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const schemaVersion = 5
+const schemaVersion = 6
 
 // SchemaVersion is the current on-disk SQLite schema supported by Gate.
 func SchemaVersion() int { return schemaVersion }
@@ -128,6 +128,25 @@ CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value BLOB NOT NULL);
 		return err
 	case 5:
 		return addColumn(tx, "jobs", "source_ref", `TEXT NOT NULL DEFAULT ''`)
+	case 6:
+		_, err := tx.Exec(`CREATE TABLE IF NOT EXISTS deployment_attempts (
+			id TEXT PRIMARY KEY CHECK(typeof(id)='text' AND length(id) BETWEEN 1 AND 64 AND substr(id,1,1) GLOB '[a-z0-9]' AND id NOT GLOB '*[^a-z0-9._-]*'),
+			job_id TEXT NOT NULL CHECK(typeof(job_id)='text' AND length(job_id) BETWEEN 1 AND 64 AND substr(job_id,1,1) GLOB '[a-z0-9]' AND job_id NOT GLOB '*[^a-z0-9._-]*'),
+			attempt_id TEXT NOT NULL CHECK(typeof(attempt_id)='text' AND length(attempt_id) BETWEEN 1 AND 64 AND substr(attempt_id,1,1) GLOB '[a-z0-9]' AND attempt_id NOT GLOB '*[^a-z0-9._-]*'),
+			kind TEXT NOT NULL CHECK(typeof(kind)='text' AND kind='preview'),
+			repository_id TEXT NOT NULL CHECK(typeof(repository_id)='text' AND length(repository_id) BETWEEN 1 AND 64 AND substr(repository_id,1,1) GLOB '[a-z0-9]' AND repository_id NOT GLOB '*[^a-z0-9._-]*'),
+			base_sha TEXT NOT NULL CHECK(typeof(base_sha)='text' AND length(base_sha)=40 AND base_sha NOT GLOB '*[^0-9a-f]*'),
+			candidate_sha TEXT NOT NULL CHECK(typeof(candidate_sha)='text' AND length(candidate_sha)=40 AND candidate_sha NOT GLOB '*[^0-9a-f]*'),
+			profile_id TEXT NOT NULL CHECK(typeof(profile_id)='text' AND length(profile_id) BETWEEN 1 AND 64 AND substr(profile_id,1,1) GLOB '[a-z0-9]' AND profile_id NOT GLOB '*[^a-z0-9._-]*'),
+			target TEXT NOT NULL CHECK(typeof(target)='text' AND length(target) BETWEEN 1 AND 64 AND substr(target,1,1) GLOB '[a-z0-9]' AND target NOT GLOB '*[^a-z0-9._-]*'),
+			profile_version INTEGER NOT NULL CHECK(typeof(profile_version)='integer' AND profile_version > 0),
+			profile_snapshot BLOB NOT NULL CHECK(typeof(profile_snapshot)='blob' AND length(profile_snapshot) BETWEEN 1 AND 16384),
+			phase TEXT NOT NULL CHECK(typeof(phase)='text' AND phase IN ('pending','preparing','activating','healthchecking','succeeded','failed')),
+			failure_code TEXT NOT NULL DEFAULT '' CHECK(typeof(failure_code)='text' AND length(failure_code) <= 64),
+			created_at INTEGER NOT NULL CHECK(typeof(created_at)='integer' AND created_at > 0),
+			updated_at INTEGER NOT NULL CHECK(typeof(updated_at)='integer' AND updated_at >= created_at));
+		CREATE INDEX IF NOT EXISTS deployment_attempts_job ON deployment_attempts(job_id,created_at,id);`)
+		return err
 	default:
 		return errors.New("unsupported database schema")
 	}
