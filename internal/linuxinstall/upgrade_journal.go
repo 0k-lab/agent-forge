@@ -91,11 +91,11 @@ func validUpgradeTransactionJournal(journal upgradeTransactionJournal) bool {
 		!upgradeJournalCommitRE.MatchString(journal.TargetCommit) ||
 		journal.StoreSchemaVersion <= 0 ||
 		!upgradeJournalDigestRE.MatchString(journal.SourceReceiptSHA256) ||
-		journal.AccountUID < 0 || uint64(journal.AccountUID) >= 1<<32 ||
-		journal.AccountGID < 0 || uint64(journal.AccountGID) >= 1<<32 ||
+		journal.AccountUID < 0 || uint64(journal.AccountUID) >= uint64(0xffffffff) ||
+		journal.AccountGID < 0 || uint64(journal.AccountGID) >= uint64(0xffffffff) ||
 		journal.DatabaseRelativePath != "var/gate/state/forge.db" ||
 		journal.SnapshotRelativePath != "var/gate/state/.forge-pre-migration-"+journal.TransactionID+".db" ||
-		journal.SnapshotSchemaVersion < 0 || journal.SnapshotSchemaVersion > journal.StoreSchemaVersion ||
+		journal.SnapshotSchemaVersion <= 0 || journal.SnapshotSchemaVersion > journal.StoreSchemaVersion ||
 		journal.SnapshotSize <= 0 ||
 		!upgradeJournalDigestRE.MatchString(journal.SnapshotSHA256) {
 		return false
@@ -107,9 +107,9 @@ func validUpgradeTransactionJournal(journal upgradeTransactionJournal) bool {
 	case upgradePhaseRestoreAppliedDurable:
 		return journal.RestoreOutcome == upgradeRestoreAppliedDurable && journal.RestoreResidue != nil
 	case upgradePhaseRestoreNotAppliedDurable:
-		return journal.RestoreOutcome == upgradeRestoreNotAppliedDurable && journal.RestoreResidue == nil
+		return journal.RestoreOutcome == upgradeRestoreNotAppliedDurable && journal.RestoreResidue != nil
 	case upgradePhaseRestoreIndeterminate:
-		return journal.RestoreOutcome == upgradeRestoreIndeterminate && journal.RestoreResidue == nil
+		return journal.RestoreOutcome == upgradeRestoreIndeterminate && journal.RestoreResidue != nil
 	default:
 		return false
 	}

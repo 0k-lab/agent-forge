@@ -63,21 +63,24 @@ func TestUpgradeTransactionJournalContract(t *testing.T) {
 	}
 
 	invalidValues := map[string]func(*upgradeTransactionJournal){
-		"format":          func(j *upgradeTransactionJournal) { j.FormatVersion = 2 },
-		"transaction":     func(j *upgradeTransactionJournal) { j.TransactionID = strings.Repeat("a", 63) },
-		"source version":  func(j *upgradeTransactionJournal) { j.SourceVersion = "1.2.3" },
-		"target version":  func(j *upgradeTransactionJournal) { j.TargetVersion = "v01.2.4" },
-		"commit":          func(j *upgradeTransactionJournal) { j.TargetCommit = strings.Repeat("C", 40) },
-		"store schema":    func(j *upgradeTransactionJournal) { j.StoreSchemaVersion = 0 },
-		"receipt digest":  func(j *upgradeTransactionJournal) { j.SourceReceiptSHA256 = strings.Repeat("b", 63) },
-		"uid":             func(j *upgradeTransactionJournal) { j.AccountUID = -1 },
-		"gid":             func(j *upgradeTransactionJournal) { j.AccountGID = -1 },
-		"database path":   func(j *upgradeTransactionJournal) { j.DatabaseRelativePath = "/var/gate/state/forge.db" },
-		"snapshot path":   func(j *upgradeTransactionJournal) { j.SnapshotRelativePath = "var/gate/state/snapshot.db" },
-		"snapshot schema": func(j *upgradeTransactionJournal) { j.SnapshotSchemaVersion = 6 },
-		"snapshot size":   func(j *upgradeTransactionJournal) { j.SnapshotSize = 0 },
-		"snapshot digest": func(j *upgradeTransactionJournal) { j.SnapshotSHA256 = strings.Repeat("D", 64) },
-		"phase":           func(j *upgradeTransactionJournal) { j.Phase = "prepared" },
+		"format":               func(j *upgradeTransactionJournal) { j.FormatVersion = 2 },
+		"transaction":          func(j *upgradeTransactionJournal) { j.TransactionID = strings.Repeat("a", 63) },
+		"source version":       func(j *upgradeTransactionJournal) { j.SourceVersion = "1.2.3" },
+		"target version":       func(j *upgradeTransactionJournal) { j.TargetVersion = "v01.2.4" },
+		"commit":               func(j *upgradeTransactionJournal) { j.TargetCommit = strings.Repeat("C", 40) },
+		"store schema":         func(j *upgradeTransactionJournal) { j.StoreSchemaVersion = 0 },
+		"receipt digest":       func(j *upgradeTransactionJournal) { j.SourceReceiptSHA256 = strings.Repeat("b", 63) },
+		"negative uid":         func(j *upgradeTransactionJournal) { j.AccountUID = -1 },
+		"invalid sentinel uid": func(j *upgradeTransactionJournal) { j.AccountUID = 0xffffffff },
+		"negative gid":         func(j *upgradeTransactionJournal) { j.AccountGID = -1 },
+		"invalid sentinel gid": func(j *upgradeTransactionJournal) { j.AccountGID = 0xffffffff },
+		"database path":        func(j *upgradeTransactionJournal) { j.DatabaseRelativePath = "/var/gate/state/forge.db" },
+		"snapshot path":        func(j *upgradeTransactionJournal) { j.SnapshotRelativePath = "var/gate/state/snapshot.db" },
+		"zero snapshot schema": func(j *upgradeTransactionJournal) { j.SnapshotSchemaVersion = 0 },
+		"high snapshot schema": func(j *upgradeTransactionJournal) { j.SnapshotSchemaVersion = 6 },
+		"snapshot size":        func(j *upgradeTransactionJournal) { j.SnapshotSize = 0 },
+		"snapshot digest":      func(j *upgradeTransactionJournal) { j.SnapshotSHA256 = strings.Repeat("D", 64) },
+		"phase":                func(j *upgradeTransactionJournal) { j.Phase = "prepared" },
 	}
 	for name, mutate := range invalidValues {
 		t.Run("encode "+name, func(t *testing.T) {
@@ -101,11 +104,14 @@ func TestUpgradeTransactionJournalContract(t *testing.T) {
 		{upgradePhaseRestoreAppliedDurable, upgradeRestoreAppliedDurable, &falseValue, true},
 		{upgradePhaseRestoreAppliedDurable, upgradeRestoreAppliedDurable, &trueValue, true},
 		{upgradePhaseRestoreAppliedDurable, upgradeRestoreNotAppliedDurable, &falseValue, false},
-		{upgradePhaseRestoreNotAppliedDurable, upgradeRestoreNotAppliedDurable, nil, true},
-		{upgradePhaseRestoreIndeterminate, upgradeRestoreIndeterminate, nil, true},
+		{upgradePhaseRestoreNotAppliedDurable, upgradeRestoreNotAppliedDurable, nil, false},
+		{upgradePhaseRestoreNotAppliedDurable, upgradeRestoreNotAppliedDurable, &falseValue, true},
+		{upgradePhaseRestoreNotAppliedDurable, upgradeRestoreNotAppliedDurable, &trueValue, true},
+		{upgradePhaseRestoreIndeterminate, upgradeRestoreIndeterminate, nil, false},
+		{upgradePhaseRestoreIndeterminate, upgradeRestoreIndeterminate, &falseValue, true},
+		{upgradePhaseRestoreIndeterminate, upgradeRestoreIndeterminate, &trueValue, true},
 		{upgradePhaseCandidateReady, upgradeRestoreAppliedDurable, nil, false},
 		{upgradePhaseRestoreAppliedDurable, upgradeRestoreAppliedDurable, nil, false},
-		{upgradePhaseRestoreNotAppliedDurable, upgradeRestoreNotAppliedDurable, &falseValue, false},
 	}
 	for _, test := range restoreCases {
 		candidate := journal
@@ -113,6 +119,33 @@ func TestUpgradeTransactionJournalContract(t *testing.T) {
 		_, err := encodeUpgradeTransactionJournal(candidate)
 		if (err == nil) != test.valid {
 			t.Errorf("restore fields (%s, %s, %v): %v", test.phase, test.outcome, test.residue, err)
+		}
+	}
+
+	for _, phaseOutcome := range []struct {
+		phase   upgradeJournalPhase
+		outcome upgradeRestoreOutcome
+	}{
+		{upgradePhaseRestoreAppliedDurable, upgradeRestoreAppliedDurable},
+		{upgradePhaseRestoreNotAppliedDurable, upgradeRestoreNotAppliedDurable},
+		{upgradePhaseRestoreIndeterminate, upgradeRestoreIndeterminate},
+	} {
+		candidate := journal
+		candidate.Phase = phaseOutcome.phase
+		candidate.RestoreOutcome = phaseOutcome.outcome
+		candidate.RestoreResidue = &falseValue
+		body, err := encodeUpgradeTransactionJournal(candidate)
+		if err != nil {
+			t.Errorf("encode %s with residue: %v", phaseOutcome.phase, err)
+			continue
+		}
+		missing := bytes.Replace(body, []byte(`,"restore_residue":false`), nil, 1)
+		null := bytes.Replace(body, []byte(`"restore_residue":false`), []byte(`"restore_residue":null`), 1)
+		if _, err := decodeUpgradeTransactionJournal(missing); err == nil {
+			t.Errorf("decoded %s with missing restore_residue", phaseOutcome.phase)
+		}
+		if _, err := decodeUpgradeTransactionJournal(null); err == nil {
+			t.Errorf("decoded %s with null restore_residue", phaseOutcome.phase)
 		}
 	}
 
