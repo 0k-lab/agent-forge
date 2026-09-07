@@ -28,10 +28,18 @@ const (
 
 type upgradeRestoreOutcome string
 
+type upgradeJournalCreateOutcome string
+
 const (
 	upgradeRestoreAppliedDurable    upgradeRestoreOutcome = "applied_durable"
 	upgradeRestoreNotAppliedDurable upgradeRestoreOutcome = "not_applied_durable"
 	upgradeRestoreIndeterminate     upgradeRestoreOutcome = "indeterminate"
+)
+
+const (
+	upgradeJournalAppliedDurable    upgradeJournalCreateOutcome = "applied_durable"
+	upgradeJournalNotAppliedDurable upgradeJournalCreateOutcome = "not_applied_durable"
+	upgradeJournalIndeterminate     upgradeJournalCreateOutcome = "indeterminate"
 )
 
 type upgradeTransactionJournal struct {
