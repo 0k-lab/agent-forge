@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"agent-forge/internal/protocol"
 	"agent-forge/internal/store"
 	"agent-forge/internal/worker"
 )
@@ -185,10 +186,11 @@ func TestPublicSourceGateWorkerE2E(t *testing.T) {
 	}
 	plugin := `import json,pathlib,sys
 i=json.loads(sys.stdin.readline())
-print(json.dumps({"version":"v1","id":i["id"],"type":"initialized","capabilities":["workspace_edit","progress","cancel","commit_subject"]},separators=(",",":")),flush=True)
+assert "agent_report" in i["capabilities"]
+print(json.dumps({"version":"v1","id":i["id"],"type":"initialized","capabilities":["workspace_edit","progress","cancel","commit_subject","agent_report"]},separators=(",",":")),flush=True)
 r=json.loads(sys.stdin.readline())
 pathlib.Path(r["workspace"],"file").write_text("worker\n")
-print(json.dumps({"version":"v1","id":i["id"],"type":"result","commit_subject":"test: worker candidate"},separators=(",",":")),flush=True)`
+print(json.dumps({"version":"v1","id":i["id"],"type":"result","commit_subject":"test: worker candidate","summary":"Update the fixture file","changes":["Replace the fixture contents with the worker result"]},separators=(",",":")),flush=True)`
 	workerBody, _ := json.Marshal(map[string]any{
 		"version": 1, "gate_url": "ws" + strings.TrimPrefix(server.URL, "http"), "id": "worker-1", "token_env": "FORGE_WORKER_TOKEN", "heartbeat_interval": "10ms", "concurrency": 1,
 		"repository_roots": []string{repositories}, "worktree_root": worktrees, "runtime_root": runtime, "repositories": []any{},
@@ -236,10 +238,15 @@ print(json.dumps({"version":"v1","id":i["id"],"type":"result","commit_subject":"
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	report, reportErr := protocol.DecodeAgentReport(job.Result)
+	attempts, attemptErr := s.Attempts(job.ID)
+	if reportErr != nil || report == nil || report.Summary != "Update the fixture file" || attemptErr != nil || len(attempts) != 1 || attempts[0].Result != job.Result {
+		t.Fatal("end-to-end report lost", job.Result, reportErr)
+	}
 	if job.Status != "succeeded" || job.CandidateSHA == "" || job.Task == nil || job.Task.Repository == "" {
 		t.Fatalf("job = %#v, %v", job, err)
 	}
-	attempts, err := s.Attempts(job.ID)
+	attempts, err = s.Attempts(job.ID)
 	if err != nil || len(attempts) != 1 {
 		t.Fatalf("attempts = %#v, %v", attempts, err)
 	}

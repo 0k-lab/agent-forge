@@ -1,6 +1,8 @@
 package pluginprotocol
 
 import (
+	"agent-forge/internal/configjson"
+	"agent-forge/internal/protocol"
 	"bufio"
 	"bytes"
 	"context"
@@ -31,6 +33,7 @@ const (
 	Progress      Capability = "progress"
 	Cancel        Capability = "cancel"
 	CommitSubject Capability = "commit_subject"
+	AgentReport   Capability = "agent_report"
 )
 
 type Limits struct {
@@ -59,6 +62,7 @@ type Request struct {
 }
 
 type Result struct {
+	Report        *protocol.AgentReport
 	Output        string
 	CommitSubject *string
 }
@@ -108,6 +112,7 @@ type workspaceResult struct {
 	ID            string  `json:"id"`
 	Type          string  `json:"type"`
 	CommitSubject *string `json:"commit_subject,omitempty"`
+	*protocol.AgentReport
 }
 
 type progressFrame struct {
@@ -214,11 +219,22 @@ func exchangeContext(ctx context.Context, dst io.Writer, src io.Reader, request 
 				}
 				return Result{Output: terminal.Output}, nil
 			}
+			if !contains(ready.Capabilities, AgentReport) {
+				var legacy struct {
+					Version       string  `json:"version"`
+					ID            string  `json:"id"`
+					Type          string  `json:"type"`
+					CommitSubject *string `json:"commit_subject,omitempty"`
+				}
+				if decodeFrame(body, &legacy) != nil {
+					return Result{}, errors.New("invalid result frame")
+				}
+			}
 			var terminal workspaceResult
-			if err := decodeFrame(body, &terminal); err != nil || ValidateCommitSubject(terminal.CommitSubject, contains(ready.Capabilities, CommitSubject)) != nil {
+			if err := configjson.Decode(body, &terminal); err != nil || protocol.ValidateAgentReport(terminal.AgentReport) != nil || ValidateCommitSubject(terminal.CommitSubject, contains(ready.Capabilities, CommitSubject)) != nil {
 				return Result{}, errors.New("invalid result frame")
 			}
-			return Result{CommitSubject: terminal.CommitSubject}, nil
+			return Result{CommitSubject: terminal.CommitSubject, Report: terminal.AgentReport}, nil
 		default:
 			return Result{}, errors.New("invalid frame order")
 		}
@@ -344,10 +360,13 @@ func Serve(in io.Reader, out io.Writer, supported []Capability, handler Handler)
 		}
 		return writeFrame(out, textResult{Version, init.ID, "result", result.Output})
 	}
-	if err := ValidateCommitSubject(result.CommitSubject, contains(selected, CommitSubject)); err != nil {
+	if !contains(selected, AgentReport) {
+		result.Report = nil
+	}
+	if err := ValidateCommitSubject(result.CommitSubject, contains(selected, CommitSubject)); err != nil || protocol.ValidateAgentReport(result.Report) != nil {
 		return writeFrame(out, failure{Version, init.ID, "failure", "execution_failed"})
 	}
-	return writeFrame(out, workspaceResult{Version, init.ID, "result", result.CommitSubject})
+	return writeFrame(out, workspaceResult{Version: Version, ID: init.ID, Type: "result", CommitSubject: result.CommitSubject, AgentReport: result.Report})
 }
 
 func ValidateCommitSubject(subject *string, negotiated bool) error {
@@ -460,7 +479,7 @@ func validID(id string) bool {
 func validCapabilities(capabilities []Capability) bool {
 	seen := map[Capability]bool{}
 	for _, capability := range capabilities {
-		if !contains([]Capability{Text, WorkspaceEdit, Progress, Cancel, CommitSubject}, capability) || seen[capability] {
+		if !contains([]Capability{Text, WorkspaceEdit, Progress, Cancel, CommitSubject, AgentReport}, capability) || seen[capability] {
 			return false
 		}
 		seen[capability] = true

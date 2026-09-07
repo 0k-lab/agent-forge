@@ -18,7 +18,7 @@ The Worker generates a lowercase 32-hex `id`. Every frame has exactly `version`,
 {"version":"v1","id":"0123456789abcdef0123456789abcdef","type":"initialized","capabilities":["text"]}
 ```
 
-Capabilities are closed: `text`, `workspace_edit`, `progress`, `cancel`, `commit_subject`. `initialized.capabilities` is a duplicate-free subset of the offer and must include the operation capability. Unknown or unoffered selections fail.
+Capabilities are closed: `text`, `workspace_edit`, `progress`, `cancel`, `commit_subject`, `agent_report`. `initialized.capabilities` is a duplicate-free subset of the offer and must include the operation capability. Unknown or unoffered selections fail.
 
 ## Operations and terminals
 
@@ -38,7 +38,9 @@ Workspace execution and success:
 {"version":"v1","id":"0123456789abcdef0123456789abcdef","type":"result","commit_subject":"feat: describe the edit"}
 ```
 
-The workspace result has exactly the common fields and optional `commit_subject`. If present, `commit_subject` requires negotiation, is 1..256 UTF-8 bytes, has no leading/trailing Unicode whitespace, Unicode control or format characters, U+2028/U+2029, or logical second line. When absent, Worker uses `chore: apply coding task`. Worker passes it as one argv element.
+`agent_report` is an optional v1 capability. Workers offer it; plugins select it only when offered. Workspace results may contain `summary` and `changes` only when selected. Otherwise plugins omit both fields and receivers strictly reject either field, including null. Legacy `commit_subject` results remain valid. The v1 limits and version are unchanged.
+
+The workspace result has the common fields, optional `commit_subject`, and an optional report pair: `summary` and `changes`. Legacy results without the report remain valid. A report has a non-empty summary of at most 1024 UTF-8 bytes and 1–12 non-empty change strings of at most 256 UTF-8 bytes each. Report strings must be trimmed and contain no Unicode control/format characters or U+2028/U+2029. Unknown, duplicate, malformed Unicode, or partially supplied report fields fail closed. The report is advisory and self-reported, never check evidence. Worker encodes it canonically into the existing candidate result only after successful checks and candidate creation; Gate persists it with the producing attempt. Progress frames remain transient and are not stored. If present, `commit_subject` requires negotiation, is 1..256 UTF-8 bytes, has no leading/trailing Unicode whitespace, Unicode control or format characters, U+2028/U+2029, or logical second line. When absent, Worker uses `chore: apply coding task`. Worker passes it as one argv element.
 
 Progress requires negotiation, is limited to 128 frames, and has monotonically consecutive sequence numbers starting at 1. `stage` is one of `started`, `working`, `finalizing`; `text` is at most 1,024 UTF-8 bytes:
 

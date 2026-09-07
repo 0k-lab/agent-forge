@@ -89,9 +89,18 @@ func publicRepositoryPath(root string, source publicSource) string {
 }
 
 func provisionPublicRepository(parent context.Context, config Config, repository RepositoryRegistration, base string) (string, error) {
-	source, err := canonicalPublicGitHubURL(repository.RepositoryURL)
-	if err != nil || protocol.ValidateBranchName(repository.DefaultBranch) != nil || protocol.ValidateBaseSHA(base) != nil || config.PublicRepositoryRoot == "" || config.GitExecutable == "" {
+	if protocol.ValidateBaseSHA(base) != nil {
 		return "", preparationFailure(protocol.EvidenceReasonSourcePolicyInvalid, false)
+	}
+	path, _, err := preparePublicRepository(parent, config, repository, base)
+	return path, err
+}
+
+// An empty base resolves the fetched default-branch head while holding the preparation lock.
+func preparePublicRepository(parent context.Context, config Config, repository RepositoryRegistration, base string) (string, string, error) {
+	source, err := canonicalPublicGitHubURL(repository.RepositoryURL)
+	if err != nil || protocol.ValidateBranchName(repository.DefaultBranch) != nil || base != "" && protocol.ValidateBaseSHA(base) != nil || config.PublicRepositoryRoot == "" || config.GitExecutable == "" {
+		return "", "", preparationFailure(protocol.EvidenceReasonSourcePolicyInvalid, false)
 	}
 	publicProvisionMu.Lock()
 	defer publicProvisionMu.Unlock()
@@ -101,10 +110,10 @@ func provisionPublicRepository(parent context.Context, config Config, repository
 	if _, err := os.Lstat(target); errors.Is(err, os.ErrNotExist) {
 		temp, err := os.MkdirTemp(config.PublicRepositoryRoot, ".forge-clone-")
 		if err != nil {
-			return "", preparationFailure(protocol.EvidenceReasonRepositoryStateUnsafe, false)
+			return "", "", preparationFailure(protocol.EvidenceReasonRepositoryStateUnsafe, false)
 		}
 		if err := os.Remove(temp); err != nil {
-			return "", preparationFailure(protocol.EvidenceReasonRepositoryStateUnsafe, false)
+			return "", "", preparationFailure(protocol.EvidenceReasonRepositoryStateUnsafe, false)
 		}
 		keep := false
 		defer func() {
@@ -113,29 +122,35 @@ func provisionPublicRepository(parent context.Context, config Config, repository
 			}
 		}()
 		if _, err := publicGitRunner(parent, config.GitExecutable, "", timeout, outputBytes, "clone", "--bare", "--template=", "--no-tags", "--single-branch", "--branch", repository.DefaultBranch, "--", remote, temp); err != nil {
-			return "", preparationFailure(protocol.EvidenceReasonCloneFailed, true)
+			return "", "", preparationFailure(protocol.EvidenceReasonCloneFailed, true)
 		}
 		if _, err := publicGitRunner(parent, config.GitExecutable, temp, timeout, outputBytes, "config", "--local", "core.hooksPath", "/dev/null"); err != nil || validatePublicRepository(parent, config.GitExecutable, temp, remote, timeout, outputBytes) != nil || os.Rename(temp, target) != nil {
-			return "", preparationFailure(protocol.EvidenceReasonRepositoryStateUnsafe, false)
+			return "", "", preparationFailure(protocol.EvidenceReasonRepositoryStateUnsafe, false)
 		}
 		keep = true
 	} else if err != nil {
-		return "", preparationFailure(protocol.EvidenceReasonRepositoryStateUnsafe, false)
+		return "", "", preparationFailure(protocol.EvidenceReasonRepositoryStateUnsafe, false)
 	}
 	if validatePublicRepository(parent, config.GitExecutable, target, remote, timeout, outputBytes) != nil {
-		return "", preparationFailure(protocol.EvidenceReasonRepositoryStateUnsafe, false)
+		return "", "", preparationFailure(protocol.EvidenceReasonRepositoryStateUnsafe, false)
 	}
 	refspec := "+refs/heads/" + repository.DefaultBranch + ":refs/heads/" + repository.DefaultBranch
 	if _, err := publicGitRunner(parent, config.GitExecutable, target, timeout, outputBytes, "fetch", "--no-tags", "--prune", "origin", refspec); err != nil {
-		return "", preparationFailure(protocol.EvidenceReasonFetchFailed, true)
+		return "", "", preparationFailure(protocol.EvidenceReasonFetchFailed, true)
+	}
+	if base == "" {
+		base, err = publicGitRunner(parent, config.GitExecutable, target, timeout, outputBytes, "rev-parse", "--verify", "refs/heads/"+repository.DefaultBranch+"^{commit}")
+		if err != nil || protocol.ValidateBaseSHA(base) != nil {
+			return "", "", preparationFailure(protocol.EvidenceReasonBaseUnavailable, false)
+		}
 	}
 	if _, err := publicGitRunner(parent, config.GitExecutable, target, timeout, outputBytes, "cat-file", "-e", base+"^{commit}"); err != nil {
-		return "", preparationFailure(protocol.EvidenceReasonBaseUnavailable, false)
+		return "", "", preparationFailure(protocol.EvidenceReasonBaseUnavailable, false)
 	}
 	if _, err := publicGitRunner(parent, config.GitExecutable, target, timeout, outputBytes, "merge-base", "--is-ancestor", base, "refs/heads/"+repository.DefaultBranch); err != nil {
-		return "", preparationFailure(protocol.EvidenceReasonBaseUnavailable, false)
+		return "", "", preparationFailure(protocol.EvidenceReasonBaseUnavailable, false)
 	}
-	return target, nil
+	return target, base, nil
 }
 
 func validatePublicRepository(parent context.Context, executable, path, remote string, timeout time.Duration, outputBytes int64) error {

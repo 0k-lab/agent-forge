@@ -301,6 +301,14 @@ func (x *server) routes() http.Handler {
 		_, _ = mac.Write([]byte("agent-forge/install-ready/v2\x00" + values[0] + "\x00" + x.options.ReleaseVersion + "\x00" + x.options.ReleaseCommit))
 		writeJSON(w, http.StatusOK, map[string]string{"commit": x.options.ReleaseCommit, "proof": base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), "status": "ready", "version": x.options.ReleaseVersion})
 	})
+	m.HandleFunc("/app", getOnly(x.controlAsset))
+	m.HandleFunc("/app/", getOnly(x.controlAsset))
+	m.HandleFunc("/v1/control/projects/{id}/runs", x.ownerAuth(getOnly(x.controlSourceRuns)))
+	m.HandleFunc("/v1/control/projects/{id}/issues/{number}/activity", x.ownerAuth(getOnly(x.controlIssueActivity)))
+	m.HandleFunc("/v1/control/projects/{id}/issues", x.ownerAuth(getOnly(x.controlIssues)))
+	m.HandleFunc("/v1/control/overview", x.ownerAuth(getOnly(x.controlOverview)))
+	m.HandleFunc("/v1/control/jobs/{id}", x.ownerAuth(getOnly(x.controlDetail)))
+	m.HandleFunc("POST /v1/control/jobs", x.ownerAuth(x.controlSubmit))
 	m.HandleFunc("POST /v1/jobs", x.ownerAuth(x.submit))
 	m.HandleFunc("GET /v1/jobs/{id}", x.ownerAuth(x.getJob))
 	m.HandleFunc("GET /v1/jobs/{id}/status", x.ownerAuth(x.getJobStatus))
@@ -600,12 +608,17 @@ func (x *server) submitConfigured(w http.ResponseWriter, r *http.Request) {
 		task.Repository = prepared
 		x.log("repository_prepared", "repository_id", repository.ID, "base_sha", task.BaseSHA)
 	}
+	x.persistConfiguredTask(w, task, *repository, string(in.SourceRef))
+}
+
+func (x *server) persistConfiguredTask(w http.ResponseWriter, task protocol.CodingTask, repository RepositoryRegistration, source string) {
+	var err error
 	policy := x.config.resolvedPolicy(repository.WorkerPool, repository.Execution, repository.ID, repository.DefaultBranch)
 	var job store.Job
-	if in.SourceRef == "" {
+	if source == "" {
 		job, err = x.store.CreateCodingJobWithPolicy(task, policy)
 	} else {
-		job, err = x.store.CreateCodingJobWithPolicyAndSource(task, policy, string(in.SourceRef))
+		job, err = x.store.CreateCodingJobWithPolicyAndSource(task, policy, source)
 	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "request failed"})
@@ -1118,6 +1131,10 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 			var terminalJob store.Job
 			var resultErr error
 			if m.Error != "" {
+				if m.Result != "" || m.CandidateSHA != "" {
+					reject()
+					return
+				}
 				disposition, ok := failureDisposition(m.Error)
 				if !ok || m.Disposition != "" && m.Disposition != string(disposition) {
 					reject()
@@ -1132,6 +1149,10 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 				reject()
 				return
 			} else if m.CandidateSHA != "" {
+				if _, err := protocol.DecodeAgentReport(m.Result); err != nil {
+					reject()
+					return
+				}
 				if x.config != nil {
 					repository, deliver := RepositoryRegistration{}, false
 					if x.config.Delivery != nil && active.Task != nil {
@@ -1142,13 +1163,13 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 						var delivery store.Delivery
 						delivery, resultErr = x.deliveryForCandidate(ctx, *active, m.CandidateSHA)
 						if resultErr == nil {
-							terminalJob, resultErr = x.store.CompleteCandidateDeliveryLeaseAt(m.JobID, m.AttemptID, effectiveID, generation, delivery, at)
+							terminalJob, resultErr = x.store.CompleteCandidateDeliveryReportLeaseAt(m.JobID, m.AttemptID, effectiveID, generation, delivery, m.Result, at)
 						}
 					} else {
-						terminalJob, resultErr = x.store.CompleteCandidateLeaseAt(m.JobID, m.AttemptID, effectiveID, generation, m.CandidateSHA, at)
+						terminalJob, resultErr = x.store.CompleteCandidateReportLeaseAt(m.JobID, m.AttemptID, effectiveID, generation, m.CandidateSHA, m.Result, at)
 					}
 				} else {
-					terminalJob, resultErr = x.store.CompleteCandidateAt(m.JobID, m.AttemptID, m.CandidateSHA, at)
+					terminalJob, resultErr = x.store.CompleteCandidateReportAt(m.JobID, m.AttemptID, m.CandidateSHA, m.Result, at)
 				}
 			} else {
 				if x.config != nil {
