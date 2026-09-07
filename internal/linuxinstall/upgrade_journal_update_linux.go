@@ -376,6 +376,12 @@ func recoverUpgradeJournalUpdate(o Options, parent *os.File, parentID unix.Stat_
 		if err := validateExpectedPreExchange(o, parent, parentID, current, currentID, expectedBody, witnessName, stageName, stage, stagePinnedID, nextBody, ops); err != nil {
 			return updateIndeterminate(err, true)
 		}
+		if err := ops.syncParent(parent); err != nil {
+			return updateNotApplied(fmt.Errorf("sync recovered staged upgrade journal: %w", err), true)
+		}
+		if err := validateExpectedPreExchange(o, parent, parentID, current, currentID, expectedBody, witnessName, stageName, stage, stagePinnedID, nextBody, ops); err != nil {
+			return updateIndeterminate(err, true)
+		}
 		return exchangeUpgradeJournalUpdate(o, parent, parentID, current, currentID, stage, stagePinnedID, expectedBody, nextBody, witnessName, stageName, ops)
 	}
 	if currentKind == updateFileNext && stageKind == updateFileExpected && sameUpgradeJournalInode(stagePinnedID, witnessPinnedID) && validUpgradeJournalPinnedMetadata(currentID, 1, int64(len(nextBody))) && validUpgradeJournalPinnedMetadata(stagePinnedID, 2, int64(len(expectedBody))) {

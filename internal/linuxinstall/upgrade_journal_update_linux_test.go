@@ -179,6 +179,38 @@ func TestCompareAndSwapUpgradeJournalExchangeUncertaintyAndRecovery(t *testing.T
 		})
 	}
 
+	t.Run("pre-exchange recovery sync failure does not exchange", func(t *testing.T) {
+		o := writeUpgradeJournalForUpdate(t, expected)
+		witness, stage := upgradeJournalUpdateNames(expected, next)
+		parentPath := filepath.Dir(upgradeJournalPath(o))
+		if err := os.Link(upgradeJournalPath(o), filepath.Join(parentPath, witness)); err != nil {
+			t.Fatal(err)
+		}
+		nextBody, err := encodeUpgradeTransactionJournal(next)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(parentPath, stage), nextBody, 0o400); err != nil {
+			t.Fatal(err)
+		}
+
+		ops := defaultUpgradeJournalUpdateOps()
+		exchangeCalled := false
+		ops.syncParent = func(*os.File) error { return errors.New("injected recovery fsync failure") }
+		ops.exchange = func(*os.File, string, string) error {
+			exchangeCalled = true
+			return errors.New("RENAME_EXCHANGE called before recovery parent sync")
+		}
+		outcome, err := compareAndSwapUpgradeTransactionJournalWithOps(o, expected, next, ops)
+		var updateErr *upgradeJournalUpdateError
+		if err == nil || outcome != upgradeJournalUpdateNotAppliedDurable || !errors.As(err, &updateErr) || !updateErr.Residue || exchangeCalled {
+			t.Fatalf("recovery = %q, %v; residue=%v, exchange called=%v", outcome, err, updateErr != nil && updateErr.Residue, exchangeCalled)
+		}
+		assertUpgradeJournalBody(t, upgradeJournalPath(o), expected)
+		assertUpgradeJournalBody(t, filepath.Join(parentPath, witness), expected)
+		assertUpgradeJournalBody(t, filepath.Join(parentPath, stage), next)
+	})
+
 	t.Run("post-exchange fsync failure remains recoverable", func(t *testing.T) {
 		o := writeUpgradeJournalForUpdate(t, expected)
 		ops := defaultUpgradeJournalUpdateOps()
