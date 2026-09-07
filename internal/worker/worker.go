@@ -38,6 +38,7 @@ type pluginFailure struct{ reason string }
 func (e pluginFailure) Error() string { return "plugin failed" }
 
 type codingOutcome struct {
+	result       string
 	candidateSHA string
 	err          error
 	evidence     []protocol.AttemptEvidence
@@ -303,7 +304,7 @@ func invokeLocalResult(parent context.Context, argv []string, request pluginRequ
 	if request.Workspace != "" {
 		operation = pluginprotocol.WorkspaceEdit
 		protocolRequest = pluginprotocol.Request{Operation: operation, Workspace: request.Workspace, Instruction: request.Instruction, TimeoutMS: timeout.Milliseconds()}
-		capabilities = []pluginprotocol.Capability{pluginprotocol.Progress, pluginprotocol.Cancel, pluginprotocol.CommitSubject}
+		capabilities = []pluginprotocol.Capability{pluginprotocol.Progress, pluginprotocol.Cancel, pluginprotocol.CommitSubject, pluginprotocol.AgentReport}
 	}
 	result, err := pluginprotocol.Run(parent, argv, protocolRequest, pluginprotocol.Options{Timeout: timeout, OutputBytes: outputBytes, Capabilities: capabilities, Environment: environment})
 	if err != nil {
@@ -505,7 +506,11 @@ func executeCodingOutcomeSettings(ctx context.Context, settings codingSettings, 
 	for i := range evidence {
 		evidence[i].CandidateSHA = sha
 	}
-	return codingOutcome{candidateSHA: sha, evidence: evidence, cleanup: cleanup}
+	report, err := protocol.EncodeAgentReport(pluginResult.Report)
+	if err != nil {
+		return codingOutcome{err: err, evidence: evidence, cleanup: cleanup}
+	}
+	return codingOutcome{result: report, candidateSHA: sha, evidence: evidence, cleanup: cleanup}
 }
 
 func boundedDurationMS(duration, limit time.Duration) int64 {

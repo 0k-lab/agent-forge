@@ -40,32 +40,42 @@ assert schema.parent == output.parent and schema.parent.parent == pathlib.Path(o
 assert stat.S_IMODE(schema.parent.stat().st_mode) == 0o700
 assert stat.S_IMODE(schema.stat().st_mode) == 0o600
 spec=json.loads(schema.read_text())
-assert spec["required"] == ["commit_subject"] and spec["additionalProperties"] is False
+assert spec["required"] == ["commit_subject", "summary", "changes"] and spec["additionalProperties"] is False
 prompt=sys.stdin.read()
 assert "actual resulting diff" in prompt
+assert "read-only git diff" in prompt
+assert "self-reported" in prompt and "1–12 concrete change bullets" in prompt
 assert "Do not run tests" not in prompt
 assert "Follow AGENTS.md and other repository instructions only when they do not conflict with this prompt's constraints or the task." in prompt
 assert "Within this plugin's existing execution environment and lifecycle, you may run workspace-local, repository-native focused validation when useful and not prohibited by the task." in prompt
 assert "Its output and your claims are advisory executor feedback, never Worker acceptance evidence." in prompt
 pathlib.Path(workspace,"answer.txt").write_text("edited\n")
-output.write_text(json.dumps({"commit_subject":"fix: use executor result"},separators=(",",":")))
+output.write_text(json.dumps({"commit_subject":"fix: use executor result","summary":"Update the answer from executor feedback","changes":["Replace the base answer with the edited answer"]},separators=(",",":")))
 `), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("CODEX_BIN", fake)
 	privateTmp := t.TempDir()
 	t.Setenv("TMPDIR", privateTmp)
-	id := strings.Repeat("a", 32)
-	input := `{"version":"v1","id":"` + id + `","type":"initialize","capabilities":["workspace_edit","commit_subject"],"limits":{"frame_bytes":1048576,"progress_frames":128,"text_bytes":65536,"progress_text_bytes":1024,"commit_subject_bytes":256}}` + "\n" +
-		`{"version":"v1","id":"` + id + `","type":"execute","operation":"workspace_edit","workspace":` + quote(workspace) + `,"instruction":"edit","timeout_ms":1000}` + "\n"
-	var output bytes.Buffer
-	if err := serve(strings.NewReader(input), &output); err != nil {
-		t.Fatal(err)
-	}
-	want := `{"version":"v1","id":"` + id + `","type":"initialized","capabilities":["workspace_edit","commit_subject"]}` + "\n" +
-		`{"version":"v1","id":"` + id + `","type":"result","commit_subject":"fix: use executor result"}` + "\n"
-	if output.String() != want || git("rev-parse", "HEAD") != head {
-		t.Fatalf("output=%q head=%s", output.String(), git("rev-parse", "HEAD"))
+	for _, report := range []bool{false, true} {
+		id := strings.Repeat("a", 32)
+		capabilities := `"workspace_edit","commit_subject"`
+		fields := ""
+		if report {
+			capabilities += `,"agent_report"`
+			fields = `,"summary":"Update the answer from executor feedback","changes":["Replace the base answer with the edited answer"]`
+		}
+		input := `{"version":"v1","id":"` + id + `","type":"initialize","capabilities":[` + capabilities + `],"limits":{"frame_bytes":1048576,"progress_frames":128,"text_bytes":65536,"progress_text_bytes":1024,"commit_subject_bytes":256}}` + "\n" +
+			`{"version":"v1","id":"` + id + `","type":"execute","operation":"workspace_edit","workspace":` + quote(workspace) + `,"instruction":"edit","timeout_ms":1000}` + "\n"
+		var output bytes.Buffer
+		if err := serve(strings.NewReader(input), &output); err != nil {
+			t.Fatal(err)
+		}
+		want := `{"version":"v1","id":"` + id + `","type":"initialized","capabilities":[` + capabilities + `]}` + "\n" +
+			`{"version":"v1","id":"` + id + `","type":"result","commit_subject":"fix: use executor result"` + fields + "}\n"
+		if output.String() != want || git("rev-parse", "HEAD") != head {
+			t.Fatalf("report=%v output=%q", report, output.String())
+		}
 	}
 	entries, err := os.ReadDir(privateTmp)
 	if err != nil || len(entries) != 0 {
@@ -91,13 +101,16 @@ if body:
 	t.Setenv("CODEX_BIN", fake)
 	t.Setenv("TMPDIR", privateTmp)
 	for name, body := range map[string][]byte{
-		"missing":       nil,
-		"malformed":     []byte(`{"commit_subject":`),
-		"duplicate":     []byte(`{"commit_subject":"fix: one","commit_subject":"fix: two"}`),
-		"unknown":       []byte(`{"commit_subject":"fix: one","private":"secret"}`),
-		"trailing":      []byte(`{"commit_subject":"fix: one"}{}`),
-		"invalid UTF-8": {'{', '"', 'c', 'o', 'm', 'm', 'i', 't', '_', 's', 'u', 'b', 'j', 'e', 'c', 't', '"', ':', '"', 0xff, '"', '}'},
-		"oversized":     []byte(`{"commit_subject":"` + strings.Repeat("x", 400) + `"}`),
+		"missing":           nil,
+		"missing report":    []byte(`{"commit_subject":"fix: valid"}`),
+		"oversized summary": []byte(`{"commit_subject":"fix: valid","summary":"` + strings.Repeat("x", 1025) + `","changes":["x"]}`),
+		"malformed report":  []byte(`{"commit_subject":"fix: valid","summary":"x","changes":[]}`),
+		"malformed":         []byte(`{"commit_subject":`),
+		"duplicate":         []byte(`{"commit_subject":"fix: one","commit_subject":"fix: two"}`),
+		"unknown":           []byte(`{"commit_subject":"fix: one","private":"secret"}`),
+		"trailing":          []byte(`{"commit_subject":"fix: one"}{}`),
+		"invalid UTF-8":     {'{', '"', 'c', 'o', 'm', 'm', 'i', 't', '_', 's', 'u', 'b', 'j', 'e', 'c', 't', '"', ':', '"', 0xff, '"', '}'},
+		"oversized":         []byte(`{"commit_subject":"` + strings.Repeat("x", 400) + `"}`),
 	} {
 		t.Run(name, func(t *testing.T) {
 			workspace := t.TempDir()

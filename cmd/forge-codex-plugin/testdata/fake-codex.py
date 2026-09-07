@@ -13,4 +13,4 @@ if answer_go.exists():
     answer_go.write_text(answer_go.read_text().replace("return 0", "return 42"))
 else:
     pathlib.Path(workspace, "answer.txt").write_text("conformance\n")
-output.write_text(json.dumps({"commit_subject": "test: prove conformance"}, separators=(",", ":")))
+output.write_text(json.dumps({"commit_subject": "test: prove conformance", "summary":"Update the fixture answer", "changes":["Write the conformance answer into the workspace"]}, separators=(",", ":")))

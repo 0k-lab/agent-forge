@@ -870,3 +870,51 @@ func write(t *testing.T, path, content string) {
 		t.Fatal(err)
 	}
 }
+
+func TestCandidateCarriesCanonicalAgentReportOnlyAfterSuccessfulChecks(t *testing.T) {
+	for _, mode := range []string{"candidate", "failed-check", "no-changes"} {
+		t.Run(mode, func(t *testing.T) {
+			repo, base, plugin := codingFixture(t, "#!/bin/sh\nexit 0\n")
+			action := `pathlib.Path(request["workspace"], "answer.txt").write_text("candidate\n")`
+			if mode == "no-changes" {
+				action = "pass"
+			}
+			script := workspacePluginPython(action, "")
+			script = strings.Replace(script, `capabilities=["workspace_edit"]`, `capabilities=["workspace_edit","agent_report"]`, 1)
+			script = strings.Replace(script, `"type":"result"}`, `"type":"result","summary":"Update answer","changes":["Replace base answer with candidate"]}`, 1)
+			write(t, plugin, script)
+			check := "true"
+			if mode == "failed-check" {
+				check = "false"
+			}
+			outcome := executeCodingOutcome(context.Background(), plugin, []string{repo}, strings.Repeat("1", 32), strings.Repeat("2", 32), protocol.CodingTask{Repository: repo, BaseSHA: base, Instruction: "edit", Tests: [][]string{{check}}})
+			defer outcome.cleanup()
+			if mode == "candidate" {
+				if outcome.err != nil || outcome.candidateSHA == "" || outcome.result != `{"summary":"Update answer","changes":["Replace base answer with candidate"]}` {
+					t.Fatalf("missing candidate report: result=%q err=%v", outcome.result, outcome.err)
+				}
+			} else if outcome.err == nil || outcome.result != "" || outcome.candidateSHA != "" {
+				t.Fatal("failed/no-candidate report escaped")
+			}
+		})
+	}
+}
+
+func TestNewWorkerOffersReportToLegacyPlugin(t *testing.T) {
+	script := `#!/usr/bin/env python3
+import json,sys
+init=json.loads(sys.stdin.readline())
+assert "agent_report" in init["capabilities"]
+print(json.dumps({"version":"v1","id":init["id"],"type":"initialized","capabilities":["workspace_edit","commit_subject"]},separators=(",",":")),flush=True)
+json.loads(sys.stdin.readline())
+print(json.dumps({"version":"v1","id":init["id"],"type":"result","commit_subject":"fix: legacy"},separators=(",",":")),flush=True)
+`
+	path := filepath.Join(t.TempDir(), "legacy.py")
+	if err := os.WriteFile(path, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	result, err := invokeLocalResult(context.Background(), []string{path}, pluginRequest{Workspace: t.TempDir(), Instruction: "fix"}, time.Second*5, 1<<20, nil)
+	if err != nil || result.CommitSubject == nil || result.Report != nil {
+		t.Fatalf("legacy result=%+v err=%v", result, err)
+	}
+}

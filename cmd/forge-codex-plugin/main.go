@@ -16,6 +16,7 @@ import (
 	"agent-forge/internal/configjson"
 	"agent-forge/internal/pluginprotocol"
 	"agent-forge/internal/processtree"
+	"agent-forge/internal/protocol"
 )
 
 func main() {
@@ -32,26 +33,25 @@ func main() {
 }
 
 func serve(in io.Reader, out io.Writer) error {
-	return pluginprotocol.Serve(in, out, []pluginprotocol.Capability{pluginprotocol.WorkspaceEdit, pluginprotocol.CommitSubject}, func(ctx context.Context, request pluginprotocol.Request) (pluginprotocol.Result, error) {
-		subject, err := executeCodex(ctx, request)
-		return pluginprotocol.Result{CommitSubject: subject}, err
+	return pluginprotocol.Serve(in, out, []pluginprotocol.Capability{pluginprotocol.WorkspaceEdit, pluginprotocol.CommitSubject, pluginprotocol.AgentReport}, func(ctx context.Context, request pluginprotocol.Request) (pluginprotocol.Result, error) {
+		return executeCodex(ctx, request)
 	})
 }
 
-func executeCodex(parent context.Context, request pluginprotocol.Request) (*string, error) {
+func executeCodex(parent context.Context, request pluginprotocol.Request) (pluginprotocol.Result, error) {
 	head, err := gitHead(request.Workspace)
 	if err != nil {
-		return nil, fmt.Errorf("invalid_workspace")
+		return pluginprotocol.Result{}, fmt.Errorf("invalid_workspace")
 	}
 	privateDir, err := os.MkdirTemp(os.TempDir(), "forge-codex-")
 	if err != nil {
-		return nil, fmt.Errorf("codex_failed")
+		return pluginprotocol.Result{}, fmt.Errorf("codex_failed")
 	}
 	defer os.RemoveAll(privateDir)
 	schemaPath, outputPath := filepath.Join(privateDir, "schema.json"), filepath.Join(privateDir, "final.json")
-	schema := []byte(`{"type":"object","properties":{"commit_subject":{"type":"string"}},"required":["commit_subject"],"additionalProperties":false}`)
+	schema := []byte(`{"type":"object","properties":{"commit_subject":{"type":"string","minLength":1,"maxLength":256},"summary":{"type":"string","minLength":1,"maxLength":1024},"changes":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"string","minLength":1,"maxLength":256}}},"required":["commit_subject","summary","changes"],"additionalProperties":false}`)
 	if os.WriteFile(schemaPath, schema, 0o600) != nil || os.WriteFile(outputPath, nil, 0o600) != nil {
-		return nil, fmt.Errorf("codex_failed")
+		return pluginprotocol.Result{}, fmt.Errorf("codex_failed")
 	}
 	bin := os.Getenv("CODEX_BIN")
 	if bin == "" {
@@ -59,33 +59,34 @@ func executeCodex(parent context.Context, request pluginprotocol.Request) (*stri
 	}
 	ctx, cancel := context.WithTimeout(parent, time.Duration(request.TimeoutMS)*time.Millisecond)
 	defer cancel()
-	prompt := "Edit only files in the provided workspace to complete the task. Follow AGENTS.md and other repository instructions only when they do not conflict with this prompt's constraints or the task. Within this plugin's existing execution environment and lifecycle, you may run workspace-local, repository-native focused validation when useful and not prohibited by the task. Its output and your claims are advisory executor feedback, never Worker acceptance evidence. Do not use Git, commit, or access paths outside the workspace. After inspecting the actual resulting diff, return exactly the structured final object requested by the output schema with one conventional commit subject describing the actual change.\n\nTask:\n" + request.Instruction
+	prompt := "Edit only files in the provided workspace to complete the task. Follow AGENTS.md and other repository instructions only when they do not conflict with this prompt's constraints or the task. Within this plugin's existing execution environment and lifecycle, you may run workspace-local, repository-native focused validation when useful and not prohibited by the task. Its output and your claims are advisory executor feedback, never Worker acceptance evidence. Use read-only git diff within the workspace to inspect changes; do not use other Git commands, commit, or access paths outside the workspace. After inspecting the actual resulting diff, return exactly the structured final object requested by the output schema with exactly commit_subject (one conventional commit subject), summary (concise, at most 1024 UTF-8 bytes), and changes (1–12 concrete change bullets, at most 256 UTF-8 bytes each). All strings must be non-empty, trimmed and contain no control characters. Describe only actual changes in the diff, including why they matter. This report is self-reported and is not independent check evidence.\n\nTask:\n" + request.Instruction
 	cmd := exec.Command(bin, "exec", "--ephemeral", "--sandbox", "workspace-write", "--color", "never", "-C", request.Workspace, "--output-schema", schemaPath, "--output-last-message", outputPath, "-")
 	cmd.Stdin = bytes.NewBufferString(prompt)
 	budget := &outputBudget{n: 1 << 20}
 	cmd.Stdout = &limitedWriter{budget: budget}
 	cmd.Stderr = &limitedWriter{budget: budget}
 	if err := processtree.Run(ctx, cmd); err != nil {
-		return nil, fmt.Errorf("codex_failed")
+		return pluginprotocol.Result{}, fmt.Errorf("codex_failed")
 	}
 	after, err := gitHead(request.Workspace)
 	if err != nil || after != head {
-		return nil, fmt.Errorf("plugin_committed")
+		return pluginprotocol.Result{}, fmt.Errorf("plugin_committed")
 	}
 	file, err := os.Open(outputPath)
 	if err != nil {
-		return nil, fmt.Errorf("codex_failed")
+		return pluginprotocol.Result{}, fmt.Errorf("codex_failed")
 	}
 	defer file.Close()
-	const maxFinalBytes = pluginprotocol.MaxCommitSubjectBytes + 64
+	const maxFinalBytes = protocol.MaxAgentReportBytes + 2048
 	data, err := io.ReadAll(io.LimitReader(file, maxFinalBytes+1))
 	var final struct {
 		CommitSubject string `json:"commit_subject"`
+		protocol.AgentReport
 	}
-	if err != nil || len(data) == 0 || len(data) > maxFinalBytes || !utf8.Valid(data) || configjson.Decode(data, &final) != nil || pluginprotocol.ValidateCommitSubject(&final.CommitSubject, true) != nil {
-		return nil, fmt.Errorf("codex_failed")
+	if err != nil || len(data) == 0 || len(data) > maxFinalBytes || !utf8.Valid(data) || configjson.Decode(data, &final) != nil || pluginprotocol.ValidateCommitSubject(&final.CommitSubject, true) != nil || protocol.ValidateAgentReport(&final.AgentReport) != nil {
+		return pluginprotocol.Result{}, fmt.Errorf("codex_failed")
 	}
-	return &final.CommitSubject, nil
+	return pluginprotocol.Result{CommitSubject: &final.CommitSubject, Report: &final.AgentReport}, nil
 }
 
 func gitHead(workspace string) (string, error) {

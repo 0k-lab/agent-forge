@@ -138,7 +138,7 @@ func executeConfiguredOutcome(ctx context.Context, config Config, message protoc
 		return runScopedCheckLocal(ctx, worktree, environment, argv, settings.checkTimeout, settings.checkOutput)
 	}
 	outcome := executeCodingOutcomeSettings(ctx, settings, message.JobID, message.AttemptID, task, runCheck)
-	return leaseOutcome{candidateSHA: outcome.candidateSHA, err: outcome.err, evidence: outcome.evidence, cleanup: outcome.cleanup}
+	return leaseOutcome{result: outcome.result, candidateSHA: outcome.candidateSHA, err: outcome.err, evidence: outcome.evidence, cleanup: outcome.cleanup}
 }
 
 var environmentLookup = func(name string) (string, bool) {

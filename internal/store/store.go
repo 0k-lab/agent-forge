@@ -754,20 +754,28 @@ func (s *Store) CompleteCandidate(jobID, attemptID, candidateSHA string) (Job, e
 }
 
 func (s *Store) CompleteCandidateAt(jobID, attemptID, candidateSHA string, at time.Time) (Job, error) {
+	return s.CompleteCandidateReportAt(jobID, attemptID, candidateSHA, "", at)
+}
+
+func (s *Store) CompleteCandidateReportAt(jobID, attemptID, candidateSHA, result string, at time.Time) (Job, error) {
 	if len(candidateSHA) != 40 {
 		return Job{}, errors.New("candidate SHA must be full length")
 	}
 	if _, err := hex.DecodeString(candidateSHA); err != nil {
 		return Job{}, errors.New("candidate SHA is not hexadecimal")
 	}
-	return s.terminal(jobID, attemptID, "succeeded", "", candidateSHA, "", at.UTC())
+	return s.terminal(jobID, attemptID, "succeeded", result, candidateSHA, "", at.UTC())
 }
 
 func (s *Store) CompleteCandidateDeliveryLeaseAt(jobID, attemptID, slot, generation string, delivery Delivery, at time.Time) (Job, error) {
+	return s.CompleteCandidateDeliveryReportLeaseAt(jobID, attemptID, slot, generation, delivery, "", at)
+}
+
+func (s *Store) CompleteCandidateDeliveryReportLeaseAt(jobID, attemptID, slot, generation string, delivery Delivery, result string, at time.Time) (Job, error) {
 	if delivery.JobID != jobID || delivery.AttemptID != attemptID || !lowerHex(jobID, 32) || !lowerHex(attemptID, 32) || !lowerHex(delivery.CandidateSHA, 40) || !lowerHex(delivery.ExpectedTreeSHA, 40) || !lowerHex(delivery.ParentSHA, 40) || delivery.CandidateRef != "refs/agent-forge/candidates/"+jobID+"/"+attemptID || delivery.RepositoryID == "" || delivery.RepositoryURL == "" || delivery.DefaultBranch == "" || delivery.Branch == "" || delivery.PRTitle == "" || delivery.MaxAttempts < 1 || delivery.MaxAttempts > 100 {
 		return Job{}, errors.New("invalid delivery")
 	}
-	return s.terminalOwnedState(jobID, attemptID, "succeeded", "", delivery.CandidateSHA, "", at.UTC(), slot, generation, true, &delivery)
+	return s.terminalOwnedState(jobID, attemptID, "succeeded", result, delivery.CandidateSHA, "", at.UTC(), slot, generation, true, &delivery)
 }
 
 func (s *Store) Fail(jobID, attemptID, code string) (Job, error) {
@@ -842,6 +850,16 @@ func (s *Store) terminalOwned(jobID, attemptID, attemptStatus, result, candidate
 }
 
 func (s *Store) terminalOwnedState(jobID, attemptID, attemptStatus, result, candidateSHA, failure string, at time.Time, slot, generation string, enforceOwnership bool, delivery *Delivery) (Job, error) {
+	if candidateSHA != "" {
+		report, err := protocol.DecodeAgentReport(result)
+		if err != nil {
+			return Job{}, err
+		}
+		result, err = protocol.EncodeAgentReport(report)
+		if err != nil {
+			return Job{}, err
+		}
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Job{}, err
@@ -954,7 +972,11 @@ func (s *Store) terminalOwnedState(jobID, attemptID, attemptStatus, result, cand
 }
 
 func (s *Store) Attempts(jobID string) ([]Attempt, error) {
-	rows, err := s.db.Query(`SELECT id,job_id,ordinal,worker_id,status,leased_at,deadline_at,completed_at,failure_disposition,failure_code,result,candidate_sha,worker_pool,slot,policy_version FROM attempts WHERE job_id=? ORDER BY ordinal`, jobID)
+	return s.attempts(jobID, -1)
+}
+
+func (s *Store) attempts(jobID string, limit int) ([]Attempt, error) {
+	rows, err := s.db.Query(`SELECT id,job_id,ordinal,worker_id,status,leased_at,deadline_at,completed_at,failure_disposition,failure_code,result,candidate_sha,worker_pool,slot,policy_version FROM attempts WHERE job_id=? ORDER BY ordinal LIMIT ?`, jobID, limit)
 	if err != nil {
 		return nil, err
 	}

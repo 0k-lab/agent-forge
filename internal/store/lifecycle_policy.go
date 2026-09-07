@@ -62,6 +62,10 @@ func (s *Store) CompleteLeaseAt(jobID, attemptID, slot, generation, result strin
 }
 
 func (s *Store) CompleteCandidateLeaseAt(jobID, attemptID, slot, generation, candidateSHA string, at time.Time) (Job, error) {
+	return s.CompleteCandidateReportLeaseAt(jobID, attemptID, slot, generation, candidateSHA, "", at)
+}
+
+func (s *Store) CompleteCandidateReportLeaseAt(jobID, attemptID, slot, generation, candidateSHA, result string, at time.Time) (Job, error) {
 	if len(candidateSHA) != 40 {
 		return Job{}, errors.New("invalid candidate SHA")
 	}
@@ -70,7 +74,7 @@ func (s *Store) CompleteCandidateLeaseAt(jobID, attemptID, slot, generation, can
 			return Job{}, errors.New("invalid candidate SHA")
 		}
 	}
-	return s.terminalOwned(jobID, attemptID, "succeeded", "", candidateSHA, "", at.UTC(), slot, generation, true)
+	return s.terminalOwned(jobID, attemptID, "succeeded", result, candidateSHA, "", at.UTC(), slot, generation, true)
 }
 
 func (s *Store) FailLeaseAt(jobID, attemptID, slot, generation, code string, disposition FailureDisposition, at time.Time) (Job, error) {
