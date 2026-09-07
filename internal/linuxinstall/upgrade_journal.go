@@ -30,6 +30,20 @@ type upgradeRestoreOutcome string
 
 type upgradeJournalCreateOutcome string
 
+type upgradeJournalUpdateOutcome string
+
+type upgradeJournalUpdateError struct {
+	err     error
+	Residue bool
+}
+
+func newUpgradeJournalUpdateError(err error, residue bool) error {
+	return &upgradeJournalUpdateError{err: err, Residue: residue}
+}
+
+func (err *upgradeJournalUpdateError) Error() string { return err.err.Error() }
+func (err *upgradeJournalUpdateError) Unwrap() error { return err.err }
+
 type upgradeJournalCreateError struct {
 	err     error
 	Residue bool
@@ -52,6 +66,12 @@ const (
 	upgradeJournalAppliedDurable    upgradeJournalCreateOutcome = "applied_durable"
 	upgradeJournalNotAppliedDurable upgradeJournalCreateOutcome = "not_applied_durable"
 	upgradeJournalIndeterminate     upgradeJournalCreateOutcome = "indeterminate"
+)
+
+const (
+	upgradeJournalUpdateAppliedDurable    upgradeJournalUpdateOutcome = "applied_durable"
+	upgradeJournalUpdateNotAppliedDurable upgradeJournalUpdateOutcome = "not_applied_durable"
+	upgradeJournalUpdateIndeterminate     upgradeJournalUpdateOutcome = "indeterminate"
 )
 
 type upgradeTransactionJournal struct {
