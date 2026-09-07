@@ -190,3 +190,242 @@ func TestRestorePreMigrationSnapshotFailureOutcomes(t *testing.T) {
 		}
 	})
 }
+
+func newRestoreSecurityFixture(t *testing.T) (string, string, PreMigrationSnapshotIdentity, []byte) {
+	t.Helper()
+	databasePath := filepath.Join(privateTempDir(t), "forge.db")
+	store, err := Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	artifactPath := filepath.Join(privateTempDir(t), "forge.db.snapshot")
+	expected, err := CreatePreMigrationSnapshot(databasePath, artifactPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(databasePath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var version [4]byte
+	binary.BigEndian.PutUint32(version[:], uint32((expected.SchemaVersion+1)%(SchemaVersion()+1)))
+	if _, err = file.WriteAt(version[:], 60); err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return databasePath, artifactPath, expected, original
+}
+
+func assertRestoreOriginal(t *testing.T, path string, original []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != string(original) {
+		t.Fatalf("original destination not preserved: %v", err)
+	}
+}
+
+func TestRestoreExchangeEffectThenErrorClassifiesBeforeCleanup(t *testing.T) {
+	databasePath, artifactPath, expected, original := newRestoreSecurityFixture(t)
+	ops := defaultPreMigrationRestoreOps()
+	realExchange := ops.exchange
+	firstExchange := true
+	ops.exchange = func(directory *os.File, firstName, secondName string) error {
+		if firstExchange {
+			firstExchange = false
+			if err := realExchange(directory, firstName, secondName); err != nil {
+				return err
+			}
+			return errors.New("exchange took effect but reported failure")
+		}
+		return realExchange(directory, firstName, secondName)
+	}
+
+	result, err := restorePreMigrationSnapshot(databasePath, artifactPath, expected, ops)
+	if err == nil || result.State != NotAppliedDurable || result.RecoveryResidue {
+		t.Fatalf("result = (%+v, %v), want durably restored clean NotAppliedDurable", result, err)
+	}
+	assertRestoreOriginal(t, databasePath, original)
+}
+
+func TestRestoreRevalidatesPinnedNamesAndContentBeforeCommit(t *testing.T) {
+	t.Run("database pathname swapped", func(t *testing.T) {
+		databasePath, artifactPath, expected, _ := newRestoreSecurityFixture(t)
+		ops := defaultPreMigrationRestoreOps()
+		realValidate := ops.validateLive
+		ops.validateLive = func(path string, identity PreMigrationSnapshotIdentity) error {
+			if err := realValidate(path, identity); err != nil {
+				return err
+			}
+			if err := os.Rename(databasePath, databasePath+".displaced"); err != nil {
+				t.Fatal(err)
+			}
+			contents, err := os.ReadFile(artifactPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = os.WriteFile(databasePath, contents, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return nil
+		}
+		result, err := restorePreMigrationSnapshot(databasePath, artifactPath, expected, ops)
+		if err == nil || result.State == AppliedDurable {
+			t.Fatalf("result = (%+v, %v), swapped database pathname must not be AppliedDurable", result, err)
+		}
+	})
+
+	t.Run("lock pathname replaced", func(t *testing.T) {
+		databasePath, artifactPath, expected, _ := newRestoreSecurityFixture(t)
+		ops := defaultPreMigrationRestoreOps()
+		realValidate := ops.validateLive
+		ops.validateLive = func(path string, identity PreMigrationSnapshotIdentity) error {
+			if err := realValidate(path, identity); err != nil {
+				return err
+			}
+			lockPath := databasePath + ".lock"
+			if err := os.Rename(lockPath, lockPath+".displaced"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return nil
+		}
+		result, err := restorePreMigrationSnapshot(databasePath, artifactPath, expected, ops)
+		if err == nil || result.State == AppliedDurable {
+			t.Fatalf("result = (%+v, %v), replaced lock pathname must not be AppliedDurable", result, err)
+		}
+	})
+
+	t.Run("database pathname swapped during commit fsync", func(t *testing.T) {
+		databasePath, artifactPath, expected, _ := newRestoreSecurityFixture(t)
+		ops := defaultPreMigrationRestoreOps()
+		realSync := ops.sync
+		swapped := false
+		ops.sync = func(file *os.File) error {
+			if file.Name() == filepath.Dir(databasePath) && !swapped {
+				swapped = true
+				if err := os.Rename(databasePath, databasePath+".displaced"); err != nil {
+					t.Fatal(err)
+				}
+				contents, err := os.ReadFile(artifactPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = os.WriteFile(databasePath, contents, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return realSync(file)
+		}
+		result, err := restorePreMigrationSnapshot(databasePath, artifactPath, expected, ops)
+		if err == nil || result.State == AppliedDurable {
+			t.Fatalf("result = (%+v, %v), pathname swap around commit fsync must not be AppliedDurable", result, err)
+		}
+	})
+
+	t.Run("artifact pathname replaced with identical bytes", func(t *testing.T) {
+		databasePath, artifactPath, expected, _ := newRestoreSecurityFixture(t)
+		ops := defaultPreMigrationRestoreOps()
+		realValidate := ops.validateLive
+		ops.validateLive = func(path string, identity PreMigrationSnapshotIdentity) error {
+			if err := realValidate(path, identity); err != nil {
+				return err
+			}
+			contents, err := os.ReadFile(artifactPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = os.Rename(artifactPath, artifactPath+".displaced"); err != nil {
+				t.Fatal(err)
+			}
+			if err = os.WriteFile(artifactPath, contents, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return nil
+		}
+		result, err := restorePreMigrationSnapshot(databasePath, artifactPath, expected, ops)
+		if err == nil || result.State == AppliedDurable {
+			t.Fatalf("result = (%+v, %v), replaced artifact pathname must not be AppliedDurable", result, err)
+		}
+	})
+
+	t.Run("artifact mutated after live validation", func(t *testing.T) {
+		databasePath, artifactPath, expected, _ := newRestoreSecurityFixture(t)
+		ops := defaultPreMigrationRestoreOps()
+		realValidate := ops.validateLive
+		ops.validateLive = func(path string, identity PreMigrationSnapshotIdentity) error {
+			if err := realValidate(path, identity); err != nil {
+				return err
+			}
+			artifact, err := os.OpenFile(artifactPath, os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, writeErr := artifact.WriteAt([]byte{0xff}, expected.Size-1)
+			closeErr := artifact.Close()
+			if writeErr != nil {
+				t.Fatal(writeErr)
+			}
+			if closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			return nil
+		}
+		result, err := restorePreMigrationSnapshot(databasePath, artifactPath, expected, ops)
+		if err == nil || result.State == AppliedDurable {
+			t.Fatalf("result = (%+v, %v), mutated artifact must not be AppliedDurable", result, err)
+		}
+	})
+}
+
+func TestRestoreRecoveryResidueUsesObservedNameState(t *testing.T) {
+	databasePath, artifactPath, expected, _ := newRestoreSecurityFixture(t)
+	ops := defaultPreMigrationRestoreOps()
+	realUnlink := ops.unlink
+	ops.unlink = func(directory *os.File, name string) error {
+		if err := realUnlink(directory, name); err != nil {
+			return err
+		}
+		return errors.New("unlink took effect but reported failure")
+	}
+	result, err := restorePreMigrationSnapshot(databasePath, artifactPath, expected, ops)
+	if err == nil || result.State != AppliedDurable || result.RecoveryResidue {
+		t.Fatalf("result = (%+v, %v), want AppliedDurable without absent recovery residue", result, err)
+	}
+}
+
+func TestRestoreDoesNotReportAppliedIfLiveNameChangesDuringCleanup(t *testing.T) {
+	databasePath, artifactPath, expected, _ := newRestoreSecurityFixture(t)
+	ops := defaultPreMigrationRestoreOps()
+	realUnlink := ops.unlink
+	ops.unlink = func(directory *os.File, name string) error {
+		if err := os.Rename(databasePath, databasePath+".displaced-during-cleanup"); err != nil {
+			t.Fatal(err)
+		}
+		contents, err := os.ReadFile(artifactPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = os.WriteFile(databasePath, contents, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return realUnlink(directory, name)
+	}
+	result, err := restorePreMigrationSnapshot(databasePath, artifactPath, expected, ops)
+	if err == nil || result.State == AppliedDurable {
+		t.Fatalf("result = (%+v, %v), cleanup-time pathname swap must not be AppliedDurable", result, err)
+	}
+}
