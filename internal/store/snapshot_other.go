@@ -9,3 +9,7 @@ func CreatePreMigrationSnapshot(string, string) (PreMigrationSnapshotIdentity, e
 func ValidatePreMigrationSnapshot(string, PreMigrationSnapshotIdentity) error {
 	return ErrUnsupportedDatabase
 }
+
+func RestorePreMigrationSnapshot(string, string, PreMigrationSnapshotIdentity) (PreMigrationRestoreResult, error) {
+	return PreMigrationRestoreResult{State: NotAppliedDurable}, ErrUnsupportedDatabase
+}
