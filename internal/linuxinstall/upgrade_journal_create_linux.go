@@ -3,8 +3,7 @@
 package linuxinstall
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -21,7 +20,29 @@ const (
 )
 
 type upgradeJournalCreateOps struct {
-	syncParent func(*os.File) error
+	syncParent  func(*os.File) error
+	inspect     func(*os.File, string, *unix.Stat_t) error
+	openUnnamed func(*os.File) (*os.File, error)
+	publish     func(*os.File, *os.File, string) error
+}
+
+func defaultUpgradeJournalCreateOps() upgradeJournalCreateOps {
+	return upgradeJournalCreateOps{
+		syncParent: func(f *os.File) error { return f.Sync() },
+		inspect: func(parent *os.File, name string, stat *unix.Stat_t) error {
+			return unix.Fstatat(int(parent.Fd()), name, stat, unix.AT_SYMLINK_NOFOLLOW)
+		},
+		openUnnamed: func(parent *os.File) (*os.File, error) {
+			fd, err := unix.Openat(int(parent.Fd()), ".", unix.O_RDWR|unix.O_CLOEXEC|unix.O_TMPFILE, 0o600)
+			if err != nil {
+				return nil, err
+			}
+			return os.NewFile(uintptr(fd), "unnamed upgrade journal"), nil
+		},
+		publish: func(parent, source *os.File, name string) error {
+			return unix.Linkat(int(source.Fd()), "", int(parent.Fd()), name, unix.AT_EMPTY_PATH)
+		},
+	}
 }
 
 func upgradeJournalPath(o Options) string {
@@ -29,7 +50,7 @@ func upgradeJournalPath(o Options) string {
 }
 
 func createUpgradeTransactionJournal(o Options, journal upgradeTransactionJournal) (upgradeJournalCreateOutcome, error) {
-	return createUpgradeTransactionJournalWithOps(o, journal, upgradeJournalCreateOps{syncParent: func(f *os.File) error { return f.Sync() }})
+	return createUpgradeTransactionJournalWithOps(o, journal, defaultUpgradeJournalCreateOps())
 }
 
 func createUpgradeTransactionJournalWithOps(o Options, journal upgradeTransactionJournal, ops upgradeJournalCreateOps) (upgradeJournalCreateOutcome, error) {
@@ -41,49 +62,246 @@ func createUpgradeTransactionJournalWithOps(o Options, journal upgradeTransactio
 	if err != nil {
 		return outcome, err
 	}
+	defaults := defaultUpgradeJournalCreateOps()
+	if ops.inspect == nil {
+		ops.inspect = defaults.inspect
+	}
+	if ops.openUnnamed == nil {
+		ops.openUnnamed = defaults.openUnnamed
+	}
+	if ops.publish == nil {
+		ops.publish = defaults.publish
+	}
+
 	parent, err := openUpgradeJournalParent(o)
 	if err != nil {
 		return outcome, err
 	}
 	defer parent.Close()
-
-	var target unix.Stat_t
-	if err := unix.Fstatat(int(parent.Fd()), upgradeJournalName, &target, unix.AT_SYMLINK_NOFOLLOW); err == nil {
-		return outcome, errors.New("upgrade journal already exists")
-	} else if !errors.Is(err, unix.ENOENT) {
+	var pinnedParent unix.Stat_t
+	if err := unix.Fstat(int(parent.Fd()), &pinnedParent); err != nil {
+		return outcome, fmt.Errorf("inspect upgrade journal directory: %w", err)
+	}
+	state, _, err := inspectUpgradeJournalName(parent, upgradeJournalName, unix.Stat_t{}, ops)
+	if err != nil {
 		return outcome, fmt.Errorf("inspect upgrade journal: %w", err)
 	}
+	if state != upgradeJournalNameAbsent {
+		return outcome, errors.New("upgrade journal already exists")
+	}
 
-	tempName, temp, err := createUpgradeJournalTemp(parent)
+	unnamed, err := ops.openUnnamed(parent)
 	if err != nil {
+		return outcome, fmt.Errorf("create unnamed upgrade journal: %w", err)
+	}
+	if unnamed == nil {
+		return outcome, errors.New("create unnamed upgrade journal: missing file")
+	}
+	defer unnamed.Close()
+	if _, err := unnamed.Write(body); err != nil {
+		return outcome, fmt.Errorf("write unnamed upgrade journal: %w", err)
+	}
+	if err := unnamed.Chmod(0o400); err != nil {
+		return outcome, fmt.Errorf("set unnamed upgrade journal mode: %w", err)
+	}
+	if err := unnamed.Sync(); err != nil {
+		return outcome, fmt.Errorf("sync unnamed upgrade journal: %w", err)
+	}
+	var expected unix.Stat_t
+	if err := unix.Fstat(int(unnamed.Fd()), &expected); err != nil {
+		return outcome, fmt.Errorf("inspect unnamed upgrade journal: %w", err)
+	}
+	if err := validatePinnedUpgradeJournal(unnamed, expected, body, 0); err != nil {
+		return outcome, fmt.Errorf("validate unnamed upgrade journal: %w", err)
+	}
+	if err := validateUpgradeJournalParentIdentityAtPath(o, parent, pinnedParent); err != nil {
+		return outcome, fmt.Errorf("upgrade journal directory changed before publish: %w", err)
+	}
+	state, _, err = inspectUpgradeJournalName(parent, upgradeJournalName, expected, ops)
+	if err != nil || state != upgradeJournalNameAbsent {
+		if err == nil {
+			err = errors.New("upgrade journal appeared before publish")
+		}
 		return outcome, err
 	}
-	published := false
-	defer func() {
-		if !published {
-			_ = unix.Unlinkat(int(parent.Fd()), tempName, 0)
-		}
-	}()
-	if _, err = temp.Write(body); err == nil {
-		err = temp.Sync()
+	if err := validatePinnedUpgradeJournal(unnamed, expected, body, 0); err != nil {
+		return outcome, fmt.Errorf("upgrade journal changed before publish: %w", err)
 	}
-	if closeErr := temp.Close(); err == nil {
-		err = closeErr
+
+	if publishErr := ops.publish(parent, unnamed, upgradeJournalName); publishErr != nil {
+		return classifyUpgradeJournalPublishError(o, parent, unnamed, pinnedParent, expected, body, ops, publishErr)
 	}
-	if err != nil {
-		return outcome, fmt.Errorf("persist upgrade journal temporary file: %w", err)
+	if err := validatePublishedUpgradeJournal(parent, unnamed, expected, body, ops); err != nil {
+		return upgradeJournalIndeterminate, newUpgradeJournalCreateError(fmt.Errorf("validate published upgrade journal: %w", err), true)
 	}
-	if err := unix.Renameat2(int(parent.Fd()), tempName, int(parent.Fd()), upgradeJournalName, unix.RENAME_NOREPLACE); err != nil {
-		return outcome, fmt.Errorf("publish upgrade journal: %w", err)
+	if err := validateUpgradeJournalParentPath(o, parent, unnamed, pinnedParent, expected, body, ops); err != nil {
+		return upgradeJournalIndeterminate, newUpgradeJournalCreateError(fmt.Errorf("upgrade journal directory changed before sync: %w", err), true)
 	}
-	published = true
 	if ops.syncParent == nil {
-		return upgradeJournalIndeterminate, errors.New("sync upgrade journal directory: missing operation")
+		return upgradeJournalIndeterminate, newUpgradeJournalCreateError(errors.New("sync upgrade journal directory: missing operation"), true)
 	}
 	if err := ops.syncParent(parent); err != nil {
-		return upgradeJournalIndeterminate, fmt.Errorf("sync upgrade journal directory: %w", err)
+		return upgradeJournalIndeterminate, newUpgradeJournalCreateError(fmt.Errorf("sync upgrade journal directory: %w", err), true)
+	}
+	if err := validateUpgradeJournalParentPath(o, parent, unnamed, pinnedParent, expected, body, ops); err != nil {
+		return upgradeJournalIndeterminate, newUpgradeJournalCreateError(fmt.Errorf("upgrade journal directory changed after sync: %w", err), true)
+	}
+	if err := validatePublishedUpgradeJournal(parent, unnamed, expected, body, ops); err != nil {
+		return upgradeJournalIndeterminate, newUpgradeJournalCreateError(fmt.Errorf("upgrade journal changed before durable result: %w", err), true)
+	}
+	if err := validateUpgradeJournalParentPath(o, parent, unnamed, pinnedParent, expected, body, ops); err != nil {
+		return upgradeJournalIndeterminate, newUpgradeJournalCreateError(fmt.Errorf("upgrade journal changed before durable result: %w", err), true)
 	}
 	return upgradeJournalAppliedDurable, nil
+}
+
+type upgradeJournalNameState uint8
+
+const (
+	upgradeJournalNameUncertain upgradeJournalNameState = iota
+	upgradeJournalNameAbsent
+	upgradeJournalNameExpected
+	upgradeJournalNameOther
+)
+
+func inspectUpgradeJournalName(parent *os.File, name string, expected unix.Stat_t, ops upgradeJournalCreateOps) (upgradeJournalNameState, unix.Stat_t, error) {
+	var stat unix.Stat_t
+	if ops.inspect == nil {
+		return upgradeJournalNameUncertain, stat, errors.New("missing inspection operation")
+	}
+	if err := ops.inspect(parent, name, &stat); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return upgradeJournalNameAbsent, stat, nil
+		}
+		return upgradeJournalNameUncertain, stat, err
+	}
+	if expected.Ino != 0 && sameUpgradeJournalInode(expected, stat) {
+		return upgradeJournalNameExpected, stat, nil
+	}
+	return upgradeJournalNameOther, stat, nil
+}
+
+func validUpgradeJournalPinnedMetadata(stat unix.Stat_t, nlink uint64, size int64) bool {
+	return stat.Mode&unix.S_IFMT == unix.S_IFREG && stat.Mode&0o7777 == 0o400 &&
+		stat.Uid == uint32(os.Geteuid()) && stat.Nlink == nlink && stat.Size == size
+}
+
+func validatePinnedUpgradeJournal(file *os.File, expected unix.Stat_t, body []byte, nlink uint64) error {
+	var before unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &before); err != nil {
+		return err
+	}
+	if !sameUpgradeJournalInode(expected, before) || !validUpgradeJournalPinnedMetadata(before, nlink, int64(len(body))) {
+		return errors.New("unsafe pinned upgrade journal metadata")
+	}
+	got := make([]byte, len(body)+1)
+	n, readErr := file.ReadAt(got, 0)
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return readErr
+	}
+	if n != len(body) || !bytes.Equal(got[:n], body) {
+		return errors.New("pinned upgrade journal content changed")
+	}
+	if _, err := decodeUpgradeTransactionJournal(got[:n]); err != nil {
+		return err
+	}
+	var after unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &after); err != nil || !sameUpgradeJournalFile(before, after) ||
+		!validUpgradeJournalPinnedMetadata(after, nlink, int64(len(body))) {
+		return errors.New("pinned upgrade journal changed while inspecting")
+	}
+	return nil
+}
+
+func validatePublishedUpgradeJournal(parent, file *os.File, expected unix.Stat_t, body []byte, ops upgradeJournalCreateOps) error {
+	state, visible, err := inspectUpgradeJournalName(parent, upgradeJournalName, expected, ops)
+	if err != nil || state != upgradeJournalNameExpected || !validUpgradeJournalPinnedMetadata(visible, 1, int64(len(body))) {
+		return errors.New("upgrade journal publication placement is uncertain")
+	}
+	if err := validatePinnedUpgradeJournal(file, expected, body, 1); err != nil {
+		return err
+	}
+	var pinned unix.Stat_t
+	if unix.Fstat(int(file.Fd()), &pinned) != nil || !sameUpgradeJournalFile(visible, pinned) {
+		return errors.New("visible upgrade journal differs from pinned inode")
+	}
+	return nil
+}
+
+func validateUpgradeJournalParentIdentityAtPath(o Options, pinned *os.File, expected unix.Stat_t) error {
+	reopened, err := openUpgradeJournalParent(o)
+	if err != nil {
+		return err
+	}
+	defer reopened.Close()
+	return validateUpgradeJournalParentIdentity(reopened, pinned, expected)
+}
+
+func validateUpgradeJournalParentPath(o Options, parent, file *os.File, expectedParent, expectedFile unix.Stat_t, body []byte, ops upgradeJournalCreateOps) error {
+	reopened, err := openUpgradeJournalParent(o)
+	if err != nil {
+		return err
+	}
+	defer reopened.Close()
+	if err := validateUpgradeJournalParentIdentity(reopened, parent, expectedParent); err != nil {
+		return err
+	}
+	fd, err := unix.Openat(int(reopened.Fd()), upgradeJournalName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return errors.New("rooted upgrade journal no longer names published file")
+	}
+	visible := os.NewFile(uintptr(fd), upgradeJournalName)
+	defer visible.Close()
+	if err := validatePinnedUpgradeJournal(visible, expectedFile, body, 1); err != nil {
+		return errors.New("rooted upgrade journal no longer names valid published file")
+	}
+	var reopenedStat, pinnedStat unix.Stat_t
+	if unix.Fstat(int(visible.Fd()), &reopenedStat) != nil || unix.Fstat(int(file.Fd()), &pinnedStat) != nil ||
+		!sameUpgradeJournalFile(reopenedStat, pinnedStat) {
+		return errors.New("rooted upgrade journal differs from pinned inode")
+	}
+	state, _, err := inspectUpgradeJournalName(reopened, upgradeJournalName, expectedFile, ops)
+	if err != nil || state != upgradeJournalNameExpected {
+		return errors.New("rooted upgrade journal path changed while inspecting")
+	}
+	return nil
+}
+
+func validateUpgradeJournalParentIdentity(reopened, pinned *os.File, expected unix.Stat_t) error {
+	var current, pinnedNow unix.Stat_t
+	if unix.Fstat(int(reopened.Fd()), &current) != nil || unix.Fstat(int(pinned.Fd()), &pinnedNow) != nil ||
+		!sameUpgradeJournalInode(expected, current) || !sameUpgradeJournalInode(expected, pinnedNow) {
+		return errors.New("rooted upgrade journal parent no longer names pinned directory")
+	}
+	return nil
+}
+
+func classifyUpgradeJournalPublishError(o Options, parent, file *os.File, expectedParent, expectedFile unix.Stat_t, body []byte, ops upgradeJournalCreateOps, publishErr error) (upgradeJournalCreateOutcome, error) {
+	state, _, inspectErr := inspectUpgradeJournalName(parent, upgradeJournalName, expectedFile, ops)
+	var pinned unix.Stat_t
+	pinnedErr := unix.Fstat(int(file.Fd()), &pinned)
+	if inspectErr == nil && state == upgradeJournalNameExpected {
+		validationErr := validatePublishedUpgradeJournal(parent, file, expectedFile, body, ops)
+		pathErr := validateUpgradeJournalParentPath(o, parent, file, expectedParent, expectedFile, body, ops)
+		if validationErr != nil || pathErr != nil {
+			return upgradeJournalIndeterminate, newUpgradeJournalCreateError(fmt.Errorf("publish upgrade journal reported an error after effect: %v; validation=%v; path=%v", publishErr, validationErr, pathErr), true)
+		}
+		return upgradeJournalIndeterminate, newUpgradeJournalCreateError(fmt.Errorf("publish upgrade journal reported an error after effect: %w", publishErr), true)
+	}
+	residue := state != upgradeJournalNameAbsent || pinnedErr != nil || pinned.Nlink != 0 || inspectErr != nil
+	return upgradeJournalIndeterminate, newUpgradeJournalCreateError(fmt.Errorf("publish upgrade journal placement uncertain: %v (state=%d inspect=%v pinned=%v)", publishErr, state, inspectErr, pinnedErr), residue)
+}
+
+func validUpgradeJournalFile(stat unix.Stat_t) bool {
+	return stat.Mode&unix.S_IFMT == unix.S_IFREG && stat.Mode&0o7777 == 0o400 && stat.Uid == uint32(os.Geteuid()) && stat.Nlink == 1
+}
+
+func sameUpgradeJournalInode(a, b unix.Stat_t) bool {
+	return a.Dev == b.Dev && a.Ino == b.Ino
+}
+
+func sameUpgradeJournalFile(a, b unix.Stat_t) bool {
+	return sameUpgradeJournalInode(a, b) && a.Size == b.Size && a.Mtim == b.Mtim && a.Ctim == b.Ctim
 }
 
 func readUpgradeTransactionJournal(o Options) (upgradeTransactionJournal, error) {
@@ -153,40 +371,4 @@ func openUpgradeJournalParent(o Options) (*os.File, error) {
 		return nil, fmt.Errorf("open upgrade journal directory: %w", err)
 	}
 	return os.NewFile(uintptr(fd), parentPath), nil
-}
-
-func createUpgradeJournalTemp(parent *os.File) (string, *os.File, error) {
-	for range 8 {
-		var random [16]byte
-		if _, err := io.ReadFull(rand.Reader, random[:]); err != nil {
-			return "", nil, fmt.Errorf("name upgrade journal temporary file: %w", err)
-		}
-		name := "." + upgradeJournalName + ".tmp-" + hex.EncodeToString(random[:])
-		fd, err := unix.Openat(int(parent.Fd()), name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o400)
-		if errors.Is(err, unix.EEXIST) {
-			continue
-		}
-		if err != nil {
-			return "", nil, fmt.Errorf("create upgrade journal temporary file: %w", err)
-		}
-		if err := unix.Fchmod(fd, 0o400); err != nil {
-			unix.Close(fd)
-			_ = unix.Unlinkat(int(parent.Fd()), name, 0)
-			return "", nil, fmt.Errorf("secure upgrade journal temporary file: %w", err)
-		}
-		return name, os.NewFile(uintptr(fd), name), nil
-	}
-	return "", nil, errors.New("create upgrade journal temporary file: name collisions")
-}
-
-func validUpgradeJournalFile(stat unix.Stat_t) bool {
-	return stat.Mode&unix.S_IFMT == unix.S_IFREG && stat.Mode&0o7777 == 0o400 && stat.Uid == uint32(os.Geteuid()) && stat.Nlink == 1
-}
-
-func sameUpgradeJournalInode(a, b unix.Stat_t) bool {
-	return a.Dev == b.Dev && a.Ino == b.Ino
-}
-
-func sameUpgradeJournalFile(a, b unix.Stat_t) bool {
-	return sameUpgradeJournalInode(a, b) && a.Size == b.Size && a.Mtim == b.Mtim && a.Ctim == b.Ctim
 }
