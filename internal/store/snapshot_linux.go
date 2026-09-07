@@ -213,7 +213,20 @@ func inspectPreMigrationSnapshot(path string) (PreMigrationSnapshotIdentity, err
 		return PreMigrationSnapshotIdentity{}, err
 	}
 	defer file.Close()
+	identity, err := inspectOpenedPreMigrationSnapshot(file)
+	if err != nil {
+		return PreMigrationSnapshotIdentity{}, err
+	}
+	if err := revalidateOpenedSnapshotPath(path, file); err != nil || rejectSnapshotSidecars(path) != nil {
+		return PreMigrationSnapshotIdentity{}, ErrInsecureDatabase
+	}
+	return identity, nil
+}
 
+func inspectOpenedPreMigrationSnapshot(file *os.File) (PreMigrationSnapshotIdentity, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return PreMigrationSnapshotIdentity{}, errInvalidPreMigrationSnapshot
+	}
 	hash := sha256.New()
 	size, err := io.Copy(hash, file)
 	if err != nil {
@@ -233,12 +246,20 @@ func inspectPreMigrationSnapshot(path string) (PreMigrationSnapshotIdentity, err
 	if err = db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version < 0 || version > SchemaVersion() {
 		return PreMigrationSnapshotIdentity{}, errInvalidPreMigrationSnapshot
 	}
-	current, err := os.Lstat(path)
-	opened, statErr := file.Stat()
-	if err != nil || statErr != nil || !os.SameFile(opened, current) || opened.Size() != size || rejectSnapshotSidecars(path) != nil {
-		return PreMigrationSnapshotIdentity{}, ErrInsecureDatabase
+	opened, err := file.Stat()
+	if err != nil || validateSnapshotFileInfo(opened) != nil || opened.Size() != size {
+		return PreMigrationSnapshotIdentity{}, errInvalidPreMigrationSnapshot
 	}
 	var digest [sha256.Size]byte
 	copy(digest[:], hash.Sum(nil))
 	return PreMigrationSnapshotIdentity{SchemaVersion: version, Size: size, SHA256: digest}, nil
+}
+
+func revalidateOpenedSnapshotPath(path string, file *os.File) error {
+	opened, statErr := file.Stat()
+	current, lstatErr := os.Lstat(path)
+	if statErr != nil || lstatErr != nil || validateSnapshotFileInfo(opened) != nil || validateSnapshotFileInfo(current) != nil || !os.SameFile(opened, current) {
+		return ErrInsecureDatabase
+	}
+	return nil
 }

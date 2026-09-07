@@ -6,3 +6,16 @@ type PreMigrationSnapshotIdentity struct {
 	Size          int64
 	SHA256        [32]byte
 }
+
+type PreMigrationRestoreState uint8
+
+const (
+	NotAppliedDurable PreMigrationRestoreState = iota
+	AppliedDurable
+	Indeterminate
+)
+
+type PreMigrationRestoreResult struct {
+	State           PreMigrationRestoreState
+	RecoveryResidue bool
+}
