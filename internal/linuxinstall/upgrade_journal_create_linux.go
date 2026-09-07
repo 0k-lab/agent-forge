@@ -183,7 +183,7 @@ func inspectUpgradeJournalName(parent *os.File, name string, expected unix.Stat_
 
 func validUpgradeJournalPinnedMetadata(stat unix.Stat_t, nlink uint64, size int64) bool {
 	return stat.Mode&unix.S_IFMT == unix.S_IFREG && stat.Mode&0o7777 == 0o400 &&
-		stat.Uid == uint32(os.Geteuid()) && stat.Nlink == nlink && stat.Size == size
+		stat.Uid == uint32(os.Geteuid()) && uint64(stat.Nlink) == nlink && stat.Size == size
 }
 
 func validatePinnedUpgradeJournal(file *os.File, expected unix.Stat_t, body []byte, nlink uint64) error {
