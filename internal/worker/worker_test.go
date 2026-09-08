@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -362,5 +363,82 @@ func TestWorkerEmitsTypedFailureMappingsAndContinues(t *testing.T) {
 	}
 	if next != 3 {
 		t.Fatalf("executed %d leases", next)
+	}
+}
+
+func TestLiveRejectLeaseBeforeExecutor(t *testing.T) {
+	for _, lease := range []protocol.Message{
+		{Type: protocol.MessageLease, ActivityVersion: "unknown"},
+		{Type: protocol.MessageLease, ActivityVersion: protocol.LiveActivityVersion, Activity: &protocol.Activity{Sequence: 1, Stage: "analyzing"}},
+	} {
+		t.Run(lease.ActivityVersion, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				c, err := websocket.Accept(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer c.CloseNow()
+				wsjson.Write(r.Context(), c, lease)
+				var m protocol.Message
+				wsjson.Read(r.Context(), c, &m)
+			}))
+			defer ts.Close()
+			invoked := false
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			err := runWithOutcomeExecutor(ctx, "ws"+strings.TrimPrefix(ts.URL, "http"), "worker", "token", WorkerOptions{HeartbeatInterval: time.Millisecond}, func(context.Context, protocol.Message) leaseOutcome { invoked = true; return leaseOutcome{} })
+			if err == nil || err.Error() != "unexpected Gate message" || invoked {
+				t.Fatalf("err=%v invoked=%v", err, invoked)
+			}
+		})
+	}
+}
+
+func TestLiveTwoCheckOrdering(t *testing.T) {
+	var stages []string
+	ctx := withActivity(context.Background(), func(a protocol.Activity) { stages = append(stages, a.Stage) })
+	legacyProgress(ctx, "started", "ignored")
+	legacyProgress(ctx, "working", "ignored")
+	legacyProgress(ctx, "finalizing", "ignored")
+	count := 0
+	_, err := runDeclaredChecks(ctx, protocol.CodingTask{Tests: [][]string{{"one"}, {"two"}}}, codingSettings{}, "", nil, func(context.Context, string, []string, []string) scopedCheckResult {
+		count++
+		if !reflect.DeepEqual(stages, []string{"analyzing", "editing", "testing"}) {
+			t.Fatalf("stages during check %d: %v", count, stages)
+		}
+		return scopedCheckResult{}
+	})
+	if err != nil || count != 2 || !reflect.DeepEqual(stages, []string{"analyzing", "editing", "testing", "preparing_result"}) {
+		t.Fatalf("%v %v %d", stages, err, count)
+	}
+	emitActivity(ctx, "testing")
+	legacyProgress(ctx, "started", "")
+	if len(stages) != 4 {
+		t.Fatal(stages)
+	}
+}
+
+func TestLiveEmptyAndFailedChecks(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		var stages []string
+		ctx := withActivity(context.Background(), func(a protocol.Activity) { stages = append(stages, a.Stage) })
+		task := protocol.CodingTask{}
+		if fail {
+			task.Tests = [][]string{{"one"}, {"two"}}
+		}
+		count := 0
+		_, err := runDeclaredChecks(ctx, task, codingSettings{}, "", nil, func(context.Context, string, []string, []string) scopedCheckResult {
+			count++
+			return scopedCheckResult{err: errors.New("failed")}
+		})
+		if fail {
+			if count != 1 || err != errScopedTest || !reflect.DeepEqual(stages, []string{"testing", "preparing_result"}) {
+				t.Fatal(count, err, stages)
+			}
+		} else if count != 0 || err != nil || !reflect.DeepEqual(stages, []string{"preparing_result"}) {
+			t.Fatal(count, err, stages)
+		}
+		closeActivity(ctx)
+		emitActivity(ctx, "testing")
 	}
 }

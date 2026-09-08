@@ -17,7 +17,7 @@ output=pathlib.Path(sys.argv[sys.argv.index("--output-last-message")+1])
 json.loads(pathlib.Path(sys.argv[sys.argv.index("--output-schema")+1]).read_text())
 sys.stdin.read()
 (workspace/"answer.txt").write_text("conformance\n")
-output.write_text(json.dumps({"commit_subject":"test: prove conformance"},separators=(",",":")))
+output.write_text(json.dumps({"commit_subject":"test: prove conformance","summary":"Add conformance answer.","changes":["Add answer.txt for the conformance fixture."]},separators=(",",":")))
 PY
 chmod 700 "$tmp/fake-codex"
 

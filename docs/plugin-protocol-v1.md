@@ -76,3 +76,36 @@ CODEX_BIN=/path/to/fake-codex /tmp/forge-plugin-conformance -operation workspace
 ```
 
 `scripts/plugin-conformance-e2e.sh` builds and runs that suite against the shipped reference plugin, the dependency-free Python example, and the Codex workspace plugin with a local fake Codex binary.
+
+### Live operator activity
+
+The `progress` capability under plugin protocol v1 retains exactly `started`,
+`working`, and `finalizing`. Old strict peers remain supported. `ServeWithProgress`
+serializes concurrent callbacks and closes progress before the terminal frame.
+The Codex plugin emits fixed lifecycle text only; executor stdout/stderr is never
+forwarded. Receivers validate negotiated capability, UTF-8, sequence, frame count
+and byte limits before invoking the progress callback.
+
+A Worker separately offers `activity_version=live_activity/v1` on its Gate
+connection. Only a Gate that recognizes that offer selects `activity_version` in
+its lease. An absent selection disables activity. Unknown lease versions and
+leases carrying an `activity` payload are rejected before execution. Activity
+payloads belong only to `activity` messages, with exact job, attempt and Worker
+identity and the selected version.
+
+The Worker maps `started` to `analyzing` and `working` to `editing`, discarding
+plugin text. Legacy `finalizing` does not advance the operator stage before
+Worker checks. The Worker emits `testing` once before a nonempty declared-check
+batch and `preparing_result` once after the batch ends, including its existing
+stop-on-failure path. Empty check lists emit no testing stage. Stages advance
+strictly, with at most four events per attempt; no command names, output, prompts,
+JSON payloads or plugin timestamps enter activity.
+
+Gate stamps receive time and projects the exact Run ID, Attempt ID/ordinal and
+Worker on each event. Storage is transient, bounded to 1,024 attempt entries and
+four closed-stage events per entry; terminal, disconnected and expired activity
+is removed. Current lease deadlines are consulted because heartbeats extend them.
+The open drawer refreshes every five seconds independently of backlog loading,
+uses text-only rendering, and keeps activity separate from Agent report, Forge
+verification and delivery evidence. There is no subagent telemetry. This activity
+is neither scoped-check evidence nor delivery acceptance evidence.

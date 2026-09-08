@@ -188,6 +188,7 @@ func (x *server) controlOverview(w http.ResponseWriter, r *http.Request) {
 }
 
 type controlAttempt struct {
+	Activity    []liveEvent           `json:"activity,omitempty"`
 	AgentReport *protocol.AgentReport `json:"agent_report,omitempty"`
 	safeAttempt
 	WorkerID string `json:"worker_id"`
@@ -237,7 +238,7 @@ func (x *server) controlDetail(w http.ResponseWriter, r *http.Request) {
 		if a.ID == job.AttemptID && a.CandidateSHA == job.CandidateSHA {
 			runReport = report
 		}
-		safe = append(safe, controlAttempt{AgentReport: report, safeAttempt: safeAttempt{ID: a.ID, Ordinal: a.Ordinal, Status: a.Status, FailureDisposition: a.FailureDisposition, FailureCode: safeFailureCode(a.FailureCode), CandidateSHA: a.CandidateSHA, LeasedAt: a.LeasedAt, DeadlineAt: a.DeadlineAt, CompletedAt: a.CompletedAt, Evidence: evidence}, WorkerID: a.WorkerID})
+		safe = append(safe, controlAttempt{Activity: x.projectActivity(a, x.options.Now().UTC()), AgentReport: report, safeAttempt: safeAttempt{ID: a.ID, Ordinal: a.Ordinal, Status: a.Status, FailureDisposition: a.FailureDisposition, FailureCode: safeFailureCode(a.FailureCode), CandidateSHA: a.CandidateSHA, LeasedAt: a.LeasedAt, DeadlineAt: a.DeadlineAt, CompletedAt: a.CompletedAt, Evidence: evidence}, WorkerID: a.WorkerID})
 	}
 	timeline, err := x.store.DebugJobTimeline(r.Context(), id, 100, nil)
 	if err != nil {

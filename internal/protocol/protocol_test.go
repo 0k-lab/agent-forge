@@ -309,3 +309,14 @@ func TestValidateBranchNameMatchesGitCheckRefFormat(t *testing.T) {
 		}
 	}
 }
+
+func TestLiveActivityClosedStagesAndBounds(t *testing.T) {
+	for _, a := range []Activity{{0, "analyzing"}, {1, "started"}, {1, "\xff"}, {1, "arbitrary text"}, {5, "preparing_result"}} {
+		if ValidActivity(a, 0, 0) {
+			t.Fatal(a)
+		}
+	}
+	if !ValidActivity(Activity{1, "analyzing"}, 0, 0) || ValidActivity(Activity{2, "analyzing"}, 1, 1) || ValidActivity(Activity{3, "testing"}, 2, 4) {
+		t.Fatal("stage ordering")
+	}
+}

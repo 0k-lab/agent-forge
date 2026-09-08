@@ -163,6 +163,7 @@ func runWithOutcomeExecutorSlot(ctx context.Context, gateURL, workerID, token st
 	if slot >= 0 {
 		query.Set("slot", strconv.Itoa(slot))
 	}
+	query.Set("activity_version", protocol.LiveActivityVersion)
 	endpoint.RawQuery = query.Encode()
 	c, _, err := websocket.Dial(ctx, endpoint.String(), &websocket.DialOptions{HTTPHeader: h})
 	if err != nil {
@@ -176,10 +177,19 @@ func runWithOutcomeExecutorSlot(ctx context.Context, gateURL, workerID, token st
 		if err := readGateMessage(ctx, c, &m); err != nil {
 			return err
 		}
-		if m.Type != protocol.MessageLease || slot >= 0 && m.Policy == nil {
+		if m.Activity != nil || (m.ActivityVersion != "" && m.ActivityVersion != protocol.LiveActivityVersion) || m.Type != protocol.MessageLease || slot >= 0 && m.Policy == nil {
 			return errors.New("unexpected Gate message")
 		}
 		taskCtx, cancelTask := context.WithCancel(ctx)
+		if m.ActivityVersion == protocol.LiveActivityVersion {
+			taskCtx = withActivity(taskCtx, func(a protocol.Activity) {
+				writeMu.Lock()
+				defer writeMu.Unlock()
+				if wsjson.Write(taskCtx, c, protocol.Message{Type: protocol.MessageActivity, JobID: m.JobID, AttemptID: m.AttemptID, WorkerID: workerID, ActivityVersion: protocol.LiveActivityVersion, Activity: &a}) != nil {
+					cancelTask()
+				}
+			})
+		}
 		stopHeartbeat := make(chan struct{})
 		heartbeatDone := make(chan struct{})
 		heartbeatErr := make(chan error, 1)
@@ -204,6 +214,7 @@ func runWithOutcomeExecutorSlot(ctx context.Context, gateURL, workerID, token st
 			}
 		}()
 		outcome := execute(taskCtx, m)
+		closeActivity(taskCtx)
 		failed := true
 		func() {
 			defer func() {
@@ -225,7 +236,7 @@ func runWithOutcomeExecutorSlot(ctx context.Context, gateURL, workerID, token st
 				if err := readGateMessage(taskCtx, c, &ack); err != nil {
 					return err
 				}
-				if ack.Type != protocol.MessageAck || ack.JobID != m.JobID || ack.AttemptID != m.AttemptID || ack.WorkerID != "" || ack.Input != "" || ack.Task != nil || ack.Policy != nil || ack.Result != "" || ack.CandidateSHA != "" || ack.Error != "" || ack.Disposition != "" || len(ack.Evidence) != 0 {
+				if ack.Activity != nil || ack.ActivityVersion != "" || ack.Type != protocol.MessageAck || ack.JobID != m.JobID || ack.AttemptID != m.AttemptID || ack.WorkerID != "" || ack.Input != "" || ack.Task != nil || ack.Policy != nil || ack.Result != "" || ack.CandidateSHA != "" || ack.Error != "" || ack.Disposition != "" || len(ack.Evidence) != 0 {
 					return errors.New("invalid Gate ACK")
 				}
 				return nil
@@ -306,6 +317,7 @@ func invokeLocalResult(parent context.Context, argv []string, request pluginRequ
 		protocolRequest = pluginprotocol.Request{Operation: operation, Workspace: request.Workspace, Instruction: request.Instruction, TimeoutMS: timeout.Milliseconds()}
 		capabilities = []pluginprotocol.Capability{pluginprotocol.Progress, pluginprotocol.Cancel, pluginprotocol.CommitSubject, pluginprotocol.AgentReport}
 	}
+	protocolRequest.OnProgress = func(stage, text string) { legacyProgress(parent, stage, text) }
 	result, err := pluginprotocol.Run(parent, argv, protocolRequest, pluginprotocol.Options{Timeout: timeout, OutputBytes: outputBytes, Capabilities: capabilities, Environment: environment})
 	if err != nil {
 		reason := protocol.EvidenceReasonPluginProtocolFailed
@@ -436,24 +448,10 @@ func executeCodingOutcomeSettings(ctx context.Context, settings codingSettings, 
 		record.CandidateSHA = candidate
 		return record
 	}
-	for index, argv := range task.Tests {
-		result := runCheck(ctx, worktree, testEnv, argv)
-		record := newEvidence(task.BaseSHA, protocol.EvidencePhaseScopedCheck, protocol.EvidenceReasonScopedCheckPassed)
-		record.CheckIndex = &index
-		record.DurationMS = boundedDurationMS(result.duration, settings.checkTimeout)
-		record.Output = result.output
-		record.OutputRedacted = result.redacted
-		record.OutputTruncated = result.truncated
-		record.ExitCode = result.exitCode
-		if result.err != nil {
-			record.Reason = protocol.EvidenceReasonScopedCheckFailed
-			if result.timedOut {
-				record.Reason = protocol.EvidenceReasonScopedCheckTimeout
-			}
-			evidence = append(evidence, record)
-			return codingOutcome{err: errScopedTest, evidence: evidence, cleanup: cleanup}
-		}
-		evidence = append(evidence, record)
+	checkEvidence, checkErr := runDeclaredChecks(ctx, task, settings, worktree, testEnv, runCheck)
+	evidence = append(evidence, checkEvidence...)
+	if checkErr != nil {
+		return codingOutcome{err: checkErr, evidence: evidence, cleanup: cleanup}
 	}
 	postCheckHead, err := gitOutputLimited(ctx, worktree, settings.gitTimeout, settings.gitOutput, "rev-parse", "HEAD")
 	postCheckTree, treeErr := gitOutputLimited(ctx, worktree, settings.gitTimeout, settings.gitOutput, "write-tree")
@@ -758,4 +756,76 @@ func (l *limitedWriter) Write(p []byte) (int, error) {
 type outputBudget struct {
 	mu sync.Mutex
 	n  int64
+}
+
+func runDeclaredChecks(ctx context.Context, task protocol.CodingTask, settings codingSettings, worktree string, testEnv []string, runCheck scopedCheckRunner) ([]protocol.AttemptEvidence, error) {
+	var evidence []protocol.AttemptEvidence
+	if len(task.Tests) > 0 {
+		emitActivity(ctx, "testing")
+	}
+	for index, argv := range task.Tests {
+		result := runCheck(ctx, worktree, testEnv, argv)
+		record := newEvidence(task.BaseSHA, protocol.EvidencePhaseScopedCheck, protocol.EvidenceReasonScopedCheckPassed)
+		record.CheckIndex = &index
+		record.DurationMS = boundedDurationMS(result.duration, settings.checkTimeout)
+		record.Output = result.output
+		record.OutputRedacted = result.redacted
+		record.OutputTruncated = result.truncated
+		record.ExitCode = result.exitCode
+		if result.err != nil {
+			record.Reason = protocol.EvidenceReasonScopedCheckFailed
+			if result.timedOut {
+				record.Reason = protocol.EvidenceReasonScopedCheckTimeout
+			}
+			evidence = append(evidence, record)
+			emitActivity(ctx, "preparing_result")
+			return evidence, errScopedTest
+		}
+		evidence = append(evidence, record)
+	}
+	emitActivity(ctx, "preparing_result")
+	return evidence, nil
+}
+
+type activityKey struct{}
+type activitySink struct {
+	mu             sync.Mutex
+	sequence, rank int
+	closed         bool
+	send           func(protocol.Activity)
+}
+
+func withActivity(ctx context.Context, send func(protocol.Activity)) context.Context {
+	return context.WithValue(ctx, activityKey{}, &activitySink{send: send})
+}
+func emitActivity(ctx context.Context, stage string) {
+	sink, _ := ctx.Value(activityKey{}).(*activitySink)
+	if sink == nil {
+		return
+	}
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	a := protocol.Activity{Sequence: sink.sequence + 1, Stage: stage}
+	if sink.closed || ctx.Err() != nil || !protocol.ValidActivity(a, sink.sequence, sink.rank) {
+		return
+	}
+	sink.sequence = a.Sequence
+	sink.rank = protocol.ActivityRank(stage)
+	sink.send(a)
+}
+func closeActivity(ctx context.Context) {
+	if sink, ok := ctx.Value(activityKey{}).(*activitySink); ok {
+		sink.mu.Lock()
+		sink.closed = true
+		sink.mu.Unlock()
+	}
+}
+func legacyProgress(ctx context.Context, stage, text string) {
+	switch stage {
+	case "started":
+		emitActivity(ctx, "analyzing")
+	case "working":
+		emitActivity(ctx, "editing")
+		// finalizing is the plugin result, not completion of Worker checks.
+	}
 }

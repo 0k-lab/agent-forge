@@ -128,18 +128,20 @@ type AttemptEvidence struct {
 }
 
 type Message struct {
-	Type         string            `json:"type"`
-	JobID        string            `json:"job_id,omitempty"`
-	AttemptID    string            `json:"attempt_id,omitempty"`
-	WorkerID     string            `json:"worker_id,omitempty"`
-	Input        string            `json:"input,omitempty"`
-	Task         *CodingTask       `json:"task,omitempty"`
-	Result       string            `json:"result,omitempty"`
-	CandidateSHA string            `json:"candidate_sha,omitempty"`
-	Error        string            `json:"error,omitempty"`
-	Disposition  string            `json:"disposition,omitempty"`
-	Evidence     []AttemptEvidence `json:"evidence,omitempty"`
-	Policy       *ResolvedPolicy   `json:"policy,omitempty"`
+	ActivityVersion string            `json:"activity_version,omitempty"`
+	Activity        *Activity         `json:"activity,omitempty"`
+	Type            string            `json:"type"`
+	JobID           string            `json:"job_id,omitempty"`
+	AttemptID       string            `json:"attempt_id,omitempty"`
+	WorkerID        string            `json:"worker_id,omitempty"`
+	Input           string            `json:"input,omitempty"`
+	Task            *CodingTask       `json:"task,omitempty"`
+	Result          string            `json:"result,omitempty"`
+	CandidateSHA    string            `json:"candidate_sha,omitempty"`
+	Error           string            `json:"error,omitempty"`
+	Disposition     string            `json:"disposition,omitempty"`
+	Evidence        []AttemptEvidence `json:"evidence,omitempty"`
+	Policy          *ResolvedPolicy   `json:"policy,omitempty"`
 }
 
 type CodingTask struct {
@@ -201,4 +203,31 @@ func ValidateCommitAuthor(name, email string) error {
 
 func domainAlphaNumeric(c byte) bool {
 	return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9'
+}
+
+const LiveActivityVersion = "live_activity/v1"
+const MessageActivity = "activity"
+
+// Activity carries only a closed stage, never executor text or timestamps.
+type Activity struct {
+	Sequence int    `json:"sequence"`
+	Stage    string `json:"stage"`
+}
+
+func ActivityRank(stage string) int {
+	switch stage {
+	case "analyzing":
+		return 1
+	case "editing":
+		return 2
+	case "testing":
+		return 3
+	case "preparing_result":
+		return 4
+	}
+	return 0
+}
+
+func ValidActivity(a Activity, sequence, rank int) bool {
+	return a.Sequence == sequence+1 && a.Sequence <= 4 && ActivityRank(a.Stage) > rank
 }

@@ -31,6 +31,7 @@ import (
 )
 
 type server struct {
+	activity        map[string]liveAttempt
 	store           *store.Store
 	tokens          map[string]string
 	ownerDigest     [sha256.Size]byte
@@ -1074,6 +1075,12 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 	ticker := time.NewTicker(x.options.LeasePollInterval)
 	defer ticker.Stop()
 	var active *store.Lease
+	defer func() {
+		if active != nil {
+			x.forgetActivity(active.AttemptID)
+		}
+	}()
+	activityNegotiated := r.URL.Query().Get("activity_version") == protocol.LiveActivityVersion
 	var completed *store.Lease
 	reject := func() {
 		_ = wsjson.Write(ctx, c, protocol.Message{Type: protocol.MessageError, Error: "request failed"})
@@ -1088,6 +1095,31 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		case m := <-incoming:
+			if m.Type == protocol.MessageActivity {
+				if !activityNegotiated || active == nil || m.JobID != active.JobID || m.AttemptID != active.AttemptID || m.WorkerID != baseWorkerID || m.ActivityVersion != protocol.LiveActivityVersion || m.Activity == nil || m.Input != "" || m.Task != nil || m.Policy != nil || m.Result != "" || m.CandidateSHA != "" || m.Error != "" || m.Disposition != "" || len(m.Evidence) != 0 {
+					reject()
+					return
+				}
+				attempts, err := x.store.Attempts(active.JobID)
+				accepted := false
+				if err == nil {
+					for _, a := range attempts {
+						if a.ID == active.AttemptID && a.WorkerID == effectiveID {
+							accepted = x.appendActivity(a, *m.Activity, x.options.Now().UTC())
+							break
+						}
+					}
+				}
+				if !accepted {
+					reject()
+					return
+				}
+				continue
+			}
+			if m.Activity != nil || m.ActivityVersion != "" {
+				reject()
+				return
+			}
 			if completed != nil && m.Type == protocol.MessageHeartbeat && m.JobID == completed.JobID && m.AttemptID == completed.AttemptID {
 				if m.WorkerID != baseWorkerID || m.Input != "" || m.Task != nil || m.Policy != nil || m.Result != "" || m.CandidateSHA != "" || m.Disposition != "" || m.Error != "" || len(m.Evidence) != 0 {
 					reject()
@@ -1198,9 +1230,11 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 			if wsjson.Write(ctx, c, protocol.Message{Type: protocol.MessageAck, JobID: m.JobID, AttemptID: m.AttemptID}) != nil {
 				return
 			}
+			x.forgetActivity(active.AttemptID)
 			completed, active = active, nil
 		case <-ticker.C:
 			if active != nil {
+				x.expireActivity(active.JobID, active.AttemptID)
 				continue
 			}
 			var lease store.Lease
@@ -1218,6 +1252,9 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			m := protocol.Message{Type: protocol.MessageLease, JobID: lease.JobID, AttemptID: lease.AttemptID, Input: lease.Input, Task: lease.Task}
+			if activityNegotiated {
+				m.ActivityVersion = protocol.LiveActivityVersion
+			}
 			if x.config != nil {
 				policy := lease.Policy.WorkerPolicy()
 				m.Policy = &policy
@@ -1266,4 +1303,92 @@ func failureDisposition(code string) (store.FailureDisposition, bool) {
 	default:
 		return "", false
 	}
+}
+
+type liveEvent struct {
+	protocol.Activity
+	RunID      string    `json:"run_id"`
+	AttemptID  string    `json:"attempt_id"`
+	Ordinal    int       `json:"attempt_ordinal"`
+	WorkerID   string    `json:"worker_id"`
+	ReceivedAt time.Time `json:"received_at"`
+}
+type liveAttempt struct {
+	events   []liveEvent
+	deadline time.Time
+}
+
+func (x *server) appendActivity(a store.Attempt, event protocol.Activity, now time.Time) bool {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if a.Status != "leased" || !now.Before(a.DeadlineAt) {
+		return false
+	}
+	if x.activity == nil {
+		x.activity = make(map[string]liveAttempt)
+	}
+	entry := x.activity[a.ID]
+	sequence, rank := 0, 0
+	if len(entry.events) > 0 {
+		last := entry.events[len(entry.events)-1]
+		if last.RunID != a.JobID || last.WorkerID != a.WorkerID || last.Ordinal != a.Ordinal {
+			return false
+		}
+		sequence = last.Sequence
+		rank = protocol.ActivityRank(last.Stage)
+	} else if len(x.activity) >= 1024 {
+		return false
+	}
+	if !protocol.ValidActivity(event, sequence, rank) {
+		return false
+	}
+	entry.events = append(entry.events, liveEvent{event, a.JobID, a.ID, a.Ordinal, a.WorkerID, now})
+	entry.deadline = a.DeadlineAt
+	x.activity[a.ID] = entry
+	return true
+}
+func (x *server) projectActivity(a store.Attempt, now time.Time) []liveEvent {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if a.Status != "leased" || !now.Before(a.DeadlineAt) {
+		return nil
+	}
+	entry := x.activity[a.ID]
+	if len(entry.events) == 0 {
+		return nil
+	}
+	first := entry.events[0]
+	if first.RunID != a.JobID || first.WorkerID != a.WorkerID || first.Ordinal != a.Ordinal {
+		return nil
+	}
+	return append([]liveEvent(nil), entry.events...)
+}
+func (x *server) forgetActivity(id string) {
+	x.mu.Lock()
+	delete(x.activity, id)
+	x.mu.Unlock()
+}
+
+// Consult the current lease deadline: heartbeats may have extended it since the last event.
+func (x *server) expireActivity(jobID, attemptID string) {
+	now := x.options.Now().UTC()
+	x.mu.Lock()
+	entry, ok := x.activity[attemptID]
+	x.mu.Unlock()
+	if !ok || now.Before(entry.deadline) {
+		return
+	}
+	attempts, err := x.store.Attempts(jobID)
+	if err == nil {
+		for _, a := range attempts {
+			if a.ID == attemptID && a.Status == "leased" && now.Before(a.DeadlineAt) {
+				x.mu.Lock()
+				entry.deadline = a.DeadlineAt
+				x.activity[attemptID] = entry
+				x.mu.Unlock()
+				return
+			}
+		}
+	}
+	x.forgetActivity(attemptID)
 }

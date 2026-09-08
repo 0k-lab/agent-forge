@@ -79,7 +79,7 @@ function lockWorkspace(message = 'Workspace locked.') {
   byId('project-info').textContent = 'Connect to see configured projects.';
   notice(message, message.startsWith('Unauthorized'));
 }
-async function api(path, body) {
+async function api(path, body, current = () => true) {
   const currentSession = session;
   let response;
   try {
@@ -92,7 +92,7 @@ async function api(path, body) {
   } catch {
     throw new Error(body === undefined ? 'Offline — unable to reach the gate. Reconnecting every 5 seconds.' : 'Connection lost. Check the board before submitting again; the task may have been created.');
   }
-  if (currentSession !== session) throw new Error('Workspace session changed.');
+  if (currentSession !== session || !current()) throw new Error('Workspace session changed.');
   if (response.status === 401) {
     lockWorkspace('Unauthorized — enter a valid owner token.');
     byId('token').focus();
@@ -103,7 +103,7 @@ async function api(path, body) {
     throw new Error(messages[response.status] || `Request failed (${response.status}). Try refreshing.`);
   }
   const data = await response.json();
-  if (currentSession !== session) throw new Error('Workspace session changed.');
+  if (currentSession !== session || !current()) throw new Error('Workspace session changed.');
   return data;
 }
 function projectInfo() {
@@ -402,13 +402,17 @@ function renderIssueCompletion(node, issue, activity) {
   if (activity?.data?.truncated) add(node, 'p', 'GitHub activity is limited to 50 records.', 'hint');
 }
 async function loadIssueActivity(task, activity) {
-  const currentSession = session;
+  const epoch = detailEpoch, currentSession = session, currentToken = token, key = taskKey(task);
+  const current = () => token && token === currentToken && session === currentSession && epoch === detailEpoch &&
+    byId('detail-modal').open && selectedTask && taskKey(selectedTask) === key && selectedActivity === activity;
   try {
-    activity.data = await api(`/v1/control/projects/${encodeURIComponent(task.project)}/issues/${task.issue.number}/activity`);
-    activity.status = activity.data.available ? 'available' : 'unavailable';
-  } catch { activity.status = 'unavailable'; }
-  if (token && session === currentSession && selectedActivity === activity && activity.node) renderIssueCompletion(activity.node, task.issue, activity);
+    const data = await api(`/v1/control/projects/${encodeURIComponent(task.project)}/issues/${task.issue.number}/activity`, undefined, current);
+    if (!current()) return;
+    activity.data = data; activity.status = data.available ? 'available' : 'unavailable';
+  } catch { if (!current()) return; activity.status = 'unavailable'; }
+  if (current() && activity.node) renderIssueCompletion(activity.node, task.issue, activity);
 }
+
 function renderTaskDetail(task, runs, total = runs.length) {
   const root = byId('detail-content');
   const expanded = new Set([...root.querySelectorAll('details')].filter(node => node.open).map(node => node.dataset.disclosure));
@@ -455,6 +459,17 @@ function renderTaskDetail(task, runs, total = runs.length) {
     add(runNode, 'p', runAction(run), 'outcome');
     add(runNode, 'p', `Started ${stamp(run.created_at)} · Updated ${stamp(run.updated_at)} · ${duration(run)} elapsed`, 'hint');
     if (data.error) { add(runNode, 'p', 'Run details unavailable. Refresh to try again.', 'error'); continue; }
+    for (const attempt of attempts.filter(a => a.status === 'leased')) {
+      const live = section(runNode, 'Live Agent Activity');
+      add(live, 'p', 'Transient Worker activity · not verification or delivery evidence', 'hint');
+      const list = add(live, 'ol', '');
+      const labels = {analyzing:'Analyzing', editing:'Editing', testing:'Testing', preparing_result:'Preparing result'};
+      for (const event of (attempt.activity || []).slice(0, 4)) {
+        if (!Object.hasOwn(labels, event.stage) || event.run_id !== run.id || event.attempt_id !== attempt.id || event.attempt_ordinal !== attempt.ordinal || event.worker_id !== attempt.worker_id) continue;
+        add(list, 'li', `${labels[event.stage]} · Run ${event.run_id} · Attempt ${event.attempt_ordinal} (${event.attempt_id}) · Worker ${event.worker_id} · ${stamp(event.received_at)}`);
+      }
+      if (!list.children.length) add(live, 'p', 'No live activity reported for this attempt.', 'hint');
+    }
     const reportSection = section(runNode, 'Agent report');
     const reportedAttempts = attempts.filter(attempt => attempt.status === 'succeeded' && attempt.candidate_sha && attempt.agent_report);
     if (!reportedAttempts.length) add(reportSection, 'p', 'Detailed agent report was not captured for this run', 'hint');
@@ -539,18 +554,20 @@ function resumeDeliveryButton(parent, id) {
 }
 function renderDetail(data) { renderTaskDetail(null, [data]); }
 async function loadTaskDetail(task) {
-  const key = taskKey(task), activity = selectedActivity, currentSession = session;
+  const key = taskKey(task), activity = selectedActivity, currentSession = session, currentToken = token, epoch = detailEpoch, request = ++detailRequest;
+  const isCurrent = () => token && token === currentToken && session === currentSession && epoch === detailEpoch && request === detailRequest &&
+    byId('detail-modal').open && selectedActivity === activity && selectedTask && taskKey(selectedTask) === key;
   try {
-    const group = await api(`/v1/control/projects/${encodeURIComponent(task.project || '_unassigned')}/runs?source_ref=${encodeURIComponent(task.source_ref)}`);
+    const group = await api(`/v1/control/projects/${encodeURIComponent(task.project || '_unassigned')}/runs?source_ref=${encodeURIComponent(task.source_ref)}`, undefined, isCurrent);
     const runs = await Promise.all(group.runs.map(async run => {
-      try { const data = await api(`/v1/control/jobs/${encodeURIComponent(run.id)}`); data.job.ordinal = run.ordinal; return data; }
+      try { const data = await api(`/v1/control/jobs/${encodeURIComponent(run.id)}`, undefined, isCurrent); data.job.ordinal = run.ordinal; return data; }
       catch { return {job:run,error:true}; }
     }));
-    if (!token || session !== currentSession || selectedActivity !== activity || !selectedTask || taskKey(selectedTask) !== key) return;
+    if (!isCurrent()) return;
     const current = boardTasks().find(item => taskKey(item) === key) || task;
     selectedTask = current;
     renderTaskDetail(current, runs, group.total); byId('detail-notice').textContent = '';
-  } catch (error) { if (session === currentSession && selectedActivity === activity && selectedTask && taskKey(selectedTask) === key) byId('detail-notice').textContent = error.message; }
+  } catch (error) { if (isCurrent()) byId('detail-notice').textContent = error.message; }
 }
 function openTaskDetail(task) {
   detailEpoch++;
@@ -568,7 +585,7 @@ async function loadDetail(id) {
     currentToken === token && token && id === job && job === selectedJob && !selectedTask && byId('detail-modal').open;
   if (!current()) return;
   try {
-    const data = await api(`/v1/control/jobs/${encodeURIComponent(id)}`);
+    const data = await api(`/v1/control/jobs/${encodeURIComponent(id)}`, undefined, current);
     if (!current()) return;
     renderDetail(data); byId('detail-notice').textContent = '';
   } catch (error) { if (current()) byId('detail-notice').textContent = error.message; }
@@ -675,5 +692,12 @@ byId('detail-modal').addEventListener('close', () => { detailEpoch++; selectedJo
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
 window.addEventListener('online', refresh);
 window.addEventListener('offline', () => notice('Offline — displayed data may be stale.', true));
-setInterval(() => { if (!document.hidden) refresh(); }, 5000);
+setInterval(() => {
+  if (document.hidden) return;
+  if (byId('detail-modal').open) {
+    if (selectedTask) loadTaskDetail(selectedTask);
+    else if (selectedJob) loadDetail(selectedJob);
+  }
+  refresh();
+}, 5000);
 renderBoard();
