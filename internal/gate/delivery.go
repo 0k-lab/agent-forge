@@ -54,7 +54,9 @@ func (x *server) deliveryLoop(ctx context.Context) {
 	defer ticker.Stop()
 	// ponytail: deliveries are serialized; add a bounded worker pool if delivery throughput becomes measurable.
 	for {
-		x.runOneDelivery(ctx)
+		if err := x.runOneDelivery(ctx); err != nil {
+			x.log("delivery_error", "failure_code", "delivery_state_failed")
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -63,16 +65,17 @@ func (x *server) deliveryLoop(ctx context.Context) {
 	}
 }
 
-func (x *server) runOneDelivery(ctx context.Context) {
+func (x *server) runOneDelivery(ctx context.Context) error {
 	delivery, ok, err := x.store.ClaimDelivery(x.options.Now().UTC())
 	if err != nil || !ok {
-		return
+		return err
 	}
 	repository, found := x.repository(delivery.RepositoryID)
 	source, sourceErr := canonicalPublicGitHubURL(delivery.RepositoryURL)
 	if !found || sourceErr != nil || repository.RepositoryURL != delivery.RepositoryURL || repository.DefaultBranch != delivery.DefaultBranch {
-		_ = x.store.FailDelivery(delivery.JobID, "delivery_registration_changed", x.options.Now().UTC())
-		return
+		return x.writeDeliveryState(ctx, delivery.JobID, "fail", func() error {
+			return x.store.FailDelivery(delivery.JobID, "delivery_registration_changed", x.options.Now().UTC())
+		})
 	}
 	cfg := githubdelivery.Config{Version: 1, APIBase: x.config.Delivery.APIBase, Owner: source.Owner, Repository: source.Repository,
 		LocalRepository: publicRepositoryPath(x.config.PublicRepositoryRoot, source), GitExecutable: x.config.GitExecutable,
@@ -80,6 +83,7 @@ func (x *server) runOneDelivery(ctx context.Context) {
 	publication := githubdelivery.Publication{Version: 1, CandidateSHA: delivery.CandidateSHA, ExpectedParentSHA: delivery.ParentSHA,
 		ExpectedTreeSHA: delivery.ExpectedTreeSHA, CandidateRef: delivery.CandidateRef, BaseBranch: delivery.DefaultBranch,
 		NewBranch: delivery.Branch, PRTitle: delivery.PRTitle, PRBody: delivery.PRBody}
+	var stateErr error
 	op := githubdelivery.AutomationOptions{Options: x.options.Delivery, PollInterval: x.config.Delivery.PollInterval,
 		NoRunsGrace: x.config.Delivery.NoRunsGrace, Timeout: x.config.Delivery.Timeout,
 		OnState: func(result githubdelivery.Result, number int, ci string) error {
@@ -87,21 +91,65 @@ func (x *server) runOneDelivery(ctx context.Context) {
 			if ci == "success" {
 				phase = "merging"
 			}
-			return x.store.UpdateDelivery(delivery.JobID, phase, result.PRURL, number, ci, x.options.Now().UTC())
+			stateErr = x.writeDeliveryState(ctx, delivery.JobID, phase, func() error {
+				return x.store.UpdateDelivery(delivery.JobID, phase, result.PRURL, number, ci, x.options.Now().UTC())
+			})
+			return stateErr
 		}}
 	result, err := githubdelivery.DeliverAndMerge(ctx, cfg, publication, op)
+	// A canceled state write leaves the active row for restart reconciliation.
+	// Do not classify the publisher's state_failed wrapper as a terminal failure.
+	if stateErr != nil {
+		return stateErr
+	}
 	if err == nil {
-		_ = x.store.CompleteDelivery(delivery.JobID, result.MergeSHA, x.options.Now().UTC())
+		if err := x.writeDeliveryState(ctx, delivery.JobID, "complete", func() error {
+			return x.store.CompleteDelivery(delivery.JobID, result.MergeSHA, x.options.Now().UTC())
+		}); err != nil {
+			return err
+		}
 		x.log("delivery_merged", "job_id", delivery.JobID, "phase", "merged", "candidate_sha", delivery.CandidateSHA, "merge_sha", result.MergeSHA)
-		return
+		return nil
 	}
 	code, transient := deliveryFailure(err)
+	operation := "fail"
 	if transient {
-		_ = x.store.RetryDelivery(delivery.JobID, code, x.options.Now().UTC(), x.config.Delivery.RetryBase)
-	} else {
-		_ = x.store.FailDelivery(delivery.JobID, code, x.options.Now().UTC())
+		operation = "retry"
 	}
-	x.log("delivery_failed", "job_id", delivery.JobID, "phase", "failed", "failure_code", code)
+	if err := x.writeDeliveryState(ctx, delivery.JobID, operation, func() error {
+		if transient {
+			return x.store.RetryDelivery(delivery.JobID, code, x.options.Now().UTC(), x.config.Delivery.RetryBase)
+		}
+		return x.store.FailDelivery(delivery.JobID, code, x.options.Now().UTC())
+	}); err != nil {
+		return err
+	}
+	event, phase := "delivery_failed", "failed"
+	if transient && delivery.Attempts < delivery.MaxAttempts {
+		event, phase = "delivery_retry", "retry_wait"
+	}
+	x.log(event, "job_id", delivery.JobID, "phase", phase, "failure_code", code)
+	return nil
+}
+
+// Retry only the durable transition, retaining the external result. The serialized
+// publisher cannot repeat external work while storage is unavailable. On shutdown,
+// the active row is recovered and exact-PR reconciliation runs after preflight.
+func (x *server) writeDeliveryState(ctx context.Context, jobID, operation string, write func() error) error {
+	for {
+		err := write()
+		if err == nil {
+			return nil
+		}
+		x.log("delivery_state_write_failed", "job_id", jobID, "operation", operation)
+		timer := time.NewTimer(x.options.LeasePollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 func deliveryFailure(err error) (string, bool) {

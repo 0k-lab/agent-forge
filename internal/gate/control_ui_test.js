@@ -466,3 +466,81 @@ for (const phase of ['fetch', 'json']) {
     assert.equal(w.nodes['detail-modal'].open, false);
   });
 }
+
+test('task submission explicitly offers automatic and review delivery', async () => {
+  const w = workspace();
+  const html = readFileSync(path.join(__dirname, 'app/index.html'), 'utf8');
+  assert.match(html, /<label for="task-delivery-policy">Delivery policy<\/label>/);
+  assert.match(html, /<option value="automatic"[^>]*>Automatic/);
+  assert.match(html, /<option value="review">Review/);
+  w.run(`token = 'owner'`);
+  w.nodes['task-delivery-policy'].value = 'review';
+  w.context.fetch = async (url, options) => { w.calls.push({url, options}); return {ok:false,status:422}; };
+  await w.run('submitTask({preventDefault(){}})');
+  assert.equal(JSON.parse(w.calls[0].options.body).delivery_policy, 'review');
+});
+
+
+test('held run stays in Review & CI and resumes once with owner auth', async () => {
+ const w=workspace();
+ const delivery={phase:'awaiting_review'};
+ const job={id:'held',title:'Review candidate',project:'parser',status:'delivering',delivery,source_ref:'https://github.com/org/repo/issues/89'};
+ w.context.data={projects:[project],workers:[],jobs:[job],tasks:[{project:'parser',title:job.title,source_ref:job.source_ref,latest_run:job}]};
+ w.context.detail={job,delivery,attempts:[],timeline:[],diagnostics:{id:job.id}};
+ w.run(`token='owner'; selectedJob='held'; renderOverview(data); byId('detail-modal').showModal(); renderDetail(detail)`);
+ assert.match(w.nodes.board.children[3].textContent,/Awaiting independent review/);
+ const action=()=>w.nodes['detail-content'].querySelectorAll('button').find(b=>b.textContent==='Resume delivery');
+ assert.ok(action());
+ let resolve;
+ w.context.fetch=(url,options)=>{w.calls.push({url,options});return new Promise(done=>{resolve=done;});};
+ const first=action().listeners.click();
+ assert.equal(action().disabled,true);
+ w.run('renderDetail(detail)');
+ assert.equal(action().disabled,true);
+ await action().listeners.click();
+ assert.equal(w.calls.length,1);
+ assert.equal(w.calls[0].url,'/v1/control/jobs/held/resume-delivery');
+ assert.equal(w.calls[0].options.headers.Authorization,'Bearer owner');
+ assert.equal(w.calls[0].options.method,'POST');
+ w.context.fetch=async()=>({ok:true,status:200,json:async()=>({...w.context.detail,job:{...job,delivery:{phase:'pending'}},delivery:{phase:'pending'}})});
+ resolve({ok:true,status:200,json:async()=>({phase:'pending'})});
+ await first;
+ assert.equal(action(),undefined);
+ assert.match(w.nodes['detail-content'].textContent,/Waiting to publish/);
+});
+
+test('resume callbacks and late responses cannot cross drawer or owner sessions', async () => {
+ for (const mode of ['navigation','lock','reauth','late-401']) {
+  const w=workspace();
+  w.context.detail={job:{id:'held',title:'Candidate',status:'delivering',delivery:{phase:'awaiting_review'}},delivery:{phase:'awaiting_review'},attempts:[],timeline:[],diagnostics:{}};
+  w.run(`token='owner'; selectedJob='held'; byId('detail-modal').showModal(); renderDetail(detail)`);
+  const action=w.nodes['detail-content'].querySelectorAll('button').find(b=>b.textContent==='Resume delivery');
+  assert.ok(action);
+  let resolve;
+  w.context.fetch=(url,options)=>{w.calls.push({url,options});return new Promise(done=>{resolve=done;});};
+  const pending=action.listeners.click();
+  if(mode==='navigation') w.run(`detailEpoch++; selectedJob='other'; byId('detail-content').textContent='Other run';`);
+  else w.run(`lockWorkspace(); session++; token='new-owner'; byId('detail-content').textContent='New session';`);
+  w.nodes['detail-notice'].textContent='Keep this notice';
+  resolve({ok:mode!=='late-401',status:mode==='late-401'?401:200,json:async()=>({phase:'pending'})});
+  await pending;
+  assert.equal(w.calls.length,1);
+  assert.equal(w.nodes['detail-notice'].textContent,'Keep this notice');
+  assert.equal(w.nodes['detail-content'].textContent,mode==='navigation'?'Other run':'New session');
+  assert.equal(w.run('token'),mode==='navigation'?'owner':'new-owner');
+  await action.listeners.click();
+  assert.equal(w.calls.length,1,'stale button must not send using new credentials');
+ }
+});
+
+
+test('resume button is bound to the owner token that rendered it', async () => {
+ const w=workspace();
+ w.context.detail={job:{id:'held',status:'delivering'},delivery:{phase:'awaiting_review'},attempts:[],timeline:[],diagnostics:{}};
+ w.run(`token='owner'; selectedJob='held'; byId('detail-modal').showModal(); renderDetail(detail)`);
+ const action=w.nodes['detail-content'].querySelectorAll('button').find(b=>b.textContent==='Resume delivery');
+ w.run(`token='replacement-owner'`);
+ w.context.fetch=async(url,options)=>{ w.calls.push({url,options}); return {ok:false,status:409}; };
+ await action.listeners.click();
+ assert.equal(w.calls.length,0);
+});

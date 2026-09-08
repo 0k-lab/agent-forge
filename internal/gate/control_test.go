@@ -16,12 +16,14 @@ import (
 
 func controlFixture(t *testing.T) (*store.Store, *server, http.Handler) {
 	t.Helper()
-	s, err := store.Open(filepath.Join(secureTempDir(t), "control.db"))
+	database := filepath.Join(secureTempDir(t), "control.db")
+	s, err := store.Open(database)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { s.Close() })
 	config := publicGateConfig(t)
+	config.Database = database
 	x := newServer(s, nil, "owner", DefaultOptions())
 	x.config = &config
 	return s, x, x.routes()

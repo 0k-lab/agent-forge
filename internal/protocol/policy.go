@@ -30,6 +30,23 @@ type ExecutionPolicy struct {
 	GitOutputBytes      int64    `json:"git_output_bytes"`
 }
 
+// DeliveryPolicy is pinned with the job; omission preserves automatic delivery.
+type DeliveryPolicy string
+
+const (
+	DeliveryAutomatic DeliveryPolicy = "automatic"
+	DeliveryReview    DeliveryPolicy = "review"
+)
+
+func (p DeliveryPolicy) Validate() error {
+	switch p {
+	case "", DeliveryAutomatic, DeliveryReview:
+		return nil
+	default:
+		return errors.New("invalid delivery policy")
+	}
+}
+
 type ResolvedPolicy struct {
 	Version        int             `json:"version"`
 	WorkerPool     string          `json:"worker_pool"`

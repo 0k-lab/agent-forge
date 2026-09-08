@@ -247,7 +247,7 @@ func (x *server) controlDetail(w http.ResponseWriter, r *http.Request) {
 	events := []store.DebugEvent{}
 	for _, event := range timeline.Events {
 		switch event.Type {
-		case "submitted", "leased", "lease_expired", "retryable_failed", "retry_scheduled", "failed", "succeeded", "delivery_pending", "delivery_phase", "delivery_retry", "delivery_merged", "delivery_failed":
+		case "submitted", "leased", "lease_expired", "retryable_failed", "retry_scheduled", "failed", "succeeded", "delivery_review", "delivery_resumed", "delivery_pending", "delivery_phase", "delivery_retry", "delivery_merged", "delivery_failed":
 		default:
 			continue
 		}
@@ -285,16 +285,25 @@ func (x *server) controlSubmit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "invalid task: choose a project, title, instruction and checks"})
 	}
 	var in struct {
-		Project     string `json:"project"`
-		Title       string `json:"title"`
-		Instruction string `json:"instruction"`
-		SourceRef   string `json:"source_ref"`
-		CheckPreset string `json:"check_preset"`
-		Checks      string `json:"checks"`
+		DeliveryPolicy configjson.String `json:"delivery_policy"`
+		Project        string            `json:"project"`
+		Title          string            `json:"title"`
+		Instruction    string            `json:"instruction"`
+		SourceRef      string            `json:"source_ref"`
+		CheckPreset    string            `json:"check_preset"`
+		Checks         string            `json:"checks"`
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 128<<10))
 	if err != nil || configjson.Decode(body, &in) != nil || x.config == nil {
 		invalid()
+		return
+	}
+	if protocol.DeliveryPolicy(in.DeliveryPolicy).Validate() != nil {
+		invalid()
+		return
+	}
+	if in.DeliveryPolicy == configjson.String(protocol.DeliveryReview) && x.config.Delivery == nil {
+		writeJSON(w, 422, map[string]string{"error": "delivery is unavailable for this project"})
 		return
 	}
 	in.Title = strings.TrimSpace(in.Title)
@@ -367,5 +376,34 @@ func (x *server) controlSubmit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, map[string]string{"error": "repository preparation failed"})
 		return
 	}
-	x.persistConfiguredTask(w, task, repository, in.SourceRef)
+	x.persistConfiguredTask(w, task, repository, in.SourceRef, protocol.DeliveryPolicy(in.DeliveryPolicy))
+}
+
+func (x *server) controlResumeDelivery(w http.ResponseWriter, r *http.Request) {
+	if x.config == nil || x.config.Delivery == nil {
+		writeJSON(w, 422, map[string]string{"error": "delivery is unavailable"})
+		return
+	}
+	d, err := x.store.Delivery(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, 409, map[string]string{"error": "delivery is not awaiting review"})
+		return
+	}
+	if d.Phase == "awaiting_review" {
+		job, jobErr := x.store.Job(d.JobID)
+		if jobErr != nil {
+			writeJSON(w, 409, map[string]string{"error": "delivery identity changed"})
+			return
+		}
+		candidate, err := x.deliveryForCandidate(r.Context(), store.Lease{JobID: job.ID, AttemptID: job.AttemptID, Task: job.Task}, d.CandidateSHA)
+		if err != nil || candidate.ExpectedTreeSHA != d.ExpectedTreeSHA || candidate.ParentSHA != d.ParentSHA || candidate.RepositoryID != d.RepositoryID || candidate.RepositoryURL != d.RepositoryURL || candidate.DefaultBranch != d.DefaultBranch || candidate.CandidateRef != d.CandidateRef {
+			writeJSON(w, 409, map[string]string{"error": "delivery identity changed"})
+			return
+		}
+	}
+	if err := x.store.ResumeDelivery(r.PathValue("id"), x.options.Now().UTC()); err != nil {
+		writeJSON(w, 409, map[string]string{"error": "delivery is not awaiting review"})
+		return
+	}
+	writeJSON(w, 200, x.safeDelivery(r.PathValue("id")))
 }

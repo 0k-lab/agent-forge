@@ -11,6 +11,7 @@ const byId = id => document.getElementById(id);
 let token = '', overview = null, selectedJob = '', submitPending = false, refreshing = false;
 let detailEpoch = 0, detailRequest = 0, startRequest = 0;
 let session = 0, selectedTask = null, selectedActivity = null;
+const resumePending = new Set();
 
 function add(parent, tag, text, className = '') {
   const node = document.createElement(tag);
@@ -62,6 +63,7 @@ function notice(message, error = false) {
 }
 function lockWorkspace(message = 'Workspace locked.') {
   session++;
+  resumePending.clear();
   token = ''; overview = null; selectedJob = ''; selectedTask = null; selectedActivity = null; backlogs.clear(); backlogRequest++;
   byId('backlog-notice').textContent = 'Select a project to load its public issue backlog.';
   byId('backlog-refresh').disabled = true;
@@ -97,7 +99,7 @@ async function api(path, body) {
     throw new Error('Unauthorized — enter a valid owner token.');
   }
   if (!response.ok) {
-    const messages = {400: 'Invalid task. Check the project, title, instructions, source URL and checks.', 404: 'Task not found.', 413: 'Task detail or request exceeds the supported limit.', 422: 'Public source preparation is unavailable. Check the project configuration and default branch.', 502: 'Repository preparation failed. The public source could not be fetched.'};
+    const messages = {400: 'Invalid task. Check the project, title, instructions, source URL and checks.', 404: 'Task not found.', 409: 'Delivery is not awaiting review. Refresh the run.', 413: 'Task detail or request exceeds the supported limit.', 422: 'Public source preparation is unavailable. Check the project configuration and default branch.', 502: 'Repository preparation failed. The public source could not be fetched.'};
     throw new Error(messages[response.status] || `Request failed (${response.status}). Try refreshing.`);
   }
   const data = await response.json();
@@ -177,7 +179,7 @@ function runState(status) {
   return {pending:'Queued',retry_wait:'Waiting for another attempt',leased:'Working',delivering:'Review & CI',succeeded:'Succeeded',failed:'Failed'}[status] || 'Not reported';
 }
 function deliveryPhase(phase) {
-  return {pending:'Waiting to publish',publishing:'Publishing candidate',ci:'Waiting for CI',merging:'Merging pull request',retry_wait:'Waiting for another delivery attempt',merged:'Merged',failed:'Delivery stopped'}[phase] || 'Not reported';
+  return {awaiting_review:'Awaiting independent review',pending:'Waiting to publish',publishing:'Publishing candidate',ci:'Waiting for CI',merging:'Merging pull request',retry_wait:'Waiting for another delivery attempt',merged:'Merged',failed:'Delivery stopped'}[phase] || 'Not reported';
 }
 function ciState(state) { return {pending:'Pending',success:'Passed',failure:'Failed',failed:'Failed'}[state] || 'Not reported'; }
 function renderRuns() {
@@ -466,6 +468,7 @@ function renderTaskDetail(task, runs, total = runs.length) {
     if (data.delivery) {
       fields(verification, [['Delivery', deliveryPhase(data.delivery.phase)], ['CI', ciState(data.delivery.ci_state)]]);
       safeLink(verification, data.delivery.pr_url, 'Open run pull request ↗');
+      if (run.status === 'delivering' && data.delivery.phase === 'awaiting_review') resumeDeliveryButton(verification, run.id);
     }
     if (data.instruction && data.instruction !== briefText) add(disclosure(runNode, 'Run brief', `run-brief-${run.id}`), 'p', data.instruction, 'instruction');
     add(runNode, 'p', `Worker slot → configured plugin agent · ${run.agent || 'Not reported'}`, 'hint');
@@ -492,7 +495,7 @@ function renderTaskDetail(task, runs, total = runs.length) {
       }
     });
     if (data.attempts_truncated) add(runNode, 'p', 'Only the first 100 attempts are available here.', 'hint');
-    const messages = {submitted:'Run queued in Forge.', delivery_pending:'Candidate handed to delivery.', delivery_phase:'Delivery advanced', delivery_retry:'Forge scheduled another delivery attempt.', delivery_merged:'Pull request merged.', delivery_failed:'Delivery stopped after failure.'};
+    const messages = {delivery_review:'Awaiting independent review.', delivery_resumed:'Owner resumed delivery.', submitted:'Run queued in Forge.', delivery_pending:'Candidate handed to delivery.', delivery_phase:'Delivery advanced', delivery_retry:'Forge scheduled another delivery attempt.', delivery_merged:'Pull request merged.', delivery_failed:'Delivery stopped after failure.'};
     const events = (data.timeline || []).filter(event => messages[event.type]);
     if (events.length) {
       const timeline = section(runNode, 'Run timeline'), list = add(timeline, 'ol', '', 'timeline');
@@ -513,6 +516,26 @@ function renderTaskDetail(task, runs, total = runs.length) {
       for (const evidence of attempt.evidence || []) copyField(diagnostics, 'Evidence ID', evidence.evidence_id);
     }
   }
+}
+function resumeDeliveryButton(parent, id) {
+  const epoch = detailEpoch, currentSession = session, currentToken = token;
+  const current = () => token && currentToken === token && currentSession === session && epoch === detailEpoch && byId('detail-modal').open;
+  const action = button(parent, 'Resume delivery', async () => {
+    if (!current() || resumePending.has(id)) return;
+    resumePending.add(id); action.disabled = true;
+    byId('detail-notice').textContent = 'Resuming delivery…';
+    try {
+      await api(`/v1/control/jobs/${encodeURIComponent(id)}/resume-delivery`, {});
+      if (!current()) return;
+      if (selectedTask) await loadTaskDetail(selectedTask);
+      else await loadDetail(id);
+    } catch (error) { if (current()) byId('detail-notice').textContent = error.message; }
+    finally {
+      if (currentSession === session) resumePending.delete(id);
+      if (current()) action.disabled = false;
+    }
+  }, 'primary');
+  action.disabled = resumePending.has(id);
 }
 function renderDetail(data) { renderTaskDetail(null, [data]); }
 async function loadTaskDetail(task) {
@@ -602,7 +625,7 @@ async function submitTask(event) {
   submitPending = true; byId('submit-task').disabled = true; byId('task-close').disabled = true;
   byId('submit-task').textContent = 'Preparing repository…'; byId('task-error').textContent = '';
   try {
-    const input = {project: byId('task-project').value, title: byId('task-title').value, instruction: byId('task-instruction').value, source_ref: byId('task-source').value.trim(), check_preset: byId('task-preset').value, checks: byId('task-preset').value === 'go' ? '' : byId('task-checks').value};
+    const input = {delivery_policy: byId('task-delivery-policy').value, project: byId('task-project').value, title: byId('task-title').value, instruction: byId('task-instruction').value, source_ref: byId('task-source').value.trim(), check_preset: byId('task-preset').value, checks: byId('task-preset').value === 'go' ? '' : byId('task-checks').value};
     const job = await api('/v1/control/jobs', input);
     if (currentSession !== session) return;
     byId('task-modal').close();

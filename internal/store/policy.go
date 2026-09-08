@@ -22,7 +22,32 @@ var policyID = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 func validSessionGeneration(generation string) bool { return lowerHex(generation, 32) }
 
 type ExecutionPolicy = protocol.ExecutionPolicy
-type ResolvedPolicy = protocol.ResolvedPolicy
+type ResolvedPolicy struct {
+	DeliveryPolicy protocol.DeliveryPolicy `json:"delivery_policy,omitempty"`
+	Version        int                     `json:"version"`
+	WorkerPool     string                  `json:"worker_pool"`
+	LeaseTTLNanos  int64                   `json:"lease_ttl_nanos"`
+	RetryBaseNanos int64                   `json:"retry_base_nanos"`
+	MaxAttempts    int                     `json:"max_attempts"`
+	RetryAlgorithm string                  `json:"retry_algorithm"`
+	RetryMaxNanos  int64                   `json:"retry_max_nanos"`
+	Execution      ExecutionPolicy         `json:"execution"`
+}
+
+// WorkerPolicy projects only the negotiated v1 execution/lease policy.
+func (p ResolvedPolicy) WorkerPolicy() protocol.ResolvedPolicy {
+	return protocol.ResolvedPolicy{Version: p.Version, WorkerPool: p.WorkerPool,
+		LeaseTTLNanos: p.LeaseTTLNanos, RetryBaseNanos: p.RetryBaseNanos,
+		MaxAttempts: p.MaxAttempts, RetryAlgorithm: p.RetryAlgorithm,
+		RetryMaxNanos: p.RetryMaxNanos, Execution: p.Execution}
+}
+
+func (p ResolvedPolicy) Validate() error {
+	if err := p.DeliveryPolicy.Validate(); err != nil {
+		return err
+	}
+	return p.WorkerPolicy().Validate()
+}
 
 func CanonicalPolicy(policy ResolvedPolicy) ([]byte, error) {
 	if err := policy.Validate(); err != nil {
