@@ -3,10 +3,12 @@ package pluginprotocol
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -209,6 +211,60 @@ func TestWorkerOutputConformanceFixtures(t *testing.T) {
 		}
 		if _, err := Exchange(io.Discard, bytes.NewReader(body), request, []Capability{Text}); err == nil {
 			t.Fatalf("accepted invalid fixture %s", path)
+		}
+	}
+}
+
+func TestLiveLegacyAndConcurrentProgress(t *testing.T) {
+	id := strings.Repeat("a", 32)
+	var input, output bytes.Buffer
+	writeFrame(&input, initialize{Version, id, "initialize", []Capability{Text, Progress}, V1Limits()})
+	writeFrame(&input, textExecute{Version, id, "execute", Text, "hello"})
+	var late func(string, string)
+	err := ServeWithProgress(&input, &output, []Capability{Text, Progress}, func(ctx context.Context, r Request) (Result, error) {
+		late = r.OnProgress
+		var wg sync.WaitGroup
+		for i := 0; i < 32; i++ {
+			wg.Add(1)
+			go func() { defer wg.Done(); r.OnProgress("working", "safe") }()
+		}
+		wg.Wait()
+		return Result{Output: "done"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := output.String()
+	late("finalizing", "late")
+	if output.String() != before {
+		t.Fatal("progress after result")
+	}
+	var frames []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(before), "\n") {
+		var f map[string]any
+		if json.Unmarshal([]byte(line), &f) != nil {
+			t.Fatal(line)
+		}
+		frames = append(frames, f)
+	}
+	if len(frames) != 34 || frames[33]["type"] != "result" {
+		t.Fatal(frames)
+	}
+	for i, f := range frames[1:33] {
+		if f["sequence"] != float64(i+1) || f["stage"] != "working" {
+			t.Fatal(f)
+		}
+	}
+	var sent bytes.Buffer
+	var stages []string
+	_, err = Exchange(&sent, strings.NewReader(before), Request{ID: id, Operation: Text, Input: "hello", OnProgress: func(stage, text string) { stages = append(stages, stage) }}, []Capability{Text, Progress})
+	if err != nil || len(stages) != 32 {
+		t.Fatalf("%v %v", stages, err)
+	}
+	for _, stage := range []string{"started", "working", "finalizing"} {
+		wire := `{"version":"v1","id":"` + id + `","type":"initialized","capabilities":["text","progress"]}` + "\n" + `{"version":"v1","id":"` + id + `","type":"progress","sequence":1,"stage":"` + stage + `","text":"safe"}` + "\n" + `{"version":"v1","id":"` + id + `","type":"result","output":"done"}` + "\n"
+		if _, err := Exchange(&sent, strings.NewReader(wire), Request{ID: id, Operation: Text}, []Capability{Text, Progress}); err != nil {
+			t.Fatal(stage, err)
 		}
 	}
 }

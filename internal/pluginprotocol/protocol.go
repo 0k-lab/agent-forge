@@ -11,6 +11,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -53,6 +54,7 @@ var ErrCancelled = errors.New("plugin operation cancelled")
 var errCancelSent = errors.New("plugin cancel sent")
 
 type Request struct {
+	OnProgress  func(stage, text string)
 	ID          string
 	Operation   Capability
 	Input       string
@@ -205,6 +207,9 @@ func exchangeContext(ctx context.Context, dst io.Writer, src io.Reader, request 
 			if progressCount > MaxProgressFrames {
 				return Result{}, errors.New("too many progress frames")
 			}
+			if request.OnProgress != nil {
+				request.OnProgress(progress.Stage, progress.Text)
+			}
 		case "failure":
 			var terminal failure
 			if err := decodeFrame(body, &terminal); err != nil || !containsString([]string{"invalid_request", "incompatible", "execution_failed", "cancelled"}, terminal.Category) {
@@ -302,7 +307,14 @@ func ReadFailure(src io.Reader) (string, error) {
 }
 
 func Serve(in io.Reader, out io.Writer, supported []Capability, handler Handler) error {
-	if !validCapabilities(supported) || len(supported) == 0 || contains(supported, Cancel) || contains(supported, Progress) || handler == nil {
+	if contains(supported, Progress) {
+		return errors.New("invalid plugin configuration")
+	}
+	return ServeWithProgress(in, out, supported, handler)
+}
+
+func ServeWithProgress(in io.Reader, out io.Writer, supported []Capability, handler Handler) error {
+	if !validCapabilities(supported) || len(supported) == 0 || contains(supported, Cancel) || handler == nil {
 		return errors.New("invalid plugin configuration")
 	}
 	reader := bufio.NewReaderSize(in, MaxFrameBytes+1)
@@ -350,7 +362,30 @@ func Serve(in io.Reader, out io.Writer, supported []Capability, handler Handler)
 	default:
 		return errors.New("invalid execute operation")
 	}
+	var mu sync.Mutex
+	sequence := 0
+	closed := false
+	var progressErr error
+	request.OnProgress = func(stage, text string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if closed || progressErr != nil || !contains(selected, Progress) {
+			return
+		}
+		if sequence >= MaxProgressFrames || !containsString([]string{"started", "working", "finalizing"}, stage) || len(text) > MaxProgressTextBytes || !utf8.ValidString(text) {
+			progressErr = errors.New("invalid progress")
+			return
+		}
+		sequence++
+		progressErr = writeFrame(out, progressFrame{Version, init.ID, "progress", sequence, stage, text})
+	}
 	result, handlerErr := handler(context.Background(), request)
+	mu.Lock()
+	defer mu.Unlock()
+	closed = true
+	if progressErr != nil {
+		handlerErr = progressErr
+	}
 	if handlerErr != nil {
 		return writeFrame(out, failure{Version, init.ID, "failure", "execution_failed"})
 	}

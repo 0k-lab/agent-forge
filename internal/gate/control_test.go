@@ -163,8 +163,22 @@ func TestControlDetailActiveEvidenceAndDelivery(t *testing.T) {
 	if err := s.BindEvidenceLeaseAt(job.ID, lease.AttemptID, "worker-1", generation, []protocol.AttemptEvidence{{EvidenceID: strings.Repeat("d", 32), Phase: protocol.EvidencePhaseScopedCheck, Reason: protocol.EvidenceReasonScopedCheckPassed, CheckIndex: &index, ExitCode: &exit, DurationMS: 15, BaseSHA: base, CandidateSHA: candidate, Output: protocol.EvidenceRedactedMarker, OutputRedacted: true}}, at.Add(time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
+	attempts, err := s.Attempts(job.ID)
+	if err != nil || len(attempts) != 1 || !x.appendActivity(attempts[0], protocol.Activity{Sequence: 1, Stage: "analyzing"}, at) {
+		t.Fatal("activity setup", err)
+	}
 	path := "/v1/control/jobs/" + job.ID
 	w := controlRequest(h, "GET", path, "owner", "")
+	var live struct {
+		Attempts []controlAttempt `json:"attempts"`
+	}
+	if json.Unmarshal(w.Body.Bytes(), &live) != nil || len(live.Attempts) != 1 || len(live.Attempts[0].Activity) != 1 {
+		t.Fatal("missing live API projection", w.Body.String())
+	}
+	event := live.Attempts[0].Activity[0]
+	if event.RunID != job.ID || event.AttemptID != lease.AttemptID || event.Ordinal != 1 || event.WorkerID != "worker-1" || !event.ReceivedAt.Equal(at) {
+		t.Fatal(event)
+	}
 	var detail struct {
 		Job         struct{ Status string } `json:"job"`
 		Instruction string                  `json:"instruction"`
@@ -201,6 +215,9 @@ func TestControlDetailActiveEvidenceAndDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	w = controlRequest(h, "GET", path, "owner", "")
+	if strings.Contains(w.Body.String(), `"activity":`) {
+		t.Fatal("terminal activity exposed")
+	}
 	json.Unmarshal(w.Body.Bytes(), &detail)
 	if w.Code != 200 || detail.Job.Status != "delivering" || detail.Delivery == nil || detail.Delivery.Phase != "ci" || detail.Delivery.CIState != "pending" || detail.Delivery.PRURL != "https://github.com/org/repo/pull/1" || detail.Diagnostics.CandidateSHA != candidate || strings.Contains(w.Body.String(), "private-delivery-body") {
 		t.Fatalf("delivery %s", w.Body.String())
@@ -341,5 +358,45 @@ func TestControlRunDetailUsesPinnedAgentTimeout(t *testing.T) {
 	}
 	if json.Unmarshal(w.Body.Bytes(), &detail) != nil || detail.Job.Timeout != policy.Execution.PluginTimeoutNanos/int64(time.Millisecond) {
 		t.Fatalf("pinned timeout %s", w.Body.String())
+	}
+}
+
+func TestLiveProjectionBoundaries(t *testing.T) {
+	now := time.Now().UTC()
+	x := &server{}
+	a := store.Attempt{ID: "attempt", JobID: "run", WorkerID: "worker", Ordinal: 2, Status: "leased", DeadlineAt: now.Add(time.Second)}
+	for i, stage := range []string{"analyzing", "editing", "testing", "preparing_result"} {
+		if !x.appendActivity(a, protocol.Activity{Sequence: i + 1, Stage: stage}, now) {
+			t.Fatal(stage)
+		}
+	}
+	for _, event := range []protocol.Activity{{Sequence: 4, Stage: "preparing_result"}, {Sequence: 5, Stage: "testing"}, {Sequence: 5, Stage: "secret"}} {
+		if x.appendActivity(a, event, now) {
+			t.Fatal(event)
+		}
+	}
+	got := x.projectActivity(a, now)
+	if len(got) != 4 || got[0].RunID != "run" || got[0].AttemptID != "attempt" || got[0].Ordinal != 2 || got[0].WorkerID != "worker" || !got[0].ReceivedAt.Equal(now) {
+		t.Fatal(got)
+	}
+	other := a
+	other.WorkerID = "other"
+	if len(x.projectActivity(other, now)) != 0 {
+		t.Fatal("cross worker")
+	}
+	expired := a
+	expired.ID = "expired"
+	if x.appendActivity(expired, protocol.Activity{Sequence: 1, Stage: "analyzing"}, a.DeadlineAt) {
+		t.Fatal("accepted expired event")
+	}
+	if len(x.projectActivity(a, a.DeadlineAt)) != 0 {
+		t.Fatal("expired")
+	}
+	a.Status = "succeeded"
+	if x.appendActivity(a, protocol.Activity{Sequence: 1, Stage: "analyzing"}, now) {
+		t.Fatal("accepted terminal event")
+	}
+	if len(x.projectActivity(a, now)) != 0 {
+		t.Fatal("terminal")
 	}
 }

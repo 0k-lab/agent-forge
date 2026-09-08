@@ -33,12 +33,15 @@ func main() {
 }
 
 func serve(in io.Reader, out io.Writer) error {
-	return pluginprotocol.Serve(in, out, []pluginprotocol.Capability{pluginprotocol.WorkspaceEdit, pluginprotocol.CommitSubject, pluginprotocol.AgentReport}, func(ctx context.Context, request pluginprotocol.Request) (pluginprotocol.Result, error) {
+	return pluginprotocol.ServeWithProgress(in, out, []pluginprotocol.Capability{pluginprotocol.Progress, pluginprotocol.WorkspaceEdit, pluginprotocol.CommitSubject, pluginprotocol.AgentReport}, func(ctx context.Context, request pluginprotocol.Request) (pluginprotocol.Result, error) {
 		return executeCodex(ctx, request)
 	})
 }
 
 func executeCodex(parent context.Context, request pluginprotocol.Request) (pluginprotocol.Result, error) {
+	if request.OnProgress != nil {
+		request.OnProgress("started", "Analyzing workspace")
+	}
 	head, err := gitHead(request.Workspace)
 	if err != nil {
 		return pluginprotocol.Result{}, fmt.Errorf("invalid_workspace")
@@ -65,8 +68,14 @@ func executeCodex(parent context.Context, request pluginprotocol.Request) (plugi
 	budget := &outputBudget{n: 1 << 20}
 	cmd.Stdout = &limitedWriter{budget: budget}
 	cmd.Stderr = &limitedWriter{budget: budget}
+	if request.OnProgress != nil {
+		request.OnProgress("working", "Editing workspace")
+	}
 	if err := processtree.Run(ctx, cmd); err != nil {
 		return pluginprotocol.Result{}, fmt.Errorf("codex_failed")
+	}
+	if request.OnProgress != nil {
+		request.OnProgress("finalizing", "Preparing plugin result")
 	}
 	after, err := gitHead(request.Workspace)
 	if err != nil || after != head {

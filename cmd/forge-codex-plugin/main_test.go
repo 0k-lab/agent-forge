@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,24 +58,35 @@ output.write_text(json.dumps({"commit_subject":"fix: use executor result","summa
 	t.Setenv("CODEX_BIN", fake)
 	privateTmp := t.TempDir()
 	t.Setenv("TMPDIR", privateTmp)
-	for _, report := range []bool{false, true} {
-		id := strings.Repeat("a", 32)
-		capabilities := `"workspace_edit","commit_subject"`
-		fields := ""
-		if report {
-			capabilities += `,"agent_report"`
-			fields = `,"summary":"Update the answer from executor feedback","changes":["Replace the base answer with the edited answer"]`
-		}
-		input := `{"version":"v1","id":"` + id + `","type":"initialize","capabilities":[` + capabilities + `],"limits":{"frame_bytes":1048576,"progress_frames":128,"text_bytes":65536,"progress_text_bytes":1024,"commit_subject_bytes":256}}` + "\n" +
-			`{"version":"v1","id":"` + id + `","type":"execute","operation":"workspace_edit","workspace":` + quote(workspace) + `,"instruction":"edit","timeout_ms":1000}` + "\n"
-		var output bytes.Buffer
-		if err := serve(strings.NewReader(input), &output); err != nil {
-			t.Fatal(err)
-		}
-		want := `{"version":"v1","id":"` + id + `","type":"initialized","capabilities":[` + capabilities + `]}` + "\n" +
-			`{"version":"v1","id":"` + id + `","type":"result","commit_subject":"fix: use executor result"` + fields + "}\n"
-		if output.String() != want || git("rev-parse", "HEAD") != head {
-			t.Fatalf("report=%v output=%q", report, output.String())
+	for _, progress := range []bool{false, true} {
+		for _, report := range []bool{false, true} {
+			id := strings.Repeat("a", 32)
+			capabilities := `"workspace_edit","commit_subject"`
+			if progress {
+				capabilities = `"progress",` + capabilities
+			}
+			fields := ""
+			if report {
+				capabilities += `,"agent_report"`
+				fields = `,"summary":"Update the answer from executor feedback","changes":["Replace the base answer with the edited answer"]`
+			}
+			input := `{"version":"v1","id":"` + id + `","type":"initialize","capabilities":[` + capabilities + `],"limits":{"frame_bytes":1048576,"progress_frames":128,"text_bytes":65536,"progress_text_bytes":1024,"commit_subject_bytes":256}}` + "\n" +
+				`{"version":"v1","id":"` + id + `","type":"execute","operation":"workspace_edit","workspace":` + quote(workspace) + `,"instruction":"edit","timeout_ms":1000}` + "\n"
+			var output bytes.Buffer
+			if err := serve(strings.NewReader(input), &output); err != nil {
+				t.Fatal(err)
+			}
+			progressWire := ""
+			if progress {
+				for i, entry := range [][2]string{{"started", "Analyzing workspace"}, {"working", "Editing workspace"}, {"finalizing", "Preparing plugin result"}} {
+					progressWire += fmt.Sprintf("{\"version\":\"v1\",\"id\":\"%s\",\"type\":\"progress\",\"sequence\":%d,\"stage\":\"%s\",\"text\":\"%s\"}\n", id, i+1, entry[0], entry[1])
+				}
+			}
+			want := `{"version":"v1","id":"` + id + `","type":"initialized","capabilities":[` + capabilities + `]}` + "\n" + progressWire +
+				`{"version":"v1","id":"` + id + `","type":"result","commit_subject":"fix: use executor result"` + fields + "}\n"
+			if output.String() != want || git("rev-parse", "HEAD") != head {
+				t.Fatalf("report=%v output=%q", report, output.String())
+			}
 		}
 	}
 	entries, err := os.ReadDir(privateTmp)

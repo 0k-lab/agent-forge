@@ -29,15 +29,15 @@ function workspace() {
   }
   const html = readFileSync(path.join(__dirname, 'app/index.html'), 'utf8');
   const nodes = Object.fromEntries([...html.matchAll(/id="([^"]+)"/g)].map(m => [m[1], new Element()]));
-  const calls = [];
+  const calls = [], timers = [];
   const context = vm.createContext({
     document: {get activeElement() { return activeElement; }, getElementById: id => nodes[id], createElement: tag => new Element(tag), addEventListener() {}, hidden: false},
     window: {addEventListener() {}}, URL, Date, console,
-    setInterval: (fn, ms) => { assert.equal(ms, 5000); },
+    setInterval: (fn, ms) => { assert.equal(ms, 5000); timers.push(fn); },
     fetch: async (url, options) => { calls.push({url, options}); return {ok: true, status: 200, json: async () => ({projects: [], workers: [], jobs: []})}; }
   });
   vm.runInContext(readFileSync(path.join(__dirname, 'app/app.js'), 'utf8'), context);
-  return {nodes, context, calls, run: code => vm.runInContext(code, context)};
+  return {nodes, context, calls, timers, run: code => vm.runInContext(code, context)};
 }
 const project = {id: 'parser', default_branch: 'main', worker_pool: 'coding', agent: 'codex', public_source: true, delivery: true};
 
@@ -543,4 +543,49 @@ test('resume button is bound to the owner token that rendered it', async () => {
  w.context.fetch=async(url,options)=>{ w.calls.push({url,options}); return {ok:false,status:409}; };
  await action.listeners.click();
  assert.equal(w.calls.length,0);
+});
+
+test('live drawer fences old local rejection and issue activity success, rejection and 401', async () => {
+ for (const kind of ['local-rejection','success','rejection','401']) {
+  const w = workspace(); const pending=[];
+  w.context.task = {project:'parser',source_ref:'local',title:'Current',...(kind==='local-rejection'?{}:{issue:{number:1,state:'open'}})};
+  w.context.fetch = url => {
+   if ((kind==='local-rejection' && url.includes('/runs?')) || url.endsWith('/activity')) return new Promise((resolve,reject)=>pending.push({resolve,reject}));
+   return Promise.resolve({ok:true,status:200,json:async()=>({runs:[],total:0})});
+  };
+  w.run("token='valid'; openTaskDetail(task)");
+  w.nodes['detail-modal'].close(); w.run('openTaskDetail(task)');
+  await new Promise(resolve=>setImmediate(resolve));
+  const before=w.nodes['detail-content'].textContent, notice=w.nodes['detail-notice'].textContent;
+  if(kind.includes('rejection')) pending[0].reject(new Error('old'));
+  else pending[0].resolve({ok:kind!=='401',status:kind==='401'?401:200,json:async()=>({available:true,issue:{state:'closed'},merged_prs:[]})});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(w.nodes['detail-modal'].open,true,kind);
+  assert.equal(w.run('token'),'valid',kind);
+  assert.equal(w.nodes['detail-content'].textContent,before,kind);
+  assert.equal(w.nodes['detail-notice'].textContent,notice,kind);
+ }
+});
+
+test('active attempt activity is ordered, attributed and separate from reports and verification', () => {
+ const w=workspace();
+ w.context.live={job:{id:'run',status:'leased'},attempts:[{id:'attempt',ordinal:2,worker_id:'worker',status:'leased',activity:['analyzing','editing','testing','preparing_result'].map((stage,i)=>({stage,sequence:i+1,run_id:'run',attempt_id:'attempt',attempt_ordinal:2,worker_id:'worker',received_at:'2026-09-01T00:00:00Z'}))}]};
+ w.run('renderDetail(live)');
+ const text=w.nodes['detail-content'].textContent;
+ assert.match(text,/Live Agent Activity.*Analyzing.*Editing.*Testing.*Preparing result.*Agent report.*Forge verification/s);
+ assert.match(text,/Run run · Attempt 2 \(attempt\) · Worker worker/);
+ assert.match(text,/No subagent telemetry/);
+});
+
+
+test('timer refreshes an open activity drawer even while overview is pending', async () => {
+ const w=workspace(); let stage='analyzing';
+ w.context.fetch=url=>url.includes('/jobs/')?Promise.resolve({ok:true,status:200,json:async()=>({job:{id:'run',status:'leased'},attempts:[{id:'attempt',ordinal:1,worker_id:'worker',status:'leased',activity:[{stage,sequence:1,run_id:'run',attempt_id:'attempt',attempt_ordinal:1,worker_id:'worker'}]}]})}):new Promise(()=>{});
+ w.run("token='valid'; openDetail('run')");
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.match(w.nodes['detail-content'].textContent,/Analyzing/);
+ stage='editing';w.timers[0]();
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.match(w.nodes['detail-content'].textContent,/Editing/);
+ assert.doesNotMatch(w.nodes['detail-content'].textContent,/Analyzing/);
 });
