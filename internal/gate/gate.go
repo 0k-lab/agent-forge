@@ -308,6 +308,7 @@ func (x *server) routes() http.Handler {
 	m.HandleFunc("/v1/control/projects/{id}/issues", x.ownerAuth(getOnly(x.controlIssues)))
 	m.HandleFunc("/v1/control/overview", x.ownerAuth(getOnly(x.controlOverview)))
 	m.HandleFunc("/v1/control/jobs/{id}", x.ownerAuth(getOnly(x.controlDetail)))
+	m.HandleFunc("POST /v1/control/jobs/{id}/resume-delivery", x.ownerAuth(x.controlResumeDelivery))
 	m.HandleFunc("POST /v1/control/jobs", x.ownerAuth(x.controlSubmit))
 	m.HandleFunc("POST /v1/jobs", x.ownerAuth(x.submit))
 	m.HandleFunc("GET /v1/jobs/{id}", x.ownerAuth(x.getJob))
@@ -608,12 +609,13 @@ func (x *server) submitConfigured(w http.ResponseWriter, r *http.Request) {
 		task.Repository = prepared
 		x.log("repository_prepared", "repository_id", repository.ID, "base_sha", task.BaseSHA)
 	}
-	x.persistConfiguredTask(w, task, *repository, string(in.SourceRef))
+	x.persistConfiguredTask(w, task, *repository, string(in.SourceRef), "")
 }
 
-func (x *server) persistConfiguredTask(w http.ResponseWriter, task protocol.CodingTask, repository RepositoryRegistration, source string) {
+func (x *server) persistConfiguredTask(w http.ResponseWriter, task protocol.CodingTask, repository RepositoryRegistration, source string, deliveryPolicy protocol.DeliveryPolicy) {
 	var err error
 	policy := x.config.resolvedPolicy(repository.WorkerPool, repository.Execution, repository.ID, repository.DefaultBranch)
+	policy.DeliveryPolicy = deliveryPolicy
 	var job store.Job
 	if source == "" {
 		job, err = x.store.CreateCodingJobWithPolicy(task, policy)
@@ -846,7 +848,7 @@ func (x *server) getResult(w http.ResponseWriter, r *http.Request) {
 	result.Timeline = make([]store.DebugEvent, 0, len(timeline.Events))
 	for _, event := range timeline.Events {
 		switch event.Type {
-		case "submitted", "leased", "lease_expired", "retryable_failed", "retry_scheduled", "failed", "succeeded", "delivery_pending", "delivery_phase", "delivery_retry", "delivery_merged", "delivery_failed":
+		case "submitted", "leased", "lease_expired", "retryable_failed", "retry_scheduled", "failed", "succeeded", "delivery_review", "delivery_resumed", "delivery_pending", "delivery_phase", "delivery_retry", "delivery_merged", "delivery_failed":
 		default:
 			continue
 		}
@@ -898,7 +900,7 @@ func (x *server) safeDelivery(jobID string) *safeDelivery {
 		return nil
 	}
 	phase := delivery.Phase
-	if phase != "pending" && phase != "publishing" && phase != "ci" && phase != "merging" && phase != "retry_wait" && phase != "merged" && phase != "failed" {
+	if phase != "awaiting_review" && phase != "pending" && phase != "publishing" && phase != "ci" && phase != "merging" && phase != "retry_wait" && phase != "merged" && phase != "failed" {
 		return nil
 	}
 	return &safeDelivery{Phase: phase, Branch: delivery.Branch, PRURL: delivery.PRURL, CIState: delivery.CIState, MergeSHA: delivery.MergeSHA, FailureCode: safeFailureCode(delivery.FailureCode)}
@@ -941,7 +943,7 @@ func (x *server) getEvents(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(event.Kind, "delivery_") {
 			for _, field := range strings.Fields(event.Detail) {
 				key, value, ok := strings.Cut(field, "=")
-				if key == "phase" && ok && (value == "pending" || value == "publishing" || value == "ci" || value == "merging" || value == "retry_wait" || value == "merged" || value == "failed") {
+				if key == "phase" && ok && (value == "awaiting_review" || value == "pending" || value == "publishing" || value == "ci" || value == "merging" || value == "retry_wait" || value == "merged" || value == "failed") {
 					response[i].Phase = value
 				}
 				if key == "failure_code" && ok {
@@ -1217,7 +1219,7 @@ func (x *server) connect(w http.ResponseWriter, r *http.Request) {
 			}
 			m := protocol.Message{Type: protocol.MessageLease, JobID: lease.JobID, AttemptID: lease.AttemptID, Input: lease.Input, Task: lease.Task}
 			if x.config != nil {
-				policy := protocol.ResolvedPolicy(lease.Policy)
+				policy := lease.Policy.WorkerPolicy()
 				m.Policy = &policy
 			}
 			if err := wsjson.Write(ctx, c, m); err != nil {

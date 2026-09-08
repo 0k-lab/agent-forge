@@ -877,6 +877,26 @@ func (s *Store) terminalOwnedState(jobID, attemptID, attemptStatus, result, cand
 	if j.AttemptID != attemptID {
 		return Job{}, errors.New("attempt does not own job")
 	}
+	if candidateSHA != "" && j.PolicyVersion != 0 {
+		// The Gate-owned policy, never a Worker result, decides whether to publish.
+		var body []byte
+		if err := tx.QueryRow(`SELECT resolved_policy FROM jobs WHERE id=?`, jobID).Scan(&body); err != nil {
+			return Job{}, err
+		}
+		policy, err := DecodeCanonicalPolicy(body)
+		if err != nil {
+			return Job{}, err
+		}
+		if policy.DeliveryPolicy == protocol.DeliveryReview && delivery == nil {
+			return Job{}, errors.New("review candidate requires delivery")
+		}
+		if delivery != nil {
+			delivery.Phase = "pending"
+			if policy.DeliveryPolicy == protocol.DeliveryReview {
+				delivery.Phase = "awaiting_review"
+			}
+		}
+	}
 	jobStatus := "failed"
 	if attemptStatus == "succeeded" {
 		jobStatus = "succeeded"
@@ -944,6 +964,7 @@ func (s *Store) terminalOwnedState(jobID, attemptID, attemptStatus, result, cand
 		return Job{}, fmt.Errorf("job terminal update affected %d rows", n)
 	}
 	if delivery != nil {
+
 		if _, err = tx.Exec(`INSERT INTO deliveries(`+deliveryColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			delivery.JobID, delivery.AttemptID, delivery.CandidateSHA, delivery.ExpectedTreeSHA, delivery.ParentSHA, delivery.CandidateRef,
 			delivery.RepositoryID, delivery.RepositoryURL, delivery.DefaultBranch, delivery.Branch, delivery.PRTitle, delivery.PRBody,
@@ -960,7 +981,11 @@ func (s *Store) terminalOwnedState(jobID, attemptID, attemptStatus, result, cand
 	eventKind := jobStatus
 	if delivery != nil {
 		eventKind = "delivery_pending"
-		detail = "phase=pending candidate_sha=" + candidateSHA
+
+		detail = "phase=" + delivery.Phase + " candidate_sha=" + candidateSHA
+		if delivery.Phase == "awaiting_review" {
+			eventKind, detail = "delivery_review", "phase=awaiting_review"
+		}
 	}
 	if _, err = tx.Exec(`INSERT INTO events(job_id,kind,detail,at) VALUES(?,?,?,?)`, jobID, eventKind, detail, stamp); err != nil {
 		return Job{}, err

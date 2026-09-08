@@ -33,6 +33,7 @@
   <label for="task-instruction">Instructions</label><textarea id="task-instruction" rows="5" required maxlength="65000" placeholder="Describe the change and what done looks like."></textarea>
   <label for="task-source">Exact GitHub issue URL <span class="hint">optional</span></label><input id="task-source" type="url" placeholder="https://github.com/owner/repo/issues/123">
   <p class="hint">Without an issue URL, this creates an unlinked run in Runs history. No GitHub issue is created.</p>
+  <label for="task-delivery-policy">Delivery policy</label><select id="task-delivery-policy"><option value="automatic" selected>Automatic · publish and merge after checks</option><option value="review">Review · hold candidate for independent review</option></select>
   <label for="task-preset">Checks</label><select id="task-preset"><option value="go">Go · go test ./...</option><option value="">Explicit scoped checks</option></select>
   <div id="scoped-checks" hidden><label for="task-checks">One command per line</label><textarea id="task-checks" rows="3" placeholder="go test ./internal/parser&#10;go vet ./internal/parser"></textarea><p class="hint">Space-separated arguments. No shell expansion or quoted arguments.</p></div>
   <p id="task-error" role="alert"></p><div class="dialog-actions"><span class="hint">Starts from the current default branch.</span><button id="submit-task" class="primary">Start run</button></div>

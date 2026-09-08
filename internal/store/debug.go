@@ -240,7 +240,7 @@ func (s *Store) DebugJobTimeline(ctx context.Context, id string, limit int, posi
 					event.FailureCode = value
 				}
 			case "phase":
-				if value == "pending" || value == "publishing" || value == "ci" || value == "merging" || value == "retry_wait" || value == "merged" || value == "failed" {
+				if value == "awaiting_review" || value == "pending" || value == "publishing" || value == "ci" || value == "merging" || value == "retry_wait" || value == "merged" || value == "failed" {
 					event.Phase = value
 				}
 			}
